@@ -2,7 +2,7 @@
 // PRISM
 //
 // Geometry (§5.4, .cheap): crop-aspect crop, zoom (1…4×), pan (fraction of
-// the croppable margin), fine rotation (−15…+15°), orientation (0/90/180/
+// the croppable margin), free rotation (−180…+180°), orientation (0/90/180/
 // 270°), and mirror, composed into a single 3×3 matrix mapping output UV to
 // input UV — one pass regardless of how many controls are active. Sampling
 // is bilinear below 2× zoom and Lanczos-2 at or above it (useLanczos).
@@ -72,7 +72,7 @@ public final class GeometryStage: EffectStage {
     /// Builds the 3×3 output-UV → input-UV matrix (bottom row 0 0 1).
     ///
     /// Forward chain (input → output): crop window (crop aspect + zoom + pan)
-    /// → fine rotation → orientation (with aspect-preserving fit for quarter
+    /// → free rotation → orientation (with aspect-preserving fit for quarter
     /// turns) → mirror. This returns its inverse, composed right-to-left:
     /// center output UV → aspect space (so rotation does not shear) →
     /// mirror⁻¹ → orientation⁻¹ (incl. 1/fit) → rotation⁻¹ → back to UV →
@@ -110,10 +110,13 @@ public final class GeometryStage: EffectStage {
         let quarterTurn = settings.orientation == .deg90 || settings.orientation == .deg270
         let fitScale: Float = quarterTurn ? min(aspect, 1 / aspect) : 1
 
-        let fineRotation = Float(clampValue(settings.rotationDegrees, -15, 15)) * .pi / 180
+        // Free rotation is a half turn either way; unlike a quarter-turn
+        // orientation it gets no fit scale, so corners the input no longer
+        // covers fall out of range and render black.
+        let freeRotation = Float(clampValue(settings.rotationDegrees, -180, 180)) * .pi / 180
         let orientationRotation = Float(settings.orientation.rawValue) * .pi / 180
         // Positive angles appear clockwise on screen (UV space is y-down).
-        let totalRotation = fineRotation + orientationRotation
+        let totalRotation = freeRotation + orientationRotation
 
         var m = translationMatrix(-0.5, -0.5)
         m = scaleMatrix(aspect, 1) * m

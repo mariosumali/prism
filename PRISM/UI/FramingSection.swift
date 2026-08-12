@@ -24,9 +24,10 @@ struct FramingSection: View {
                                fractionDigits: 1)
                 PrismSliderRow(label: "Rotate",
                                value: geometryBinding(\.rotationDegrees),
-                               range: -15...15,
+                               range: -180...180,
                                defaultValue: 0,
-                               fractionDigits: 0)
+                               fractionDigits: 0,
+                               unit: "°")
                 Toggle("Flip output", isOn: flipBinding)
                     .toggleStyle(.switch)
                     .controlSize(.mini)
@@ -111,6 +112,9 @@ struct PrismSliderRow: View {
     let range: ClosedRange<Double>
     let defaultValue: Double
     var fractionDigits: Int = 1
+    /// Suffix carried inside the numeric field (`12°`). Empty for the bare
+    /// 0…1 amounts, which have no unit to name.
+    var unit: String = ""
 
     var body: some View {
         HStack(spacing: Metrics.itemGap) {
@@ -125,7 +129,7 @@ struct PrismSliderRow: View {
                 .accessibilityLabel(label)
                 .accessibilityValue(formattedValue)
             TextField("", value: clampedValue,
-                      format: .number.precision(.fractionLength(0...max(fractionDigits, 0))))
+                      format: PrismUnitFormat(fractionDigits: fractionDigits, unit: unit))
                 .textFieldStyle(.roundedBorder)
                 .controlSize(.small)
                 .font(.caption.monospacedDigit())
@@ -160,6 +164,32 @@ struct PrismSliderRow: View {
     }
 
     private var formattedValue: String {
-        String(format: "%.\(max(fractionDigits, 0))f", value)
+        String(format: "%.\(max(fractionDigits, 0))f", value) + unit
+    }
+}
+
+/// Numeric-field format that keeps a unit inside the field (`12°`) instead of
+/// spending a separate label on it, so §8.3's row widths hold. Typed input is
+/// accepted with or without the suffix.
+struct PrismUnitFormat: ParseableFormatStyle {
+    var fractionDigits: Int
+    var unit: String
+
+    var parseStrategy: PrismUnitParseStrategy { PrismUnitParseStrategy(unit: unit) }
+
+    func format(_ value: Double) -> String {
+        let digits = max(fractionDigits, 0)
+        return value.formatted(.number.precision(.fractionLength(0...digits))) + unit
+    }
+}
+
+struct PrismUnitParseStrategy: ParseStrategy {
+    var unit: String
+
+    func parse(_ value: String) throws -> Double {
+        let stripped = unit.isEmpty ? value : value.replacingOccurrences(of: unit, with: "")
+        return try FloatingPointFormatStyle<Double>()
+            .parseStrategy
+            .parse(stripped.trimmingCharacters(in: .whitespaces))
     }
 }

@@ -5,7 +5,7 @@
 // output UV to input UV (§5.4) — with hand-derived fixed points: identity
 // settings produce the identity mapping, zoom pulls corners inward around a
 // fixed center, pan clamps at the croppable margin, mirror flips, quarter
-// turns rotate with aspect-preserving fit, fine rotation composes without
+// turns rotate with aspect-preserving fit, free rotation composes without
 // scale drift (determinant check), and a 1:1 crop on 16:9 input narrows the
 // sampled width. Requires a Metal device only to compile the stage's
 // pipeline state; no frames are rendered and no capture session is touched.
@@ -257,7 +257,7 @@ final class GeometryMathTests: XCTestCase {
         assertMaps(m, (0.5, 0.5), to: (0.5, 0.5))
     }
 
-    // MARK: - Fine rotation
+    // MARK: - Free rotation
 
     func testFineRotationKeepsCenterFixed() throws {
         let stage = try makeStage()
@@ -296,12 +296,24 @@ final class GeometryMathTests: XCTestCase {
         XCTAssertEqual(abs(linearDeterminant(m)), 1, accuracy: 1e-4)
     }
 
+    func testFreeRotation180MatchesOrientation180() throws {
+        // The slider reaches a half turn either way (§5.4), and at exactly
+        // 180° it must land on the same point reflection the orientation
+        // control produces — no fit scale, no aspect shear.
+        let stage = try makeStage()
+        stage.settings.rotationDegrees = 180
+        let m = stage.buildUVTransform(inputSize: size16x9)
+        assertMaps(m, (0, 0), to: (1, 1), accuracy: 1e-3)
+        assertMaps(m, (0.25, 0.7), to: (0.75, 0.3), accuracy: 1e-3)
+        assertMaps(m, (0.5, 0.5), to: (0.5, 0.5))
+    }
+
     func testRotationDegreesClampToSpecRange() throws {
-        // ±15° is the spec range (§5.4); values beyond clamp.
+        // ±180° is the spec range (§5.4); values beyond clamp.
         let wild = try makeStage()
-        wild.settings.rotationDegrees = 90
+        wild.settings.rotationDegrees = 400
         let limit = try makeStage()
-        limit.settings.rotationDegrees = 15
+        limit.settings.rotationDegrees = 180
         let a = wild.buildUVTransform(inputSize: size16x9)
         let b = limit.buildUVTransform(inputSize: size16x9)
         for c in 0..<3 {
