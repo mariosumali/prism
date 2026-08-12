@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: Build all targets and run tests
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate project
+        run: xcodegen generate
+
+      - name: Syntax-check audio plug-in (C++)
+        run: |
+          for f in PRISMAudioPlugIn/*.cpp; do
+            xcrun clang++ -fsyntax-only -std=c++17 -IPRISMShared "$f"
+          done
+          xcrun clang -fsyntax-only -std=c11 PRISMShared/RingBuffer.c
+
+      - name: Compile-check Metal kernels
+        run: |
+          for f in PRISMKernels/*.metal; do
+            xcrun -sdk macosx metal -c "$f" -IPRISMKernels -o /tmp/$(basename "$f").air
+          done
+
+      - name: Build app + camera extension
+        run: |
+          xcodebuild -project PRISM.xcodeproj -scheme PRISM \
+            -configuration Debug -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" build | tail -20
+
+      - name: Build audio HAL plug-in
+        run: |
+          xcodebuild -project PRISM.xcodeproj -scheme PRISMAudioPlugIn \
+            -configuration Debug -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" build | tail -20
+
+      - name: Run unit tests
+        run: |
+          xcodebuild -project PRISM.xcodeproj -scheme PRISMTests \
+            -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" test | tail -40
+
+      - name: Driver smoke test
+        run: |
+          if [ -x Tools/driver_smoke/run.sh ]; then Tools/driver_smoke/run.sh; fi
+
+      - name: Verify no network symbols in app
+        # §7: PRISM makes no network connections. Cheap tripwire: the app
+        # binary must not link networking frameworks.
+        run: |
+          BIN=$(find ~/Library/Developer/Xcode/DerivedData -path '*Debug/PRISM.app/Contents/MacOS/PRISM' | head -1)
+          if [ -n "$BIN" ]; then
+            if otool -L "$BIN" | grep -E 'CFNetwork|Network.framework'; then
+              echo "::error::App links networking frameworks"; exit 1
+            fi
+          fi
