@@ -9,6 +9,29 @@
 
 import Foundation
 
+// MARK: - Forward compatibility
+
+/// Decodes a key if it is present and well-formed, and falls back to the
+/// property's default otherwise.
+///
+/// Swift's synthesised `Codable` does not fall back to property defaults —
+/// it throws on an absent key. Every settings struct below is persisted, in
+/// UserDefaults and in shareable preset JSON, so with synthesised decoding
+/// the moment any of them gains a field every file written by an earlier
+/// build fails to decode and the user silently loses that whole struct on
+/// upgrade. Tolerating absence per field makes new fields additive.
+///
+/// This has to be applied at EVERY level, not just the outermost one: a
+/// tolerant `PipelineConfiguration` decoding a `BlurSettings` that throws
+/// still discards the user's blur settings entirely. Version skew shows up
+/// as a partial nested object, which is exactly the case a top-level-only
+/// fallback misses.
+extension KeyedDecodingContainer {
+    func tolerant<T: Decodable>(_ key: Key, _ fallback: T) -> T {
+        ((try? decodeIfPresent(T.self, forKey: key)) ?? nil) ?? fallback
+    }
+}
+
 // MARK: - Per-stage settings (§5.4)
 
 public struct AdjustSettings: Codable, Equatable {
@@ -18,6 +41,15 @@ public struct AdjustSettings: Codable, Equatable {
     public var temperature: Double = 0     // −100…+100
     public var vignette: Double = 0        // 0…1
     public init() {}
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        exposureEV = c.tolerant(.exposureEV, 0)
+        contrast = c.tolerant(.contrast, 1)
+        saturation = c.tolerant(.saturation, 1)
+        temperature = c.tolerant(.temperature, 0)
+        vignette = c.tolerant(.vignette, 0)
+    }
 
     public var isIdentity: Bool {
         exposureEV == 0 && contrast == 1 && saturation == 1
@@ -30,6 +62,12 @@ public struct LUTSettings: Codable, Equatable {
     public var lutName: String = "Neutral"
     public var strength: Double = 1        // 0…1
     public init() {}
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        lutName = c.tolerant(.lutName, "Neutral")
+        strength = c.tolerant(.strength, 1)
+    }
 }
 
 public enum BlurQuality: String, Codable, CaseIterable {
@@ -48,6 +86,12 @@ public struct BlurSettings: Codable, Equatable {
     public var quality: BlurQuality = .balanced
     public var radius: Double = 18         // pixels at 1080p, scaled by height
     public init() {}
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        quality = c.tolerant(.quality, .balanced)
+        radius = c.tolerant(.radius, 18)
+    }
 }
 
 public enum Orientation: Int, Codable, CaseIterable {
@@ -95,17 +139,284 @@ public struct GeometrySettings: Codable, Equatable {
     public var zoom: Double = 1            // 1…4
     public var panX: Double = 0            // −1…1, fraction of croppable margin
     public var panY: Double = 0            // −1…1
-    public var rotationDegrees: Double = 0 // −15…+15
+    public var rotationDegrees: Double = 0 // −180…+180
     public var orientation: Orientation = .deg0
     public var mirror: Mirror = .none
     public var cropAspect: CropAspect = .free
     public var autoFrame: Bool = false
     public init() {}
 
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        zoom = c.tolerant(.zoom, 1)
+        panX = c.tolerant(.panX, 0)
+        panY = c.tolerant(.panY, 0)
+        rotationDegrees = c.tolerant(.rotationDegrees, 0)
+        orientation = c.tolerant(.orientation, .deg0)
+        mirror = c.tolerant(.mirror, Mirror.none)
+        cropAspect = c.tolerant(.cropAspect, .free)
+        autoFrame = c.tolerant(.autoFrame, false)
+    }
+
     public var isIdentity: Bool {
         zoom == 1 && panX == 0 && panY == 0 && rotationDegrees == 0
             && orientation == .deg0 && mirror == .none
             && cropAspect == .free && !autoFrame
+    }
+}
+
+// MARK: - Eye-contact correction (§5.6)
+
+public struct GazeSettings: Codable, Equatable {
+    /// How much of the measured gaze error to remove. 1 aims the eyes at the
+    /// lens exactly; the default leaves a little residual because a gaze
+    /// nailed to the lens for minutes at a time reads as a stare.
+    public var strength: Double = 0.75      // 0…1
+    /// Hard ceiling on the warp, as a fraction of iris radius. Past roughly
+    /// half an iris width the sclera stretch becomes visible, so this is a
+    /// quality clamp, not a safety one.
+    public var maxShift: Double = 0.5       // 0…1
+    /// Where the camera sits relative to the screen you actually look at.
+    /// Positive = camera above (the usual laptop case, eyes need lifting).
+    public var verticalBias: Double = 1.0   // −1…1
+    /// Landmark smoothing. Vision's per-frame jitter is small but visible on
+    /// something as fine as an iris, so this is high by default.
+    public var smoothing: Double = 0.8      // 0…1
+    /// Softness of the sclera transition between iris and eyelid.
+    public var feather: Double = 0.25       // 0.05…1
+    public init() {}
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        strength = c.tolerant(.strength, 0.75)
+        maxShift = c.tolerant(.maxShift, 0.5)
+        verticalBias = c.tolerant(.verticalBias, 1.0)
+        smoothing = c.tolerant(.smoothing, 0.8)
+        feather = c.tolerant(.feather, 0.25)
+    }
+}
+
+// MARK: - Virtual background (§5.7)
+
+public enum BackgroundKind: String, Codable, CaseIterable {
+    case color, image, video
+
+    public var displayName: String {
+        switch self {
+        case .color: return "Colour"
+        case .image: return "Image"
+        case .video: return "Video"
+        }
+    }
+}
+
+/// A colour that survives a preset round-trip. `Color` is not Codable and
+/// NSColor archiving would drag AppKit into the pipeline layer.
+public struct RGBColor: Codable, Equatable {
+    public var red: Double
+    public var green: Double
+    public var blue: Double
+
+    public init(red: Double, green: Double, blue: Double) {
+        self.red = red
+        self.green = green
+        self.blue = blue
+    }
+
+    public static let prismSlate = RGBColor(red: 0.10, green: 0.11, blue: 0.13)
+}
+
+public struct BackgroundSettings: Codable, Equatable {
+    public var kind: BackgroundKind = .image
+    /// File path of the still or looping video. Absolute; PRISM is not
+    /// sandboxed (§9), so no bookmark round-trip is needed.
+    public var assetPath: String?
+    public var color: RGBColor = .prismSlate
+    public var fillMode: ClipFillMode = .fill    // backgrounds fill, they do not letterbox
+    public var maskContrast: Double = 1.4        // 1…4
+    public var edgeSoftness: Double = 0.3        // 0…1
+    public var lightWrap: Double = 0.25          // 0…1
+    public init() {}
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        kind = c.tolerant(.kind, .image)
+        assetPath = (try? c.decodeIfPresent(String.self, forKey: .assetPath)) ?? nil
+        color = c.tolerant(.color, .prismSlate)
+        fillMode = c.tolerant(.fillMode, .fill)
+        maskContrast = c.tolerant(.maskContrast, 1.4)
+        edgeSoftness = c.tolerant(.edgeSoftness, 0.3)
+        lightWrap = c.tolerant(.lightWrap, 0.25)
+    }
+
+    public var assetURL: URL? {
+        assetPath.map { URL(fileURLWithPath: $0) }
+    }
+
+    /// A video/image background with no file chosen renders as the colour
+    /// rather than as nothing — an empty picker must never blank the camera.
+    public var resolvedKind: BackgroundKind {
+        (kind == .color || assetPath != nil) ? kind : .color
+    }
+}
+
+// MARK: - Overlay layers — the green-screen / puppet-stage stage (§5.8)
+
+public enum KeyMode: String, Codable, CaseIterable {
+    case none, chroma, luma
+
+    public var displayName: String {
+        switch self {
+        case .none: return "None"
+        case .chroma: return "Chroma key"
+        case .luma: return "Luma key"
+        }
+    }
+}
+
+public enum LayerPlacement: String, Codable, CaseIterable {
+    case front, behind
+
+    public var displayName: String {
+        switch self {
+        case .front: return "In front"
+        case .behind: return "Behind me"
+        }
+    }
+}
+
+public enum LayerSourceKind: String, Codable, CaseIterable {
+    case image, video
+
+    public var displayName: String {
+        switch self {
+        case .image: return "Image"
+        case .video: return "Video"
+        }
+    }
+}
+
+public struct OverlayLayer: Codable, Equatable, Identifiable {
+    public var id: UUID
+    public var name: String
+    public var isEnabled: Bool
+    public var sourceKind: LayerSourceKind
+    public var assetPath: String?
+    public var placement: LayerPlacement
+    public var keyMode: KeyMode
+    /// Chroma-key target. Defaults to broadcast green; any colour works.
+    public var keyColor: RGBColor
+    public var similarity: Double        // 0…1 chroma distance threshold
+    public var smoothness: Double        // 0…1 soft edge above the threshold
+    public var spill: Double             // 0…1 despill
+    public var lumaLow: Double           // 0…1
+    public var lumaHigh: Double          // 0…1
+    public var opacity: Double           // 0…1
+    public var scale: Double             // 0.05…4, relative to the frame
+    public var offsetX: Double           // −1…1 in output UV, 0 = centred
+    public var offsetY: Double           // −1…1
+    public var rotationDegrees: Double   // −180…180
+    public var mirrored: Bool
+
+    public init(id: UUID = UUID(),
+                name: String = "Layer",
+                isEnabled: Bool = true,
+                sourceKind: LayerSourceKind = .image,
+                assetPath: String? = nil,
+                placement: LayerPlacement = .front,
+                keyMode: KeyMode = .none,
+                keyColor: RGBColor = RGBColor(red: 0, green: 0.7, blue: 0.1),
+                similarity: Double = 0.2,
+                smoothness: Double = 0.1,
+                spill: Double = 0.5,
+                lumaLow: Double = 0.05,
+                lumaHigh: Double = 0.25,
+                opacity: Double = 1,
+                scale: Double = 1,
+                offsetX: Double = 0,
+                offsetY: Double = 0,
+                rotationDegrees: Double = 0,
+                mirrored: Bool = false) {
+        self.id = id
+        self.name = name
+        self.isEnabled = isEnabled
+        self.sourceKind = sourceKind
+        self.assetPath = assetPath
+        self.placement = placement
+        self.keyMode = keyMode
+        self.keyColor = keyColor
+        self.similarity = similarity
+        self.smoothness = smoothness
+        self.spill = spill
+        self.lumaLow = lumaLow
+        self.lumaHigh = lumaHigh
+        self.opacity = opacity
+        self.scale = scale
+        self.offsetX = offsetX
+        self.offsetY = offsetY
+        self.rotationDegrees = rotationDegrees
+        self.mirrored = mirrored
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // An id is the one field with no sensible default — a layer that
+        // loses its identity would detach from its media source — so a fresh
+        // one is minted rather than failing the whole preset.
+        id = c.tolerant(.id, UUID())
+        name = c.tolerant(.name, "Layer")
+        isEnabled = c.tolerant(.isEnabled, true)
+        sourceKind = c.tolerant(.sourceKind, .image)
+        assetPath = (try? c.decodeIfPresent(String.self, forKey: .assetPath)) ?? nil
+        placement = c.tolerant(.placement, .front)
+        keyMode = c.tolerant(.keyMode, KeyMode.none)
+        keyColor = c.tolerant(.keyColor, RGBColor(red: 0, green: 0.7, blue: 0.1))
+        similarity = c.tolerant(.similarity, 0.2)
+        smoothness = c.tolerant(.smoothness, 0.1)
+        spill = c.tolerant(.spill, 0.5)
+        lumaLow = c.tolerant(.lumaLow, 0.05)
+        lumaHigh = c.tolerant(.lumaHigh, 0.25)
+        opacity = c.tolerant(.opacity, 1)
+        scale = c.tolerant(.scale, 1)
+        offsetX = c.tolerant(.offsetX, 0)
+        offsetY = c.tolerant(.offsetY, 0)
+        rotationDegrees = c.tolerant(.rotationDegrees, 0)
+        mirrored = c.tolerant(.mirrored, false)
+    }
+
+    public var assetURL: URL? {
+        assetPath.map { URL(fileURLWithPath: $0) }
+    }
+
+    /// A layer with no file draws nothing rather than a black rectangle.
+    public var isRenderable: Bool {
+        isEnabled && assetPath != nil && opacity > 0
+    }
+}
+
+public struct OverlaySettings: Codable, Equatable {
+    /// Each layer is one full-frame compute pass and (for video) its own
+    /// decoder with a small frame FIFO, so the count is capped: three 1080p
+    /// video layers already cost more resident memory than the rest of the
+    /// pipeline combined (§7, < 250 MB).
+    public static let maxLayers = 3
+
+    public var layers: [OverlayLayer] = []
+    public init() {}
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        layers = c.tolerant(.layers, [])
+    }
+
+    public var renderableLayers: [OverlayLayer] {
+        layers.filter(\.isRenderable).prefix(Self.maxLayers).map { $0 }
+    }
+
+    /// True when any enabled layer sits behind the subject — that is what
+    /// makes the overlay stage a mask consumer.
+    public var needsPersonMask: Bool {
+        renderableLayers.contains { $0.placement == .behind }
     }
 }
 
@@ -119,6 +430,12 @@ public struct StageFlags: Codable, Equatable {
         self.enabled = enabled
         self.pinned = pinned
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = c.tolerant(.enabled, false)
+        pinned = c.tolerant(.pinned, false)
+    }
 }
 
 // MARK: - Full pipeline configuration (what a preset captures, §5.5)
@@ -128,10 +445,15 @@ public struct PipelineConfiguration: Codable, Equatable {
     public var lut = LUTSettings()
     public var blur = BlurSettings()
     public var geometry = GeometrySettings()
+    public var gaze = GazeSettings()
+    public var background = BackgroundSettings()
+    public var overlay = OverlaySettings()
 
     public var flags: [StageID: StageFlags] = [
         .geometry: StageFlags(), .adjust: StageFlags(),
         .lut: StageFlags(), .blur: StageFlags(),
+        .gaze: StageFlags(), .background: StageFlags(),
+        .overlay: StageFlags(),
     ]
 
     public var format: VideoFormat = VideoFormat(width: 1920, height: 1080, frameRate: 30)
@@ -145,6 +467,36 @@ public struct PipelineConfiguration: Codable, Equatable {
 
     public func flags(for id: StageID) -> StageFlags {
         flags[id] ?? StageFlags()
+    }
+
+    public enum CodingKeys: String, CodingKey {
+        case adjust, lut, blur, geometry, gaze, background, overlay
+        case flags, format, latencyPolicy, cameraID, microphoneID
+    }
+
+    // Synthesised Codable does not fall back to property defaults for absent
+    // keys — it throws. That would mean every saved configuration and every
+    // user preset written by an earlier build fails to decode the moment
+    // this struct gains a field, and the user silently loses their whole
+    // setup on upgrade. Decoding each field independently makes new fields
+    // additive and old files forward-compatible; `encode` stays synthesised.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        func decode<T: Decodable>(_ key: CodingKeys, _ fallback: T) -> T {
+            ((try? container.decodeIfPresent(T.self, forKey: key)) ?? nil) ?? fallback
+        }
+        adjust = decode(.adjust, AdjustSettings())
+        lut = decode(.lut, LUTSettings())
+        blur = decode(.blur, BlurSettings())
+        geometry = decode(.geometry, GeometrySettings())
+        gaze = decode(.gaze, GazeSettings())
+        background = decode(.background, BackgroundSettings())
+        overlay = decode(.overlay, OverlaySettings())
+        flags = decode(.flags, [:])
+        format = decode(.format, VideoFormat(width: 1920, height: 1080, frameRate: 30))
+        latencyPolicy = decode(.latencyPolicy, LatencyPolicy.balanced)
+        cameraID = (try? container.decodeIfPresent(String.self, forKey: .cameraID)) ?? nil
+        microphoneID = (try? container.decodeIfPresent(String.self, forKey: .microphoneID)) ?? nil
     }
 }
 

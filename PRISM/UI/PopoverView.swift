@@ -87,8 +87,12 @@ struct PopoverView: View {
             if state.clipState != .none {
                 scrubRow
             }
+        case .moments:
+            MomentsSection()
         case .presets:
             PresetBar()
+        case .scene:
+            SceneSection()
         case .framing:
             FramingSection()
         case .effects:
@@ -156,6 +160,9 @@ struct PopoverView: View {
             switch warning.action {
             case .raiseBudget:
                 Button("Raise budget") { state.raiseBudgetOneStep() }
+                    .controlSize(.small)
+            case .armBuffer:
+                Button("Turn on") { state.setBufferArmed(true) }
                     .controlSize(.small)
             case .openSettings:
                 Button("Open Settings") { openSettingsWindow() }

@@ -185,10 +185,19 @@ All stages encode into a **single** `MTLCommandBuffer` per frame. One commit, on
 Stage order is fixed:
 
 ```
-Clip substitution → Freeze → Geometry → Adjust → LUT → Background blur → Output fit → Push
+Clip → Replay → Freeze → Eye contact → Geometry → Adjust → LUT →
+Background blur → Virtual background → Overlay → Output fit → Push
 ```
 
-Clip and Freeze come first because they replace the source; everything downstream applies to whatever the source ends up being. Geometry precedes color so that crop and zoom do not change how a LUT reads. Output fit is not a user stage — it is the final scale/letterbox into the negotiated format and always runs.
+The three substituting stages come first because they replace the source; everything downstream applies to whatever the source ends up being. They are ordered by escalating authority: a replay overrides a playing clip, and a freeze overrides a replay — each is a more deliberate "stop showing me live" than the one before it. Since every substituting stage writes the whole frame, chain position *is* precedence.
+
+Eye contact precedes Geometry so the warp happens in the same space Vision measured its landmarks in; putting it after zoom and rotation would mean transforming every landmark through the geometry matrix just to stay aligned. Geometry precedes color so that crop and zoom do not change how a LUT reads.
+
+Background blur, Virtual background and Overlay all consume the same person mask and composite over the finished look, so they run last. Blur and Virtual background are mutually exclusive — they answer the same question — and the UI presents them as one control (§8.7). Overlay follows Virtual background so a foreground layer sits above a replaced background.
+
+Output fit is not a user stage — it is the final scale/letterbox into the negotiated format and always runs.
+
+**One segmentation per frame.** Four features need the person mask: background blur (§5.4), virtual backgrounds (§5.7), overlay layers placed behind the subject (§5.8), and auto-framing (§5.4). Segmentation is the single most expensive thing in the pipeline, so it runs **once**, driven by the pipeline at the first mask-consuming stage's position in the chain, and every consumer shares the result. Running two of these features together must cost one segmentation, not two. The mask is captured post-Geometry so it aligns with everything that samples it, and so auto-framing remains the closed-loop servo it is specified to be.
 
 ### 3.4 Latency budget and degradation
 
@@ -343,7 +352,7 @@ All GPU, all Metal. Do not use `CIContext` on the hot path — its render schedu
 |---|---|---|
 | Zoom | 1.0…4.0× | 1.0 |
 | Pan X / Y | −1…1 (fraction of the croppable margin) | 0, 0 |
-| Rotation | −15°…+15°, continuous | 0° |
+| Rotation | −180°…+180°, continuous | 0° |
 | Orientation | 0° / 90° / 180° / 270° | 0° |
 | Mirror | horizontal, vertical, both, none | none |
 | Crop aspect | free, 16:9, 4:3, 1:1, 9:16 | free |
@@ -365,6 +374,126 @@ Customizability without presets is a settings panel nobody returns to. `PresetSt
 - Presets bind to optional global hotkeys.
 - Switching presets crossfades over 200ms and never causes a format renegotiation — if a preset specifies a format outside the currently published set, apply everything else and show the reconnect confirmation from §3.2 for the format alone.
 - Export and import as JSON so configurations are shareable. This matters for an open-source project: shared presets are how a community forms around a tool like this.
+
+**Forward compatibility is a hard requirement, not a nicety.** Presets and the saved configuration are on-disk formats that outlive the build that wrote them. Swift's synthesised `Codable` throws on an absent key rather than falling back to a property default, so a naively-coded settings struct means every new field silently resets every existing user's entire setup on upgrade — configuration *and* every preset they had saved. Every persisted settings struct therefore decodes each field independently, at **every** nesting level. Top-level tolerance alone is not enough: version skew shows up as a partial nested object, and a tolerant parent decoding a throwing child discards the child wholesale.
+
+### 5.6 Eye-contact correction
+
+Redirects the subject's gaze toward the lens so they can read notes off-camera while appearing to look at whoever they are talking to.
+
+| Property | Specification |
+|---|---|
+| Stage | `.gaze`, `.expensive`, before Geometry |
+| Trigger | Scene section toggle, plus global hotkey ⌥⌘E |
+| Detection | `VNDetectFaceLandmarksRequest`, `.constellation76Points` (pupils only exist in the 76-point constellation), on a serial queue every 2nd frame, request input capped at 720p |
+| Measurement | Drift of the pupil from the centre of its own eye opening |
+| Correction | A `strength` fraction of that drift, removed |
+| Clamp | `maxShift` iris radii, default 0.5 |
+
+**The correction needs no knowledge of where the camera is mounted.** When someone looks into the lens, the pupil sits near the centre of the palpebral fissure; when they look at the screen instead, it sits off centre — down for the usual camera-above-display laptop, sideways for a monitor beside the webcam. Measuring how far the pupil has drifted from the centre of its own eye and pulling part of that back therefore self-calibrates. A setup where centred is not the truth (an oddly mounted external camera) is handled by `verticalBias` on top.
+
+**What this is.** The redirection itself is a geometric warp (`Gaze.metal`) driven by an on-device ML landmark model. It is *not* a learned image-to-image gaze synthesiser — it moves the iris you have rather than generating the one you would have had. That is the honest trade at this latency budget. `maxShift` clamps rather than extrapolates because past roughly half an iris width the sclera stretch becomes visible, and a subtly-wrong eye is far better than an uncanny one. **Do not describe this feature to users in terms that imply synthesis.**
+
+The warp per eye is the product of two falloffs: rigid across the iris disc (so the pupil and limbal ring keep their shape instead of smearing into an oval), and pinned at the eye-opening boundary (so eyelids, lashes and skin do not move). The sclera between them takes up the difference by stretching.
+
+Detection flickers, and a correction that pops on and off is more distracting than none, so tracking confidence ramps over ~0.25 s in both directions and scales the shift. Landmark smoothing defaults high: Vision's per-frame jitter is small but visible on something as fine as an iris.
+
+### 5.7 Virtual backgrounds
+
+Full background replacement — a still, a looping video, or a flat colour — using the same person mask as background blur (§3.3).
+
+| Property | Specification |
+|---|---|
+| Stage | `.background`, `.expensive`, after blur |
+| Modes | colour, image, video |
+| Fit | fill by default (a letterboxed backdrop reads as a bug); letterbox available. Never stretch. |
+| Edge controls | mask contrast, edge softness, light wrap |
+
+**Light wrap** bleeds the new background into the subject's rim. It is the cheapest thing that stops a composite reading as a sticker: real subjects pick up the colour of what is behind them.
+
+**Every degraded path errs toward covering the background, never toward revealing it.** This stage exists partly for privacy — someone turns it on because they do not want the room behind them on camera. Therefore:
+
+- No mask yet → composite against an all-zero mask, showing the backdrop across the whole frame for the frame or two segmentation takes to warm up.
+- Asset missing, still opening, or failed to load → the flat colour.
+- The stage will **not** pass the camera through under any circumstance.
+
+Blur and replacement are mutually exclusive and share one UI control (§8.7).
+
+### 5.8 Green-screen compositing
+
+Up to **three** placed, keyed layers over the finished frame — the stage that turns PRISM from a camera filter into a stage.
+
+| Property | Specification |
+|---|---|
+| Stage | `.overlay`, `.moderate`, after virtual background |
+| Sources | image (alpha honoured) or looping video |
+| Keying | none, chroma, or luma |
+| Placement | in front of everything, or behind the subject (mask-gated) |
+| Transform | scale, offset, rotation, mirror, opacity |
+| Layer cap | 3 (`OverlaySettings.maxLayers`) |
+
+Keying is computed in YCbCr so the key colour is arbitrary rather than hard-coded green, and despill works for any hue. Despill removes what is left of the key hue from surviving pixels, so a green screen stops tinting hair and shoulders.
+
+The layer cap is a memory constraint, not a GPU one: each layer is one compute pass, but each *video* layer carries its own decoder and frame FIFO, and resident memory is the binding limit (§7). At scale 1 a layer is fitted into the frame with its own aspect preserved — a square PNG stays square.
+
+Layers composite bottom-up in array order. Dropping an image or video onto the Scene pane adds it as a layer, the same affordance as dropping a `.cube` to import a LUT.
+
+### 5.9 Instant replay
+
+A rolling buffer of the last N seconds, so "say that again" is a keystroke rather than an awkward redo.
+
+| Property | Specification |
+|---|---|
+| Trigger | Moments tile, plus global hotkey ⌥⌘R |
+| Buffer | 4–30 s, default 10 s, **off by default** |
+| Recording | Hardware H.264 via `VTCompressionSession`, height capped (540p/720p/1080p, default 1080p), no frame reordering, 1 s keyframe interval |
+| Playback | 0.25–4×, default 1.5×; scrubbable; returns to live at the end by default |
+
+**The buffer stores encoded frames, not raw ones.** Ten seconds of raw 1080p30 is ~2.5 GB — an order of magnitude past the entire app's memory budget (§7). Encoded, it is ~10 MB, the encode happens on the media engine rather than the GPU or CPU, and the only real cost on the frame path is one downscale pass. This is why the buffer cannot simply be a bigger `FrameRing`.
+
+**It buffers camera frames, upstream of every effect.** A replay therefore runs through the live effects chain like any other source. Recording the finished output instead would double-apply every effect, and a replay that does not match the current look reads as a glitch rather than a rewind. Change your look mid-replay and the replay changes with it.
+
+Playback above 1× catches back up to live, which is the point: the user is showing someone the thing they missed, not screening a rerun. The buffer records only while something is actually consuming frames (§5.1 demand gating), and is off by default — an armed buffer runs a hardware encoder on every frame, and a resident agent must cost nothing for a feature nobody has switched on.
+
+Alongside the compressed ring, a 32×18 luma thumbnail is kept per frame. §5.10 explains why.
+
+### 5.10 Away loop
+
+An auto-generated "still here" idle loop instead of a static freeze when the user steps away.
+
+| Property | Specification |
+|---|---|
+| Trigger | Moments tile, plus global hotkey ⌥⌘A |
+| Source | The §5.9 rolling buffer (one recorder serves both) |
+| Loop length | 2–10 s, default 4 s |
+| Seam crossfade | 0–1500 ms, default 400 ms |
+| Audio | Mutes by default — stepping away means stepping away |
+
+**Cut-point selection is the whole feature.** Two things make an auto-generated idle loop convincing, and they pull in different directions: the cut has to be invisible, which wants the first and last frames to match; and the loop has to look alive rather than like a stuck stream, which wants *some* motion. The score is therefore the seam difference (weighted 3×, because a visible jump cut is what gives these away) plus the segment's mean frame-to-frame motion, minimised over all candidate segments.
+
+This is what the per-frame thumbnails exist for. The §5.2 sharpness score yields one scalar per frame, which can rank frames but cannot answer "do these two frames match closely enough to loop between them?" Thumbnails can, at 576 floats per frame.
+
+**The most recent second is excluded outright.** The away loop is triggered as someone gets up, so the newest frames are exactly the ones with a hand reaching off-screen in them.
+
+At the wrap point the loop crossfades its tail into its own held first frame and restarts on that frame. Holding one frame costs one texture (~8 MB); crossfading two arbitrary points of a compressed stream would mean two decompression sessions and two frame FIFOs, for an identical result.
+
+A frozen frame tells everyone you left. A loop that breathes does not — worth being deliberate about, and the reason the menu bar glyph has a dedicated away state (§8.2).
+
+### 5.11 Panic
+
+One chord: freeze, mute, and swap to a "back in a bit" backdrop. Built entirely from primitives PRISM already has.
+
+| Property | Specification |
+|---|---|
+| Trigger | Moments tile, plus global hotkey ⌥⌘P |
+| Components | freeze / mute / backdrop swap, each individually switchable |
+| Backdrop | user image or video, falling back to a flat colour |
+
+Deliberately un-shifted: a panic key you have to reach for is not one.
+
+Pressing it again restores **exactly** the prior state, including a freeze or mute the user had engaged themselves beforehand — panic tracks what it changed rather than blanket-reverting.
+
+The backdrop swap mutates the live configuration so every surface shows what is actually on air, but the pre-panic configuration snapshot is what gets persisted and what a preset save captures. Relaunching after a panic must leave the user where they were, not stuck behind a "back in a bit" card with no memory of why.
 
 ---
 
@@ -494,9 +623,16 @@ enum Metrics {
 | Not in use by any client | Outline prism, 40% opacity |
 | Live, pass-through | Outline prism, full opacity |
 | Effects active | Filled prism |
+| Replaying | Filled prism with rewind badge |
+| Away | Filled prism with moon badge |
 | Frozen | Filled prism with pause bar |
 | Muted | Filled prism with slash |
+| Panic engaged | Filled prism with raised-hand badge, `.red` tint |
 | Error | Filled prism, `.red` tint |
+
+Precedence: error > panic > away > replaying > frozen > muted > effects > live > idle.
+
+The four substitution states outrank the effect states because forgetting you are in one is the damaging failure this app can produce. Replay, away and panic each get their own glyph rather than folding into frozen, because *"why can nobody see me moving"* has to be answerable at a glance.
 
 ### 8.3 Popover layout
 
@@ -574,6 +710,14 @@ Sentence case throughout. Active voice. Name things by what the user controls, n
 | Camera unplugged | `FaceTime HD Camera disconnected. Using built-in camera.` |
 | Extension not approved | `Approve PRISM Camera in System Settings to continue` |
 | Audio plug-in missing | `Install the audio component to use PRISM Microphone` |
+| Replay/away without a buffer | `Turn on the rolling buffer to use instant replay` + action `Turn on` |
+| Away armed on first use | `Rolling buffer on. The away loop needs a few seconds of video first.` |
+| Away with too little buffered | `Not enough video buffered yet for an away loop` |
+| Overlay layer cap reached | `PRISM composites up to 3 layers at once` |
+| Eye contact searching | `Looking for your eyes…` |
+| Eye contact active | `Tracking your eyes` |
+| Replay on air | `Playing back at 1.5× — everyone is seeing the past right now.` |
+| Away on air | `Looping. Everyone sees the idle clip until you turn this off.` |
 
 Errors state what happened and what to do. They do not apologize and are never vague.
 
@@ -603,6 +747,14 @@ The meter sits directly under the status line and is always visible — it is th
 `accessibilityDifferentiateWithoutColor` adds a threshold tick mark at the budget line and changes the trailing label to include `over budget` when exceeded.
 
 Per-stage cost appears inline in the Effects list at `.caption2` `.secondary`. When a user toggles blur and watches the meter move from green to yellow, they have learned the trade-off without reading documentation. That is the entire design intent of exposing these numbers.
+
+### 8.7 One question, one control
+
+Background blur (§5.4) and virtual backgrounds (§5.7) are separate stages with separate costs, but they answer the same question and cannot both be true — blurring a background you have already replaced is nonsense. They are therefore presented as **one** control with modes: `Off / Blur / Colour / Image / Video`. Two independent switches would let a user construct exactly the nonsense case, and the underlying stage flags are kept consistent for them.
+
+The same reasoning governs where things live. `Effects` holds per-pixel colour work (Adjust, LUT). `Scene` holds everything that changes what is in frame besides you (Background, Overlay, Eye contact). `Moments` holds everything that changes what is on air in *time* rather than space (Replay, Away, Panic).
+
+**Replay, away and panic settings are not part of a preset.** A preset captures a look. "How many seconds do you keep in memory" and "what does the panic key do" are not looks, and switching from Meeting to Studio must not silently rearm a hardware encoder or repoint a panic backdrop. They persist separately as `StudioSettings`.
 
 ---
 

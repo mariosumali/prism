@@ -93,10 +93,18 @@ public final class LatencyMonitor: ObservableObject {
 
     private let publishTimer: DispatchSourceTimer
 
-    /// Only effects stages are degradation candidates; clip/freeze carry user
-    /// intent and outputFit is structural — auto-disabling any of them would
-    /// change what the user is deliberately showing.
-    private static let disableCandidates: Set<StageID> = [.geometry, .adjust, .lut, .blur]
+    /// Only effects stages are degradation candidates. Clip, replay and
+    /// freeze carry user intent — auto-disabling them would put the live
+    /// camera back on air behind the user's back, which is the one failure
+    /// this app must never produce — and outputFit is structural.
+    ///
+    /// Eye contact, virtual background and overlay ARE candidates: they are
+    /// looks, and a look is exactly what §3.4 says to sacrifice before a
+    /// dropped frame. Virtual background degrading means the real room comes
+    /// back, so it is weighted expensive and loses before cheaper stages.
+    private static let disableCandidates: Set<StageID> = [
+        .geometry, .adjust, .lut, .blur, .gaze, .background, .overlay,
+    ]
 
     // MARK: Lifecycle
 

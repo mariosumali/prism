@@ -38,12 +38,20 @@ import Metal
 
 final class DraftRenderer {
     private let metal: MetalContext
+    private let segmenter: PersonSegmenter
+    private let gazeStage: GazeStage
     private let geometryStage: GeometryStage
     private let adjustStage: AdjustStage
     private let lutStage: LUTStage
     private let blurStage: BlurStage
+    private let backgroundStage: BackgroundStage
+    private let overlayStage: OverlayStage
     private let outputFitStage: OutputFitStage
     private let userStages: [EffectStage]
+
+    /// Mirrors VideoPipeline.maskConsumers — the chain position where the
+    /// draft's own segmentation runs.
+    private static let maskConsumers: Set<StageID> = [.blur, .background, .overlay]
 
     /// The finished draft texture for the preview. Completion-thread callback.
     var onOutput: ((MTLTexture) -> Void)?
@@ -67,14 +75,26 @@ final class DraftRenderer {
     init(metal: MetalContext, outputFormat: VideoFormat) throws {
         self.metal = metal
         self.outputFormat = outputFormat
+        segmenter = try PersonSegmenter(metal: metal)
+        gazeStage = try GazeStage(metal: metal)
         geometryStage = try GeometryStage(metal: metal)
         adjustStage = try AdjustStage(metal: metal)
         lutStage = try LUTStage(metal: metal)
-        blurStage = try BlurStage(metal: metal)
+        blurStage = try BlurStage(metal: metal, segmenter: segmenter)
+        backgroundStage = try BackgroundStage(metal: metal, segmenter: segmenter)
+        overlayStage = try OverlayStage(metal: metal, segmenter: segmenter)
         outputFitStage = try OutputFitStage(metal: metal)
-        userStages = [geometryStage, adjustStage, lutStage, blurStage]
+        userStages = [gazeStage, geometryStage, adjustStage, lutStage,
+                      blurStage, backgroundStage, overlayStage]
         outputFitStage.outputSize = CGSize(width: outputFormat.width,
                                            height: outputFormat.height)
+    }
+
+    deinit {
+        // The draft's own media clocks stop with it; a torn-down renderer
+        // must not leave a background video decoding for nobody.
+        backgroundStage.setDemandActive(false)
+        overlayStage.setDemandActive(false)
     }
 
     func configure(outputFormat: VideoFormat) {
@@ -95,11 +115,21 @@ final class DraftRenderer {
         lutStage.settings = config.lut
         blurStage.settings = config.blur
         geometryStage.settings = config.geometry
+        gazeStage.settings = config.gaze
+        backgroundStage.settings = config.background
+        overlayStage.settings = config.overlay
+        segmenter.quality = config.blur.quality
+
         geometryStage.isEnabled = config.flags(for: .geometry).enabled
         adjustStage.isEnabled = config.flags(for: .adjust).enabled
         lutStage.isEnabled = config.flags(for: .lut).enabled
         blurStage.isEnabled = config.flags(for: .blur).enabled
-        blurStage.maskOnlyMode = false
+        gazeStage.isEnabled = config.flags(for: .gaze).enabled
+        backgroundStage.isEnabled = config.flags(for: .background).enabled
+        overlayStage.isEnabled = config.flags(for: .overlay).enabled
+
+        backgroundStage.setDemandActive(true)
+        overlayStage.setDemandActive(true)
     }
 
     /// Forwarded from the live auto-framer so the draft previews the same
@@ -147,7 +177,26 @@ final class DraftRenderer {
 
         var current = source
         var useA = true
-        for stage in userStages where stage.wantsEncode() {
+        var segmentationDone = false
+        for stage in userStages {
+            // Same one-segmentation-per-frame contract as VideoPipeline. The
+            // draft does run its own Vision request when a mask consumer is
+            // staged — without it a drafted background or blur would preview
+            // as pass-through, which is the one thing a preview must not do.
+            if !segmentationDone, Self.maskConsumers.contains(stage.id) {
+                segmentationDone = true
+                let demanded = blurStage.isEnabled
+                    || backgroundStage.needsPersonMask
+                    || overlayStage.needsPersonMask
+                if demanded {
+                    segmenter.isDemanded = true
+                    segmenter.update(commandBuffer: commandBuffer, input: current)
+                } else if segmenter.isDemanded {
+                    segmenter.isDemanded = false
+                    segmenter.invalidate()
+                }
+            }
+            guard stage.wantsEncode() else { continue }
             guard let dst = useA ? intermediateA : intermediateB else {
                 throw PipelineError.textureAllocationFailed
             }

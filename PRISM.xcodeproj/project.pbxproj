@@ -11,6 +11,7 @@
 		03900F480E5844053590B4D9 /* PresetStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00484E681C5D813404917AE1 /* PresetStore.swift */; };
 		043B4B1E28A11209B6EAB227 /* LUTStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC94DF5ADB2CCC4413D10B50 /* LUTStore.swift */; };
 		0508ECBB98D540DF7FAB024D /* PanePreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 651F67AFECCFCD3A324DBCB2 /* PanePreview.swift */; };
+		068274E908F4592D7BF12D65 /* GazeStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = D3C2F4AD2DBD23DF00FC2A8D /* GazeStage.swift */; };
 		076097B2BFE642935323CC8E /* CoreFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6B2B26D8A861BAEDB87E6A89 /* CoreFoundation.framework */; };
 		07ABFE6A7063006C7970A2EF /* RingBuffer.c in Sources */ = {isa = PBXBuildFile; fileRef = AD5DCDAE59542E9A670A9B42 /* RingBuffer.c */; };
 		08C24FBBBAE5D3DA73705BCD /* ExtensionInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EE248762C200152A2E3EA8D /* ExtensionInstaller.swift */; };
@@ -18,6 +19,7 @@
 		0E8B3A768A67EA41396D9111 /* AppStateTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62AF43069E1F77F701394067 /* AppStateTypes.swift */; };
 		13364E22BFAAB95ECA53493B /* StageSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6490B465289A45CBA9E2274F /* StageSettings.swift */; };
 		14E4FA557BA7837E566BF73E /* RingBufferTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CD66F0B2FCC790E25042496 /* RingBufferTests.swift */; };
+		16DA69013A83E5E11533E5AF /* GazeStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = D3C2F4AD2DBD23DF00FC2A8D /* GazeStage.swift */; };
 		177EFFF03CC605C85B0E9733 /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC236B6B716770D870EC4658 /* AppState.swift */; };
 		1801A47FAF78BD611FF9E242 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = DAB4360F8A3589624753D9D9 /* Assets.xcassets */; };
 		18AC7C2C124ABFE9EED45B8D /* MainWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9B43BCAF0730BAEB1EE9FB65 /* MainWindowController.swift */; };
@@ -31,6 +33,7 @@
 		2A5EAD59198110ABF9B56BEC /* OutputFitStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = C459B61B281B0164BF4BC1C9 /* OutputFitStage.swift */; };
 		2AFEE60289749738AF678B3A /* EffectsSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = D56DC5301882D68A1F0658AF /* EffectsSection.swift */; };
 		2B5F7B93A47E255D80EB2C69 /* LatencyMeter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 53514366F59C6ADAC3800705 /* LatencyMeter.swift */; };
+		2BF729B8CC62923A505BE535 /* ReplayBuffer.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1B6DDEB62CF87A54AA7D65B /* ReplayBuffer.swift */; };
 		2F35626197549CAA9B220D70 /* VideoPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AEF33697F8E471A59D55333 /* VideoPipeline.swift */; };
 		31045908DF67678E385D83D6 /* AutoFramerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 665587966FF1DC8F9D0575C3 /* AutoFramerTests.swift */; };
 		310FB4250DD21F3F4DB12908 /* StreamSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D88CE1466967F22224CD876 /* StreamSource.swift */; };
@@ -46,34 +49,45 @@
 		413AA75C4128C5C999F134C1 /* DeviceMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = D74EF65BB5797627F0D9C525 /* DeviceMonitor.swift */; };
 		41F54808F71A361B213B5895 /* CoreAudio.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 77115686AA2FCDA4D9AF6C38 /* CoreAudio.framework */; };
 		43BDABED1115BCDACEB94282 /* MainWindowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73270FD112F0C8B1BA82E0EB /* MainWindowView.swift */; };
+		4519999DCDEE6DB795EA0D07 /* BackgroundStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A36434DB9634BBC1E28F94F5 /* BackgroundStage.swift */; };
 		456570CE53198E0BB1156655 /* Cool.cube in Resources */ = {isa = PBXBuildFile; fileRef = F5CF86EF692111A7BC80FF9F /* Cool.cube */; };
 		4586A148816F107CD05E4DEC /* PixelFormats.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93070807D31FCC2579995DBC /* PixelFormats.swift */; };
 		45B17D4FB593E69A1D14E951 /* PRISMApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCF581196F074CC78EF6E49A /* PRISMApp.swift */; };
 		45C1643D61F74834684CEDC4 /* PresetsPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59DE48E698981ADCCC127856 /* PresetsPane.swift */; };
+		48831D16987F5255F4410172 /* ReplayBufferTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93DF453D1AD025F78107920C /* ReplayBufferTests.swift */; };
 		4CDF21B240459C66D7D97EF0 /* EffectsPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = F83B9E6AE227921AA633A2A1 /* EffectsPane.swift */; };
 		4CFF7D54279FF9949E785AD6 /* FramingPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = 985EBBD95DF6C83F13A30A4A /* FramingPane.swift */; };
 		4D08DCAD2F2B9368687D0A78 /* AudioSink.swift in Sources */ = {isa = PBXBuildFile; fileRef = 367E6B83C5BE24FFC29A2B64 /* AudioSink.swift */; };
+		4ED2E4698E027A514789B68A /* ScenePane.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0085374A06F1C7AECB0AB857 /* ScenePane.swift */; };
+		532FA68CEF2F36887E34663C /* MomentsSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 12C343B3A84A51C036889902 /* MomentsSection.swift */; };
+		53BF17FAEE2EC7393693EFAC /* OverlayStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CB075C6D6D34CA3BE2BB96D /* OverlayStage.swift */; };
 		54002C1336EFDE2DB32F9737 /* FreezeStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 21CC8265134D3F7EFB19E105 /* FreezeStage.swift */; };
 		5D9A73586FFDB44A65D2C907 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 334E7F01542A708162B01D41 /* main.swift */; };
+		5EA176B53CA3217907078A0E /* Layers.metal in Sources */ = {isa = PBXBuildFile; fileRef = CEA5572941CB1B51AFC54052 /* Layers.metal */; };
 		5F3DB6929124FB6B6AFD1794 /* ClipStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B73B15856323C3240286438 /* ClipStage.swift */; };
+		60100DB363BE2B15347F2770 /* SceneSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E4230754DD0CC06066B1699 /* SceneSection.swift */; };
 		62432F3DB10485974FAC5235 /* MenuBarLayoutPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95D50908EB1583324D4BF7B8 /* MenuBarLayoutPane.swift */; };
 		6654C19B8CF13CB1211B93F0 /* DesignSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = E428DF4772A95B7DACD74F98 /* DesignSystem.swift */; };
 		67F5BD244F0B193BB652C30F /* Film.cube in Resources */ = {isa = PBXBuildFile; fileRef = 52BC20A79E3805278E9CEDA5 /* Film.cube */; };
 		68E826BECFBEC7E5D54FDB0F /* ClipStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B73B15856323C3240286438 /* ClipStage.swift */; };
 		693BBDD9813D15E15CF0815F /* Warm.cube in Resources */ = {isa = PBXBuildFile; fileRef = DA068C6A1C7FBD48889FE190 /* Warm.cube */; };
 		6AE16A57587040AAA7448F7E /* RingBuffer.c in Sources */ = {isa = PBXBuildFile; fileRef = AD5DCDAE59542E9A670A9B42 /* RingBuffer.c */; };
+		6BA2522593C2C9245934D3D1 /* MomentsPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = C57BF23686FD9A58028F79C8 /* MomentsPane.swift */; };
 		6F03BCFE7C91C21764C9ADDF /* ClipPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA5B6F4E65AFE3DA58C25DAE /* ClipPlayer.swift */; };
 		70CB806DE182923F7D92889E /* Film.cube in Resources */ = {isa = PBXBuildFile; fileRef = 52BC20A79E3805278E9CEDA5 /* Film.cube */; };
+		72658A320EC1565F00C95EFE /* StudioSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1C7AE0F914D6DA76D2C9845 /* StudioSettings.swift */; };
 		7285D9896068AEB7155529D3 /* Hotkeys.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8ECBD2378C965EA3C4DE5B3E /* Hotkeys.swift */; };
 		75CB5AD2CFD744950643E4F0 /* Blur.metal in Sources */ = {isa = PBXBuildFile; fileRef = 16D7CFDB5202A947C70C2542 /* Blur.metal */; };
 		7828206F9B97B429A62B5BEF /* AudioCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 430EC642B947703386BE6E7E /* AudioCapture.swift */; };
 		7854AE0EF5145031F61E9B9F /* Geometry.metal in Sources */ = {isa = PBXBuildFile; fileRef = CB00F8324910C2B14928EE56 /* Geometry.metal */; };
 		78B18C43618740971E693BCD /* KernelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE29DCB396A6FB8888F5B0A4 /* KernelTests.swift */; };
 		7AF9E2444E5A6136F7BEC079 /* PopoverView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 619B13203A28CA9E0927F0B2 /* PopoverView.swift */; };
+		7B4564D754C892A061D2AC72 /* GazeStageTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CEF4CED9705F22BC22756360 /* GazeStageTests.swift */; };
 		7C832E809F7ACF0AC9509A50 /* Neutral.cube in Resources */ = {isa = PBXBuildFile; fileRef = 23DF6FB0C9E81B3D1E58A0B2 /* Neutral.cube */; };
 		7D53884422567455CE547C06 /* FormatManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79FF7AF601E55D37F66EB022 /* FormatManagerTests.swift */; };
 		7E9FCD7C75549A643620A80C /* LoginItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 520983359A7294925FDB93C3 /* LoginItem.swift */; };
 		7FD37A5D7718F5FAFECB9130 /* PixelFormats.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93070807D31FCC2579995DBC /* PixelFormats.swift */; };
+		80BD9B7E0604871C1C69F558 /* Gaze.metal in Sources */ = {isa = PBXBuildFile; fileRef = A20A229F46527A72C3480E58 /* Gaze.metal */; };
 		81D506FAD718ACD521040B79 /* Permissions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B1C3A2AE4BA0EB6991632B0 /* Permissions.swift */; };
 		875D06A0D885110E80C0E53F /* FreezeStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 21CC8265134D3F7EFB19E105 /* FreezeStage.swift */; };
 		88A406B90AEDA715588C49BC /* Mono.cube in Resources */ = {isa = PBXBuildFile; fileRef = E6939C7C96B029684841510E /* Mono.cube */; };
@@ -82,7 +96,10 @@
 		8B31065501BDBE33FD9A3DD3 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8949CE3186FBB24B552D6A6D /* SettingsView.swift */; };
 		907E78395A000D9465917CDB /* AdjustStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2D1A5DE99E9DCD69AFA2645 /* AdjustStage.swift */; };
 		925278567290F9E725EED4B2 /* AudioSink.swift in Sources */ = {isa = PBXBuildFile; fileRef = 367E6B83C5BE24FFC29A2B64 /* AudioSink.swift */; };
+		928CF2782BE2C4AAC6CDBC53 /* StudioSettingsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98BA26EAD66B6EC21B19D565 /* StudioSettingsTests.swift */; };
 		9326B86685AC832D8F1E7919 /* StageSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6490B465289A45CBA9E2274F /* StageSettings.swift */; };
+		938A5F43063CB5AE29968EE8 /* Gaze.metal in Sources */ = {isa = PBXBuildFile; fileRef = A20A229F46527A72C3480E58 /* Gaze.metal */; };
+		953AD29AE5455304C40C8366 /* BackgroundStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A36434DB9634BBC1E28F94F5 /* BackgroundStage.swift */; };
 		95E8F5036531F2CC17E18CE5 /* LUTStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E157BD293B9E7F816DA6241C /* LUTStoreTests.swift */; };
 		96FDF3F167B0765679F67904 /* LUT.metal in Sources */ = {isa = PBXBuildFile; fileRef = 908D97B57D980B712327EB7B /* LUT.metal */; };
 		98151E93FEA646A68F8A7E6B /* Neutral.cube in Resources */ = {isa = PBXBuildFile; fileRef = 23DF6FB0C9E81B3D1E58A0B2 /* Neutral.cube */; };
@@ -91,6 +108,7 @@
 		A16D4A296E5187F05D485932 /* Hotkeys.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8ECBD2378C965EA3C4DE5B3E /* Hotkeys.swift */; };
 		A5052C1B0A939F46922F86EF /* CameraCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = A22C46F765CFA76387C26277 /* CameraCapture.swift */; };
 		A51A2BAFD6ED9620C066569F /* FramingSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = DB2A5CA765E6AAB38279FB40 /* FramingSection.swift */; };
+		A665E3E3A7A06ED1AE4431A4 /* ReplayStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F2D2D84A17A12C4AA5F0873 /* ReplayStage.swift */; };
 		A89AC82673115677D48FBF84 /* GeometryStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = F68B971871151DCA9C3F91D3 /* GeometryStage.swift */; };
 		A9878DDCED22981BEB6BD3C7 /* ControlTile.swift in Sources */ = {isa = PBXBuildFile; fileRef = B344343652BB2DB9EB6E8CE1 /* ControlTile.swift */; };
 		ACDFF2564655D3097A21C900 /* Adjust.metal in Sources */ = {isa = PBXBuildFile; fileRef = E8D1B82A692934B670FF6FE7 /* Adjust.metal */; };
@@ -100,9 +118,11 @@
 		B15E0D28EBD150EEF0E9D748 /* OutputFitStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = C459B61B281B0164BF4BC1C9 /* OutputFitStage.swift */; };
 		B5FEAA6F6DBDB0F2B2879C92 /* BlurStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18AF5ECE4C7193418E1A8B65 /* BlurStage.swift */; };
 		B8F948AE481A92DD942653B5 /* CameraCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = A22C46F765CFA76387C26277 /* CameraCapture.swift */; };
+		BA1AA80930E0888DCB1516FC /* StudioSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1C7AE0F914D6DA76D2C9845 /* StudioSettings.swift */; };
 		BAB9FD099963309479EE4809 /* VideoPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AEF33697F8E471A59D55333 /* VideoPipeline.swift */; };
 		BABD2F2BAD9320FD8E4A13D2 /* ExtensionProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A3CC15AE7381523F9118087 /* ExtensionProvider.swift */; };
 		BB34570CB4BC16A19750B926 /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E0756772A7F36507B633C11 /* OnboardingView.swift */; };
+		BC4C31E12F7CECB787D530B9 /* Layers.metal in Sources */ = {isa = PBXBuildFile; fileRef = CEA5572941CB1B51AFC54052 /* Layers.metal */; };
 		BCDF72069FFEF0E8FB8FABE6 /* PlaceholderRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD229C9E3A81527D84843A1B /* PlaceholderRenderer.swift */; };
 		BCEFA3727CF838AA2FBB8E62 /* FormatSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = ED9EEE45DD9D6C7C1C7D098E /* FormatSection.swift */; };
 		BE129B9E06E67A5276BB1FFE /* AppStateTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62AF43069E1F77F701394067 /* AppStateTypes.swift */; };
@@ -113,9 +133,12 @@
 		C1C3EFD86901077CA63CE5E0 /* StudioPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2A10AB36C896FCE953C1226 /* StudioPane.swift */; };
 		C2F6142D397DF59A093959B4 /* Geometry.metal in Sources */ = {isa = PBXBuildFile; fileRef = CB00F8324910C2B14928EE56 /* Geometry.metal */; };
 		C5DA69A9EC6473A319A08D1F /* Composite.metal in Sources */ = {isa = PBXBuildFile; fileRef = 9AC6456E2FE242D16DD43349 /* Composite.metal */; };
+		C6061D4C4DBE8BACD6EC2D01 /* ReplayPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020F7D5FFB53F57E5B034B13 /* ReplayPlayer.swift */; };
 		C678B23F7C7EC63113052A37 /* LatencyMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = E8CB82B65292DC6EEB8FA768 /* LatencyMonitor.swift */; };
 		C706B7516EEA141DCFEF2E73 /* ClipPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA5B6F4E65AFE3DA58C25DAE /* ClipPlayer.swift */; };
+		CD981F9B41E9F32141602550 /* PersonSegmenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD4AB93D2C1D0234FCC225DF /* PersonSegmenter.swift */; };
 		D2D26CA51F144956D17050A2 /* PresetBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE972D19DB5CED77AC4B88C2 /* PresetBar.swift */; };
+		D44593EDB4E4B7DBB20B380B /* SceneCompositingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 954600C921AC4A39BF54C986 /* SceneCompositingTests.swift */; };
 		D66E1CCCCC04289DCE65F4E0 /* AudioCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 430EC642B947703386BE6E7E /* AudioCapture.swift */; };
 		DA050785FF6504B8FBDBF7FA /* FormatManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1316A897BE17127EF6A8D0D /* FormatManager.swift */; };
 		DADDF8EA7E58F34952A6B255 /* PRISM_Stream.cpp in Sources */ = {isa = PBXBuildFile; fileRef = FAC96E07ED0AA27A32471B7F /* PRISM_Stream.cpp */; };
@@ -127,11 +150,18 @@
 		E3B751C9E235135645C18EFF /* GeometryMathTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9FFE81443EA611E13E70543 /* GeometryMathTests.swift */; };
 		E6AB61E973F3E879AF4D54A7 /* FrameRing.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E5FCEB7DD1501A57382CB83 /* FrameRing.swift */; };
 		E89124469D1FE6A190031339 /* AutoFramer.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA55D796CEDD2B65D7897F4B /* AutoFramer.swift */; };
+		E9B1102B99134C83AF9C22D8 /* LayerSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4452DC5051EF36B908AE0B7 /* LayerSource.swift */; };
 		EBB6B5029058B6A7ACA5E6C7 /* FormatPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3C02463C50F08564384E6C5B /* FormatPane.swift */; };
+		EE1536EEB314E9601D66FE2B /* ReplayBuffer.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1B6DDEB62CF87A54AA7D65B /* ReplayBuffer.swift */; };
 		F12E06180D3B45A450096772 /* Composite.metal in Sources */ = {isa = PBXBuildFile; fileRef = 9AC6456E2FE242D16DD43349 /* Composite.metal */; };
+		F2D874DB12C8DB1D00FAF3D9 /* OverlayStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CB075C6D6D34CA3BE2BB96D /* OverlayStage.swift */; };
 		F5A5381BE6CFDF4D148084D8 /* LUTStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 12068898E3D79E293BC12ADD /* LUTStage.swift */; };
 		F756830956D37714288553B7 /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC236B6B716770D870EC4658 /* AppState.swift */; };
+		FADF2B49411B5945AAAA3754 /* PersonSegmenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD4AB93D2C1D0234FCC225DF /* PersonSegmenter.swift */; };
 		FB094D09ABCF19D3DF99788F /* DeviceSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13032872A117E6CB8B3E2A1D /* DeviceSource.swift */; };
+		FB6455BB81B2A1051B00A28C /* LayerSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4452DC5051EF36B908AE0B7 /* LayerSource.swift */; };
+		FCC2A27E20E47EE9906C13FB /* ReplayPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020F7D5FFB53F57E5B034B13 /* ReplayPlayer.swift */; };
+		FD73E8756AA915964B6ED29E /* ReplayStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F2D2D84A17A12C4AA5F0873 /* ReplayStage.swift */; };
 		FD847B0464A22CADD6A51A2F /* EffectStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 78484AC653FD132ADA559CCF /* EffectStage.swift */; };
 		FE8C1EECF3E2CC9D43D55A13 /* LUT.metal in Sources */ = {isa = PBXBuildFile; fileRef = 908D97B57D980B712327EB7B /* LUT.metal */; };
 		FFB4D76DE8FD8C48DA850CEF /* PresetStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4189198EA5B988CFF03C050 /* PresetStoreTests.swift */; };
@@ -163,8 +193,12 @@
 
 /* Begin PBXFileReference section */
 		00484E681C5D813404917AE1 /* PresetStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresetStore.swift; sourceTree = "<group>"; };
+		0085374A06F1C7AECB0AB857 /* ScenePane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScenePane.swift; sourceTree = "<group>"; };
+		020F7D5FFB53F57E5B034B13 /* ReplayPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReplayPlayer.swift; sourceTree = "<group>"; };
 		0B1C3A2AE4BA0EB6991632B0 /* Permissions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Permissions.swift; sourceTree = "<group>"; };
+		0E4230754DD0CC06066B1699 /* SceneSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneSection.swift; sourceTree = "<group>"; };
 		12068898E3D79E293BC12ADD /* LUTStage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LUTStage.swift; sourceTree = "<group>"; };
+		12C343B3A84A51C036889902 /* MomentsSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MomentsSection.swift; sourceTree = "<group>"; };
 		13032872A117E6CB8B3E2A1D /* DeviceSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceSource.swift; sourceTree = "<group>"; };
 		16D7CFDB5202A947C70C2542 /* Blur.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Blur.metal; sourceTree = "<group>"; };
 		18AF5ECE4C7193418E1A8B65 /* BlurStage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlurStage.swift; sourceTree = "<group>"; };
@@ -174,6 +208,7 @@
 		23DF6FB0C9E81B3D1E58A0B2 /* Neutral.cube */ = {isa = PBXFileReference; path = Neutral.cube; sourceTree = "<group>"; };
 		2435E0B8D2F51C5BA54E2363 /* PRISM_PlugIn.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = PRISM_PlugIn.h; sourceTree = "<group>"; };
 		2C3E91CDAD0F5859F1D113C2 /* PRISM.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PRISM.entitlements; sourceTree = "<group>"; };
+		2F2D2D84A17A12C4AA5F0873 /* ReplayStage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReplayStage.swift; sourceTree = "<group>"; };
 		334E7F01542A708162B01D41 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		346FB9016E5C3A25396B2F61 /* PRISMCameraExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PRISMCameraExtension.entitlements; sourceTree = "<group>"; };
 		3470A96AFDE1B23E68BD8EDD /* PRISMAudioPlugIn.bundle */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PRISMAudioPlugIn.bundle; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -201,6 +236,7 @@
 		6A3CC15AE7381523F9118087 /* ExtensionProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExtensionProvider.swift; sourceTree = "<group>"; };
 		6B2B26D8A861BAEDB87E6A89 /* CoreFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreFoundation.framework; path = System/Library/Frameworks/CoreFoundation.framework; sourceTree = SDKROOT; };
 		6C53F2782DAEA73F7178BC47 /* DraftRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DraftRenderer.swift; sourceTree = "<group>"; };
+		6CB075C6D6D34CA3BE2BB96D /* OverlayStage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverlayStage.swift; sourceTree = "<group>"; };
 		6CD66F0B2FCC790E25042496 /* RingBufferTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RingBufferTests.swift; sourceTree = "<group>"; };
 		73270FD112F0C8B1BA82E0EB /* MainWindowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindowView.swift; sourceTree = "<group>"; };
 		77115686AA2FCDA4D9AF6C38 /* CoreAudio.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreAudio.framework; path = System/Library/Frameworks/CoreAudio.framework; sourceTree = SDKROOT; };
@@ -214,13 +250,18 @@
 		8ECBD2378C965EA3C4DE5B3E /* Hotkeys.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Hotkeys.swift; sourceTree = "<group>"; };
 		908D97B57D980B712327EB7B /* LUT.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = LUT.metal; sourceTree = "<group>"; };
 		93070807D31FCC2579995DBC /* PixelFormats.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PixelFormats.swift; sourceTree = "<group>"; };
+		93DF453D1AD025F78107920C /* ReplayBufferTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReplayBufferTests.swift; sourceTree = "<group>"; };
+		954600C921AC4A39BF54C986 /* SceneCompositingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneCompositingTests.swift; sourceTree = "<group>"; };
 		95D50908EB1583324D4BF7B8 /* MenuBarLayoutPane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBarLayoutPane.swift; sourceTree = "<group>"; };
 		985EBBD95DF6C83F13A30A4A /* FramingPane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FramingPane.swift; sourceTree = "<group>"; };
+		98BA26EAD66B6EC21B19D565 /* StudioSettingsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StudioSettingsTests.swift; sourceTree = "<group>"; };
 		9AC6456E2FE242D16DD43349 /* Composite.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Composite.metal; sourceTree = "<group>"; };
 		9B43BCAF0730BAEB1EE9FB65 /* MainWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindowController.swift; sourceTree = "<group>"; };
 		9E5FCEB7DD1501A57382CB83 /* FrameRing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrameRing.swift; sourceTree = "<group>"; };
 		9EE248762C200152A2E3EA8D /* ExtensionInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExtensionInstaller.swift; sourceTree = "<group>"; };
+		A20A229F46527A72C3480E58 /* Gaze.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Gaze.metal; sourceTree = "<group>"; };
 		A22C46F765CFA76387C26277 /* CameraCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraCapture.swift; sourceTree = "<group>"; };
+		A36434DB9634BBC1E28F94F5 /* BackgroundStage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundStage.swift; sourceTree = "<group>"; };
 		A4189198EA5B988CFF03C050 /* PresetStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresetStoreTests.swift; sourceTree = "<group>"; };
 		AD229C9E3A81527D84843A1B /* PlaceholderRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaceholderRenderer.swift; sourceTree = "<group>"; };
 		AD5DCDAE59542E9A670A9B42 /* RingBuffer.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = RingBuffer.c; sourceTree = "<group>"; };
@@ -229,19 +270,25 @@
 		B41FF1780DF7FE42413B415B /* PRISMCameraExtension.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = PRISMCameraExtension.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
 		BCF581196F074CC78EF6E49A /* PRISMApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PRISMApp.swift; sourceTree = "<group>"; };
 		C459B61B281B0164BF4BC1C9 /* OutputFitStage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OutputFitStage.swift; sourceTree = "<group>"; };
+		C57BF23686FD9A58028F79C8 /* MomentsPane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MomentsPane.swift; sourceTree = "<group>"; };
 		C9FFE81443EA611E13E70543 /* GeometryMathTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GeometryMathTests.swift; sourceTree = "<group>"; };
 		CA55D796CEDD2B65D7897F4B /* AutoFramer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoFramer.swift; sourceTree = "<group>"; };
 		CB00F8324910C2B14928EE56 /* Geometry.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Geometry.metal; sourceTree = "<group>"; };
 		CB06D752C43A04CAC6777FDB /* PRISM-Local.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "PRISM-Local.entitlements"; sourceTree = "<group>"; };
 		CE37A64BFFF8D8B7BDFE0C7B /* KernelTypes.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = KernelTypes.h; sourceTree = "<group>"; };
 		CE972D19DB5CED77AC4B88C2 /* PresetBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresetBar.swift; sourceTree = "<group>"; };
+		CEA5572941CB1B51AFC54052 /* Layers.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Layers.metal; sourceTree = "<group>"; };
+		CEF4CED9705F22BC22756360 /* GazeStageTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GazeStageTests.swift; sourceTree = "<group>"; };
 		D2D1A5DE99E9DCD69AFA2645 /* AdjustStage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AdjustStage.swift; sourceTree = "<group>"; };
+		D3C2F4AD2DBD23DF00FC2A8D /* GazeStage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GazeStage.swift; sourceTree = "<group>"; };
+		D4452DC5051EF36B908AE0B7 /* LayerSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LayerSource.swift; sourceTree = "<group>"; };
 		D56DC5301882D68A1F0658AF /* EffectsSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EffectsSection.swift; sourceTree = "<group>"; };
 		D74EF65BB5797627F0D9C525 /* DeviceMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceMonitor.swift; sourceTree = "<group>"; };
 		DA068C6A1C7FBD48889FE190 /* Warm.cube */ = {isa = PBXFileReference; path = Warm.cube; sourceTree = "<group>"; };
 		DAB4360F8A3589624753D9D9 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		DB2A5CA765E6AAB38279FB40 /* FramingSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FramingSection.swift; sourceTree = "<group>"; };
 		DC94DF5ADB2CCC4413D10B50 /* LUTStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LUTStore.swift; sourceTree = "<group>"; };
+		DD4AB93D2C1D0234FCC225DF /* PersonSegmenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PersonSegmenter.swift; sourceTree = "<group>"; };
 		DE29DCB396A6FB8888F5B0A4 /* KernelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KernelTests.swift; sourceTree = "<group>"; };
 		E157BD293B9E7F816DA6241C /* LUTStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LUTStoreTests.swift; sourceTree = "<group>"; };
 		E428DF4772A95B7DACD74F98 /* DesignSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignSystem.swift; sourceTree = "<group>"; };
@@ -252,6 +299,8 @@
 		EC236B6B716770D870EC4658 /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
 		EC692B18502267749EC66F7D /* PRISMTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PRISMTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		ED9EEE45DD9D6C7C1C7D098E /* FormatSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FormatSection.swift; sourceTree = "<group>"; };
+		F1B6DDEB62CF87A54AA7D65B /* ReplayBuffer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReplayBuffer.swift; sourceTree = "<group>"; };
+		F1C7AE0F914D6DA76D2C9845 /* StudioSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StudioSettings.swift; sourceTree = "<group>"; };
 		F2A10AB36C896FCE953C1226 /* StudioPane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StudioPane.swift; sourceTree = "<group>"; };
 		F5CF86EF692111A7BC80FF9F /* Cool.cube */ = {isa = PBXFileReference; path = Cool.cube; sourceTree = "<group>"; };
 		F68B971871151DCA9C3F91D3 /* GeometryStage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GeometryStage.swift; sourceTree = "<group>"; };
@@ -289,12 +338,16 @@
 				4C154757DBE0811782C08AA8 /* ClientNameTests.swift */,
 				79FF7AF601E55D37F66EB022 /* FormatManagerTests.swift */,
 				206F1E02763A36CBB7B00BFE /* FoundationTypesTests.swift */,
+				CEF4CED9705F22BC22756360 /* GazeStageTests.swift */,
 				C9FFE81443EA611E13E70543 /* GeometryMathTests.swift */,
 				DE29DCB396A6FB8888F5B0A4 /* KernelTests.swift */,
 				348E827CEB7C3F19DA35DCE0 /* LatencyMonitorTests.swift */,
 				E157BD293B9E7F816DA6241C /* LUTStoreTests.swift */,
 				A4189198EA5B988CFF03C050 /* PresetStoreTests.swift */,
+				93DF453D1AD025F78107920C /* ReplayBufferTests.swift */,
 				6CD66F0B2FCC790E25042496 /* RingBufferTests.swift */,
+				954600C921AC4A39BF54C986 /* SceneCompositingTests.swift */,
+				98BA26EAD66B6EC21B19D565 /* StudioSettingsTests.swift */,
 			);
 			path = PRISMTests;
 			sourceTree = "<group>";
@@ -309,10 +362,12 @@
 				DB2A5CA765E6AAB38279FB40 /* FramingSection.swift */,
 				53514366F59C6ADAC3800705 /* LatencyMeter.swift */,
 				4A1EC4ED23C9BD0CCD087D71 /* MenuBarIcon.swift */,
+				12C343B3A84A51C036889902 /* MomentsSection.swift */,
 				4E0756772A7F36507B633C11 /* OnboardingView.swift */,
 				619B13203A28CA9E0927F0B2 /* PopoverView.swift */,
 				CE972D19DB5CED77AC4B88C2 /* PresetBar.swift */,
 				EAB8340AC048FB9FBABD347E /* PreviewView.swift */,
+				0E4230754DD0CC06066B1699 /* SceneSection.swift */,
 				8949CE3186FBB24B552D6A6D /* SettingsView.swift */,
 				B56C92A12876CEDC6FB1755C /* MainWindow */,
 			);
@@ -330,6 +385,7 @@
 				BCF581196F074CC78EF6E49A /* PRISMApp.swift */,
 				756F134576C75B2161E296BF /* Capture */,
 				E2E0F6D4A23876E41A4871B9 /* Clip */,
+				96B20E90951368DB0C2D6D05 /* Media */,
 				5100807BB4CE0FA6843CD74A /* Pipeline */,
 				CD79EAD3A0D54E901E988FB9 /* Resources */,
 				587446B7AB45C210675AC9E5 /* Sinks */,
@@ -348,7 +404,10 @@
 				9E5FCEB7DD1501A57382CB83 /* FrameRing.swift */,
 				E8CB82B65292DC6EEB8FA768 /* LatencyMonitor.swift */,
 				00484E681C5D813404917AE1 /* PresetStore.swift */,
+				F1B6DDEB62CF87A54AA7D65B /* ReplayBuffer.swift */,
+				020F7D5FFB53F57E5B034B13 /* ReplayPlayer.swift */,
 				6490B465289A45CBA9E2274F /* StageSettings.swift */,
+				F1C7AE0F914D6DA76D2C9845 /* StudioSettings.swift */,
 				1AEF33697F8E471A59D55333 /* VideoPipeline.swift */,
 				85A53D73592E99D7BAD41A01 /* Stages */,
 			);
@@ -379,15 +438,28 @@
 			children = (
 				D2D1A5DE99E9DCD69AFA2645 /* AdjustStage.swift */,
 				CA55D796CEDD2B65D7897F4B /* AutoFramer.swift */,
+				A36434DB9634BBC1E28F94F5 /* BackgroundStage.swift */,
 				18AF5ECE4C7193418E1A8B65 /* BlurStage.swift */,
 				3B73B15856323C3240286438 /* ClipStage.swift */,
 				21CC8265134D3F7EFB19E105 /* FreezeStage.swift */,
+				D3C2F4AD2DBD23DF00FC2A8D /* GazeStage.swift */,
 				F68B971871151DCA9C3F91D3 /* GeometryStage.swift */,
 				12068898E3D79E293BC12ADD /* LUTStage.swift */,
 				DC94DF5ADB2CCC4413D10B50 /* LUTStore.swift */,
 				C459B61B281B0164BF4BC1C9 /* OutputFitStage.swift */,
+				6CB075C6D6D34CA3BE2BB96D /* OverlayStage.swift */,
+				DD4AB93D2C1D0234FCC225DF /* PersonSegmenter.swift */,
+				2F2D2D84A17A12C4AA5F0873 /* ReplayStage.swift */,
 			);
 			path = Stages;
+			sourceTree = "<group>";
+		};
+		96B20E90951368DB0C2D6D05 /* Media */ = {
+			isa = PBXGroup;
+			children = (
+				D4452DC5051EF36B908AE0B7 /* LayerSource.swift */,
+			);
+			path = Media;
 			sourceTree = "<group>";
 		};
 		9ACB8EA292F0BE5D323F4DC2 = {
@@ -447,8 +519,10 @@
 				9B43BCAF0730BAEB1EE9FB65 /* MainWindowController.swift */,
 				73270FD112F0C8B1BA82E0EB /* MainWindowView.swift */,
 				95D50908EB1583324D4BF7B8 /* MenuBarLayoutPane.swift */,
+				C57BF23686FD9A58028F79C8 /* MomentsPane.swift */,
 				651F67AFECCFCD3A324DBCB2 /* PanePreview.swift */,
 				59DE48E698981ADCCC127856 /* PresetsPane.swift */,
+				0085374A06F1C7AECB0AB857 /* ScenePane.swift */,
 				F2A10AB36C896FCE953C1226 /* StudioPane.swift */,
 			);
 			path = MainWindow;
@@ -460,8 +534,10 @@
 				E8D1B82A692934B670FF6FE7 /* Adjust.metal */,
 				16D7CFDB5202A947C70C2542 /* Blur.metal */,
 				9AC6456E2FE242D16DD43349 /* Composite.metal */,
+				A20A229F46527A72C3480E58 /* Gaze.metal */,
 				CB00F8324910C2B14928EE56 /* Geometry.metal */,
 				CE37A64BFFF8D8B7BDFE0C7B /* KernelTypes.h */,
+				CEA5572941CB1B51AFC54052 /* Layers.metal */,
 				908D97B57D980B712327EB7B /* LUT.metal */,
 			);
 			path = PRISMKernels;
@@ -696,6 +772,7 @@
 				4D08DCAD2F2B9368687D0A78 /* AudioSink.swift in Sources */,
 				B0DDB9080FD62909F2C98D2A /* AutoFramer.swift in Sources */,
 				31045908DF67678E385D83D6 /* AutoFramerTests.swift in Sources */,
+				953AD29AE5455304C40C8366 /* BackgroundStage.swift in Sources */,
 				C0C34F74ACD97CDB3877F092 /* Blur.metal in Sources */,
 				36C71C65851CC13A04CBEBC6 /* BlurStage.swift in Sources */,
 				BFC7E4F0F2D067D5D1D88866 /* CMIOSink.swift in Sources */,
@@ -713,6 +790,9 @@
 				99588A2D24A17C96A4732D71 /* FoundationTypesTests.swift in Sources */,
 				28CF1B69970A6550074BEEF8 /* FrameRing.swift in Sources */,
 				54002C1336EFDE2DB32F9737 /* FreezeStage.swift in Sources */,
+				938A5F43063CB5AE29968EE8 /* Gaze.metal in Sources */,
+				16DA69013A83E5E11533E5AF /* GazeStage.swift in Sources */,
+				7B4564D754C892A061D2AC72 /* GazeStageTests.swift in Sources */,
 				7854AE0EF5145031F61E9B9F /* Geometry.metal in Sources */,
 				E3B751C9E235135645C18EFF /* GeometryMathTests.swift in Sources */,
 				2465AF7274B0679860AD3040 /* GeometryStage.swift in Sources */,
@@ -724,15 +804,26 @@
 				95E8F5036531F2CC17E18CE5 /* LUTStoreTests.swift in Sources */,
 				C678B23F7C7EC63113052A37 /* LatencyMonitor.swift in Sources */,
 				3A8D5BAF924702E627A68B62 /* LatencyMonitorTests.swift in Sources */,
+				FB6455BB81B2A1051B00A28C /* LayerSource.swift in Sources */,
+				5EA176B53CA3217907078A0E /* Layers.metal in Sources */,
 				BFD35162A74E6D792438F752 /* LoginItem.swift in Sources */,
 				2A5EAD59198110ABF9B56BEC /* OutputFitStage.swift in Sources */,
+				53BF17FAEE2EC7393693EFAC /* OverlayStage.swift in Sources */,
 				81D506FAD718ACD521040B79 /* Permissions.swift in Sources */,
+				FADF2B49411B5945AAAA3754 /* PersonSegmenter.swift in Sources */,
 				4586A148816F107CD05E4DEC /* PixelFormats.swift in Sources */,
 				03900F480E5844053590B4D9 /* PresetStore.swift in Sources */,
 				FFB4D76DE8FD8C48DA850CEF /* PresetStoreTests.swift in Sources */,
+				EE1536EEB314E9601D66FE2B /* ReplayBuffer.swift in Sources */,
+				48831D16987F5255F4410172 /* ReplayBufferTests.swift in Sources */,
+				FCC2A27E20E47EE9906C13FB /* ReplayPlayer.swift in Sources */,
+				FD73E8756AA915964B6ED29E /* ReplayStage.swift in Sources */,
 				E374507CA8CE26B7BA539C24 /* RingBuffer.c in Sources */,
 				14E4FA557BA7837E566BF73E /* RingBufferTests.swift in Sources */,
+				D44593EDB4E4B7DBB20B380B /* SceneCompositingTests.swift in Sources */,
 				13364E22BFAAB95ECA53493B /* StageSettings.swift in Sources */,
+				BA1AA80930E0888DCB1516FC /* StudioSettings.swift in Sources */,
+				928CF2782BE2C4AAC6CDBC53 /* StudioSettingsTests.swift in Sources */,
 				BAB9FD099963309479EE4809 /* VideoPipeline.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -748,6 +839,7 @@
 				D66E1CCCCC04289DCE65F4E0 /* AudioCapture.swift in Sources */,
 				925278567290F9E725EED4B2 /* AudioSink.swift in Sources */,
 				E89124469D1FE6A190031339 /* AutoFramer.swift in Sources */,
+				4519999DCDEE6DB795EA0D07 /* BackgroundStage.swift in Sources */,
 				75CB5AD2CFD744950643E4F0 /* Blur.metal in Sources */,
 				B5FEAA6F6DBDB0F2B2879C92 /* BlurStage.swift in Sources */,
 				E0A98961F921264DF4B6AEE5 /* CMIOSink.swift in Sources */,
@@ -770,6 +862,8 @@
 				4CFF7D54279FF9949E785AD6 /* FramingPane.swift in Sources */,
 				A51A2BAFD6ED9620C066569F /* FramingSection.swift in Sources */,
 				875D06A0D885110E80C0E53F /* FreezeStage.swift in Sources */,
+				80BD9B7E0604871C1C69F558 /* Gaze.metal in Sources */,
+				068274E908F4592D7BF12D65 /* GazeStage.swift in Sources */,
 				C2F6142D397DF59A093959B4 /* Geometry.metal in Sources */,
 				A89AC82673115677D48FBF84 /* GeometryStage.swift in Sources */,
 				A16D4A296E5187F05D485932 /* Hotkeys.swift in Sources */,
@@ -778,26 +872,38 @@
 				1D0F26AE68A3D145AD21DEFF /* LUTStore.swift in Sources */,
 				2B5F7B93A47E255D80EB2C69 /* LatencyMeter.swift in Sources */,
 				1DE05826648BAAE3ED9A052E /* LatencyMonitor.swift in Sources */,
+				E9B1102B99134C83AF9C22D8 /* LayerSource.swift in Sources */,
+				BC4C31E12F7CECB787D530B9 /* Layers.metal in Sources */,
 				7E9FCD7C75549A643620A80C /* LoginItem.swift in Sources */,
 				18AC7C2C124ABFE9EED45B8D /* MainWindowController.swift in Sources */,
 				43BDABED1115BCDACEB94282 /* MainWindowView.swift in Sources */,
 				8ABE672138DF16F2160C62D4 /* MenuBarIcon.swift in Sources */,
 				62432F3DB10485974FAC5235 /* MenuBarLayoutPane.swift in Sources */,
+				6BA2522593C2C9245934D3D1 /* MomentsPane.swift in Sources */,
+				532FA68CEF2F36887E34663C /* MomentsSection.swift in Sources */,
 				BB34570CB4BC16A19750B926 /* OnboardingView.swift in Sources */,
 				B15E0D28EBD150EEF0E9D748 /* OutputFitStage.swift in Sources */,
+				F2D874DB12C8DB1D00FAF3D9 /* OverlayStage.swift in Sources */,
 				45B17D4FB593E69A1D14E951 /* PRISMApp.swift in Sources */,
 				0508ECBB98D540DF7FAB024D /* PanePreview.swift in Sources */,
 				1BA7C44675ABE52D9EC7D65A /* Permissions.swift in Sources */,
+				CD981F9B41E9F32141602550 /* PersonSegmenter.swift in Sources */,
 				7FD37A5D7718F5FAFECB9130 /* PixelFormats.swift in Sources */,
 				7AF9E2444E5A6136F7BEC079 /* PopoverView.swift in Sources */,
 				D2D26CA51F144956D17050A2 /* PresetBar.swift in Sources */,
 				DDC586CE3D0F9F70152C9CB4 /* PresetStore.swift in Sources */,
 				45C1643D61F74834684CEDC4 /* PresetsPane.swift in Sources */,
 				B0CE2254D16CF7C34499FCEB /* PreviewView.swift in Sources */,
+				2BF729B8CC62923A505BE535 /* ReplayBuffer.swift in Sources */,
+				C6061D4C4DBE8BACD6EC2D01 /* ReplayPlayer.swift in Sources */,
+				A665E3E3A7A06ED1AE4431A4 /* ReplayStage.swift in Sources */,
 				6AE16A57587040AAA7448F7E /* RingBuffer.c in Sources */,
+				4ED2E4698E027A514789B68A /* ScenePane.swift in Sources */,
+				60100DB363BE2B15347F2770 /* SceneSection.swift in Sources */,
 				8B31065501BDBE33FD9A3DD3 /* SettingsView.swift in Sources */,
 				9326B86685AC832D8F1E7919 /* StageSettings.swift in Sources */,
 				C1C3EFD86901077CA63CE5E0 /* StudioPane.swift in Sources */,
+				72658A320EC1565F00C95EFE /* StudioSettings.swift in Sources */,
 				2F35626197549CAA9B220D70 /* VideoPipeline.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

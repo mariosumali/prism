@@ -45,6 +45,9 @@ struct StudioPane: View {
                 if state.clipState != .none {
                     clipTransport
                 }
+                Text("Moments")
+                    .font(.headline)
+                MomentsSection()
                 Text("Presets")
                     .font(.headline)
                 PresetBar()
@@ -78,9 +81,15 @@ struct StudioPane: View {
                 .font(.caption)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
-            if warning.action == .raiseBudget {
+            switch warning.action {
+            case .raiseBudget:
                 Button("Raise budget") { state.raiseBudgetOneStep() }
                     .controlSize(.small)
+            case .armBuffer:
+                Button("Turn on") { state.setBufferArmed(true) }
+                    .controlSize(.small)
+            case .openSettings, .none:
+                EmptyView()
             }
         }
     }

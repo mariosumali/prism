@@ -69,7 +69,31 @@ final class FoundationTypesTests: XCTestCase {
 
     func testChainOrderIsFixed() {
         let ordered = StageID.allCases.sorted()
-        XCTAssertEqual(ordered, [.clip, .freeze, .geometry, .adjust, .lut, .blur, .outputFit])
+        XCTAssertEqual(ordered, [.clip, .replay, .freeze, .gaze, .geometry,
+                                 .adjust, .lut, .blur, .background, .overlay,
+                                 .outputFit])
+    }
+
+    /// The three substituting stages escalate: a replay overrides a clip, a
+    /// freeze overrides a replay. Later stages write the whole frame, so
+    /// chain position IS the precedence.
+    func testSubstitutionStagesEscalate() {
+        XCTAssertLessThan(StageID.clip.chainIndex, StageID.replay.chainIndex)
+        XCTAssertLessThan(StageID.replay.chainIndex, StageID.freeze.chainIndex)
+    }
+
+    /// Eye contact warps in the space Vision measured landmarks in, so it
+    /// must precede any geometric transform.
+    func testGazePrecedesGeometry() {
+        XCTAssertLessThan(StageID.gaze.chainIndex, StageID.geometry.chainIndex)
+    }
+
+    /// Both mask consumers composite over the finished look, and a
+    /// foreground overlay layer must land above a replaced background.
+    func testCompositingStagesFollowTheLook() {
+        XCTAssertLessThan(StageID.lut.chainIndex, StageID.background.chainIndex)
+        XCTAssertLessThan(StageID.background.chainIndex, StageID.overlay.chainIndex)
+        XCTAssertLessThan(StageID.overlay.chainIndex, StageID.outputFit.chainIndex)
     }
 
     func testDegradationVictimOrdering() {

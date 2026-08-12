@@ -16,17 +16,31 @@ import Foundation
 
 public final class Hotkeys {
 
-    // MARK: Fixed combos (§5.2; ANSI keycodes F = 3, M = 46)
+    // MARK: Fixed combos
+    //
+    // §5.2 originals plus the studio chords (§5.6, §5.9–§5.11). All share the
+    // ⌥⌘ prefix so they read as one family and none collide with an app
+    // shortcut a user is likely to have muscle memory for. ANSI keycodes:
+    // F = 3, M = 46, R = 15, A = 0, P = 35, E = 14.
 
     public static let freezeCombo = HotkeyCombo(keyCode: 3, option: true, command: true)
     public static let muteCombo = HotkeyCombo(keyCode: 46, option: true, command: true)
     public static let freezeAndMuteCombo = HotkeyCombo(keyCode: 3, option: true, command: true, shift: true)
+    public static let replayCombo = HotkeyCombo(keyCode: 15, option: true, command: true)
+    public static let awayCombo = HotkeyCombo(keyCode: 0, option: true, command: true)
+    /// Deliberately un-shifted: a panic key you have to reach for is not one.
+    public static let panicCombo = HotkeyCombo(keyCode: 35, option: true, command: true)
+    public static let eyeContactCombo = HotkeyCombo(keyCode: 14, option: true, command: true)
 
     // MARK: Callbacks (invoked on the main thread)
 
     public var onFreeze: (() -> Void)?             // ⌥⌘F
     public var onMute: (() -> Void)?               // ⌥⌘M
     public var onFreezeAndMute: (() -> Void)?      // ⌥⌘⇧F
+    public var onReplay: (() -> Void)?             // ⌥⌘R
+    public var onAway: (() -> Void)?               // ⌥⌘A
+    public var onPanic: (() -> Void)?              // ⌥⌘P
+    public var onEyeContact: (() -> Void)?         // ⌥⌘E
     public var onPreset: ((UUID) -> Void)?
 
     // MARK: State
@@ -167,6 +181,14 @@ public final class Hotkeys {
             fire { $0.onFreeze?() }
         } else if matches(Self.muteCombo) {
             fire { $0.onMute?() }
+        } else if matches(Self.replayCombo) {
+            fire { $0.onReplay?() }
+        } else if matches(Self.awayCombo) {
+            fire { $0.onAway?() }
+        } else if matches(Self.panicCombo) {
+            fire { $0.onPanic?() }
+        } else if matches(Self.eyeContactCombo) {
+            fire { $0.onEyeContact?() }
         } else if let (id, _) = presetBindings.first(where: { matches($0.1) }) {
             fire { $0.onPreset?(id) }
         }

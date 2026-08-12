@@ -88,6 +88,10 @@ texture format, not the shader). Include `KernelTypes.h` for param structs.
 | `prism_output_fit` | Composite.metal | src t0, dst t1, `constant PRISMFitParams&` b0 — scale/offset content, bars are opaque black |
 | `prism_crossfade` | Composite.metal | a t0, b t1, dst t2, `constant PRISMCrossfadeParams&` b0 |
 | `prism_sharpness` | Composite.metal | src t0, `device float*` b0 (result), `constant PRISMSharpnessParams&` b1 — dispatched as **one** threadgroup of 256 threads; each thread strides a 128×72 sample grid of src, computes 3×3 Laplacian of luma, threadgroup-reduces the variance, thread 0 writes `result[slot]` |
+| `prism_thumbnail` | Composite.metal | src t0, `device float*` b0 (result), `constant PRISMThumbnailParams&` b1 — dispatched over the 32×18 thumbnail grid itself (linear filtering does the box-averaging); writes luma into `result[slot·w·h …]` |
+| `prism_gaze` | Gaze.metal | src t0, dst t1, `constant PRISMGazeParams&` b0 — per-eye inverse warp: rigid across the iris disc, pinned at the lid ellipse, sclera stretches between. Eyes with `valid == 0` contribute nothing; outside both lid ellipses the output is an exact copy |
+| `prism_background_replace` | Layers.metal | src t0, bg t1, mask t2, dst t3, `constant PRISMBackgroundParams&` b0 — mask hardened by `maskContrast` and feathered by `edgeSoftness`; `lightWrap` bleeds background into the rim (peaks at mask 0.5); `useTexture == 0` uses `flatColor` |
+| `prism_overlay` | Layers.metal | base t0, layer t1, mask t2, dst t3, `constant PRISMOverlayParams&` b0 — `uvTransform` maps output UV → layer UV (bottom row 0 0 1); outside [0,1] writes base unchanged; chroma/luma key in YCbCr with hue-agnostic despill; `placement == 1` multiplies alpha by `1 − mask` |
 
 ---
 
@@ -120,12 +124,23 @@ queue; one MTLCommandBuffer per frame; one commit; one completed-handler.
 public final class VideoPipeline {
     public let metal: MetalContext
     public private(set) var stages: [EffectStage]      // chain order
-    public var clipStage: ClipStage { get }
-    public var freezeStage: FreezeStage { get }
-    public var geometryStage: GeometryStage { get }
-    public var adjustStage: AdjustStage { get }
-    public var lutStage: LUTStage { get }
-    public var blurStage: BlurStage { get }
+    public let clipStage: ClipStage
+    public let replayStage: ReplayStage
+    public let freezeStage: FreezeStage
+    public let gazeStage: GazeStage
+    public let geometryStage: GeometryStage
+    public let adjustStage: AdjustStage
+    public let lutStage: LUTStage
+    public let blurStage: BlurStage
+    public let backgroundStage: BackgroundStage
+    public let overlayStage: OverlayStage
+    public let outputFitStage: OutputFitStage
+
+    /// Shared by blur, virtual background, behind-placed overlay layers and
+    /// auto-framing. Driven once per frame by the pipeline (§3.3).
+    public let segmenter: PersonSegmenter
+    public let replayBuffer: ReplayBuffer
+    public let replayPlayer: ReplayPlayer
 
     /// Post-effects output: IOSurface-backed buffer ready for the sink,
     /// plus the final texture for the preview. Called on the capture queue.
@@ -143,6 +158,12 @@ public final class VideoPipeline {
     public func setFrozen(_ frozen: Bool)              // §5.2 sharpest-frame
     public var isFrozen: Bool { get }
     public func apply(_ config: PipelineConfiguration)
+    /// Arms/disarms the rolling buffer. Separate from `apply` because it is
+    /// behaviour, not a look — a preset switch must not start recording.
+    public func applyStudio(_ settings: StudioSettings)
+    /// Forwards the demand gate to every stage owning a media clock, so an
+    /// idle PRISM neither decodes nor fast-forwards on wake.
+    public func setDemandActive(_ active: Bool)
     /// 200ms output crossfade (preset switch, clip → live return).
     public func beginCrossfade(durationMs: Double)
     /// Preview texture retention: false tears the preview path down (§8.3).
@@ -184,6 +205,110 @@ public final class FrameRing {
     public func reconfigure(width: Int, height: Int) throws
 }
 ```
+
+### ReplayBuffer (`PRISM/Pipeline/ReplayBuffer.swift`)
+
+Rolling last-N-seconds store behind instant replay and the away loop (§5.9,
+§5.10). Frames are hardware-encoded, not stored raw — see §5.9 for why.
+`prepare` runs on the frame queue and only encodes GPU work; `commit` runs
+from the command buffer's completed handler, where the pixels are finished
+and safe to hand to the encoder.
+
+```swift
+public final class ReplayBuffer {
+    public struct RecordedFrame {
+        public let sample: CMSampleBuffer
+        public let seconds: Double          // host clock, monotonic
+        public let isKeyframe: Bool
+        public let thumbnailSlot: Int
+    }
+    public struct PendingRecord { /* opaque; prepare → commit */ }
+
+    public static let thumbnailWidth = 32
+    public static let thumbnailHeight = 18
+
+    public init(metal: MetalContext) throws
+    public private(set) var isArmed: Bool
+    public var span: (start: Double, end: Double)? { get }
+    public var bufferedSeconds: Double { get }
+    public func configure(armed: Bool, bufferSeconds: Double,
+                          maxHeight: Int, frameRate: Int)
+    public func reset()
+    public func prepare(commandBuffer: MTLCommandBuffer, source: MTLTexture,
+                        hostSeconds: Double) -> PendingRecord?
+    public func commit(_ record: PendingRecord)
+    public var sampleFormatDescription: CMFormatDescription? { get }
+    public func snapshot() -> [RecordedFrame]                  // oldest first
+    public func thumbnails(for: [RecordedFrame]) -> [[Float]]
+    public func selectAwayRange(loopSeconds: Double) -> (start: Int, end: Int)?
+
+    /// Pure, testable: seam cost × 3 + mean motion, minimised. Excludes the
+    /// most recent second (§5.10).
+    static func selectLoop(thumbnails: [[Float]], times: [Double],
+                           loopSeconds: Double) -> (start: Int, end: Int)?
+    static func meanAbsoluteDifference(_ a: [Float], _ b: [Float]) -> Double
+    static func bitRate(width: Int, height: Int) -> Int
+    static func isKeyframe(_ sample: CMSampleBuffer) -> Bool
+}
+```
+
+The ring always begins on a keyframe: `trim` drops back only to a keyframe,
+and a non-keyframe arriving into an empty ring is discarded. Without that,
+a prefix of the ring would be undecodable.
+
+### ReplayPlayer (`PRISM/Pipeline/ReplayPlayer.swift`)
+
+```swift
+public enum ReplayMode: Equatable { case idle, replay, away }
+
+public final class ReplayPlayer {
+    public struct Frame {
+        public let texture: MTLTexture
+        public let blendTexture: MTLTexture?    // loop-seam crossfade target
+        public let mix: Float                   // 0 = texture, 1 = blendTexture
+    }
+    public init(metal: MetalContext, buffer: ReplayBuffer)
+    public var mode: ReplayMode { get }
+    public var isActive: Bool { get }
+    public var positionSeconds: Double { get }
+    public var durationSeconds: Double { get }
+    public var onReplayFinished: (() -> Void)?          // main thread
+    @discardableResult public func startReplay(rate: Double) -> Bool
+    @discardableResult public func startAway(loopSeconds: Double,
+                                             crossfadeMs: Double) -> Bool
+    public func stop()
+    public func seek(toSeconds: Double)
+    /// Frame queue only.
+    public func currentFrame(at hostTime: CMTime) -> Frame?
+}
+```
+
+Decode backpressure is mandatory: VideoToolbox may decode asynchronously, so
+the feed stops on `fifo.count + inFlight`, never on `fifo.count` alone.
+Feeding until the FIFO looks full would race the callbacks and decode an
+entire loop before the first frame returned — a gigabyte of 1080p frames.
+
+### LayerSource (`PRISM/Media/LayerSource.swift`)
+
+A file on disk as a Metal texture, per frame — a still loaded once or a
+video decoded on a loop. Backs both the virtual background and every overlay
+layer. Deliberately not ClipPlayer: no transport, no audio, and a 4-frame
+decode-ahead rather than 30, because a scene can hold a background plus
+three overlay layers and resident memory is the binding constraint (§7).
+
+```swift
+final class LayerSource {
+    init(metal: MetalContext, label: String)
+    func configure(url: URL?, kind: LayerSourceKind)   // main thread; keyed on (url, kind)
+    func setDemandActive(_ active: Bool)
+    func currentTexture(at hostTime: CMTime) -> MTLTexture?   // frame queue only
+    var contentSize: CGSize? { get }
+}
+```
+
+Reloading is keyed on `(url, kind)` so re-applying an unchanged
+configuration — which happens on every slider drag — never restarts a
+running video layer.
 
 ### FormatManager (`PRISM/Pipeline/FormatManager.swift`)
 
@@ -429,6 +554,46 @@ public final class OutputFitStage: EffectStage {   // id .outputFit, cost .cheap
     public var contentMode: ClipFillMode           // letterbox default
 }
 
+public final class GazeStage: EffectStage {         // id .gaze, cost .expensive
+    public var settings: GazeSettings
+    public var isTracking: Bool { get }             // a face with usable eye landmarks
+    public func reset()                             // clears tracking state
+    /// The whole correction in one pure function, free of Metal/Vision types.
+    static func shift(for eye: EyeMeasurement, settings: GazeSettings,
+                      confidence: Float) -> SIMD2<Float>
+}
+public final class BackgroundStage: EffectStage {   // id .background, cost .expensive
+    public var settings: BackgroundSettings
+    public let segmenter: PersonSegmenter
+    public var needsPersonMask: Bool { get }
+    public func setDemandActive(_ active: Bool)
+    static func fit(contentSize: CGSize, outputSize: CGSize,
+                    mode: ClipFillMode) -> (scale: SIMD2<Float>, offset: SIMD2<Float>)
+}
+public final class OverlayStage: EffectStage {      // id .overlay, cost .moderate
+    public var settings: OverlaySettings            // ≤ OverlaySettings.maxLayers render
+    public let segmenter: PersonSegmenter
+    public var needsPersonMask: Bool { get }        // true when any layer is .behind
+    public func setDemandActive(_ active: Bool)
+    static func placement(layer: OverlayLayer, contentSize: CGSize,
+                          outputSize: CGSize) -> simd_float3x3
+}
+public final class ReplayStage: EffectStage {       // id .replay, cost .cheap
+    public var player: ReplayPlayer?                // substitutes while active
+}
+
+/// One mask, four consumers (§3.3). The pipeline calls `update` once per
+/// frame at the first mask-consuming stage's chain position; stages only read.
+public final class PersonSegmenter {
+    public init(metal: MetalContext) throws
+    public var quality: BlurQuality
+    public var isDemanded: Bool
+    public var latestMask: MTLTexture? { get }      // thread-safe
+    public var latestSubjectBox: CGRect? { get }    // thread-safe, top-left origin
+    public func update(commandBuffer: MTLCommandBuffer, input: MTLTexture)
+    public func invalidate()                        // demand went to zero
+}
+
 public final class LUTStore {
     public static let shared: LUTStore
     public var availableLUTs: [String] { get }     // bundled 5 + imported
@@ -500,6 +665,15 @@ public final class AppState: ObservableObject {
     // Controls
     @Published public var isFrozen: Bool
     @Published public var isMuted: Bool
+    // Studio behaviour (§5.9–§5.11) — persisted separately from presets
+    @Published public var studio: StudioSettings
+    @Published public var replayMode: ReplayMode
+    @Published public var replayPosition: Double
+    @Published public var replayDuration: Double
+    @Published public var bufferedSeconds: Double
+    @Published public var isAway: Bool
+    @Published public var isPanicked: Bool
+    @Published public var eyeContactTracking: Bool
     // Clip
     @Published public var clipState: ClipState
     @Published public var clipDuration: Double
@@ -540,6 +714,24 @@ public final class AppState: ObservableObject {
     public func scrubClip(to seconds: Double)
     public func setStageEnabled(_ id: StageID, _ enabled: Bool)
     public func setStagePinned(_ id: StageID, _ pinned: Bool)
+    // Background: blur and replacement are one question, one control (§8.7)
+    public var backgroundMode: BackgroundMode { get }
+    public func setBackgroundMode(_ mode: BackgroundMode)   // keeps both stages consistent
+    public func setBackgroundAsset(_ url: URL?)
+    // Overlay layers (§5.8)
+    public func addOverlayLayer(url: URL)
+    public func updateOverlayLayer(_ id: UUID, _ mutate: (inout OverlayLayer) -> Void)
+    public func removeOverlayLayer(_ id: UUID)
+    public func moveOverlayLayers(fromOffsets: IndexSet, toOffset: Int)
+    // Moments (§5.9–§5.11)
+    public func startReplay()
+    public func stopReplay()
+    public func toggleReplay()
+    public func scrubReplay(to seconds: Double)
+    public func setBufferArmed(_ armed: Bool)
+    public func toggleAway()
+    public func togglePanic()
+    public func toggleEyeContact()
     public func updateConfig(_ mutate: (inout PipelineConfiguration) -> Void)
     public func setActiveFormat(_ format: VideoFormat)     // free within published set
     public func requestPublishedFormatsChange(_ formats: [VideoFormat])  // reconnect confirm if clients live

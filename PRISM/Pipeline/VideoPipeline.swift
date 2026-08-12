@@ -136,12 +136,23 @@ public final class VideoPipeline {
     public private(set) var stages: [EffectStage]      // chain order, outputFit last
 
     public let clipStage: ClipStage
+    public let replayStage: ReplayStage
     public let freezeStage: FreezeStage
+    public let gazeStage: GazeStage
     public let geometryStage: GeometryStage
     public let adjustStage: AdjustStage
     public let lutStage: LUTStage
     public let blurStage: BlurStage
+    public let backgroundStage: BackgroundStage
+    public let overlayStage: OverlayStage
     public let outputFitStage: OutputFitStage
+
+    /// One person mask, shared by blur, virtual background, behind-the-
+    /// subject overlay layers, and auto-framing (§5.4, §5.7, §5.8).
+    public let segmenter: PersonSegmenter
+    /// Rolling buffer behind instant replay and the away loop (§5.9, §5.10).
+    public let replayBuffer: ReplayBuffer
+    public let replayPlayer: ReplayPlayer
 
     /// Post-effects output: IOSurface-backed buffer ready for the sink, plus
     /// the final texture for the preview. Invoked from the command buffer's
@@ -189,6 +200,8 @@ public final class VideoPipeline {
 
     private var frozenFlag = false
     private var lastFrameTime = CMTime.zero
+    /// Auto-framing's mask demand — the one consumer with no stage of its own.
+    private var autoFrameNeedsMask = false
 
     /// frameQueue-confined. Set when freeze is engaged but no frame exists to
     /// hold (capture stopped, ring empty); the next live camera frame becomes
@@ -208,29 +221,53 @@ public final class VideoPipeline {
     /// Static GPU weight model. The whole command buffer is measured via
     /// gpuStartTime/gpuEndTime and attributed to the stages that encoded this
     /// frame proportionally to these fixed weights (CONTRACTS: keep the
-    /// proportional model, deterministic and documented). Blur carries the
-    /// segmentation composite plus two separable blur passes, hence 12.
+    /// proportional model, deterministic and documented). Blur carries two
+    /// separable blur passes plus the composite, hence 12. Eye contact is a
+    /// single full-frame warp on the GPU but drags a Vision landmark request
+    /// behind it, and the degradation engine has to see that cost somewhere.
+    /// Overlay is weighted for a typical single layer; a three-layer scene
+    /// under-reports somewhat, which is the acceptable direction — the model
+    /// is proportional, not a measurement.
     private static let stageWeights: [StageID: Double] = [
-        .clip: 1, .freeze: 1, .geometry: 2, .adjust: 1,
-        .lut: 3, .blur: 12, .outputFit: 1,
+        .clip: 1, .replay: 1, .freeze: 1, .gaze: 8, .geometry: 2,
+        .adjust: 1, .lut: 3, .blur: 12, .background: 6, .overlay: 2,
+        .outputFit: 1,
     ]
+
+    /// Stages that consume the person mask. Segmentation runs once per frame
+    /// at the first of these positions in the chain — post-geometry, so the
+    /// mask lines up with everything that samples it, and so AutoFramer stays
+    /// the closed-loop servo it is documented to be (§5.4).
+    private static let maskConsumers: Set<StageID> = [.blur, .background, .overlay]
 
     // MARK: Init / configure
 
     public init(metal: MetalContext) throws {
         self.metal = metal
+        segmenter = try PersonSegmenter(metal: metal)
+        replayBuffer = try ReplayBuffer(metal: metal)
+        replayPlayer = ReplayPlayer(metal: metal, buffer: replayBuffer)
+
         clipStage = try ClipStage(metal: metal)
+        replayStage = try ReplayStage(metal: metal)
         freezeStage = try FreezeStage(metal: metal)
+        gazeStage = try GazeStage(metal: metal)
         geometryStage = try GeometryStage(metal: metal)
         adjustStage = try AdjustStage(metal: metal)
         lutStage = try LUTStage(metal: metal)
-        blurStage = try BlurStage(metal: metal)
+        blurStage = try BlurStage(metal: metal, segmenter: segmenter)
+        backgroundStage = try BackgroundStage(metal: metal, segmenter: segmenter)
+        overlayStage = try OverlayStage(metal: metal, segmenter: segmenter)
         outputFitStage = try OutputFitStage(metal: metal)
-        userStages = [clipStage, freezeStage, geometryStage, adjustStage, lutStage, blurStage]
-        stages = [clipStage, freezeStage, geometryStage, adjustStage, lutStage, blurStage, outputFitStage]
+
+        userStages = [clipStage, replayStage, freezeStage, gazeStage, geometryStage,
+                      adjustStage, lutStage, blurStage, backgroundStage, overlayStage]
+        stages = userStages + [outputFitStage]
+
         frameRing = try FrameRing(metal: metal, width: 1920, height: 1080)
         sharpnessPipeline = try metal.computePipeline(function: "prism_sharpness")
         crossfadePipeline = try metal.computePipeline(function: "prism_crossfade")
+        replayStage.player = replayPlayer
         configure(outputFormat: VideoFormat(width: 1920, height: 1080, frameRate: 30))
     }
 
@@ -284,6 +321,13 @@ public final class VideoPipeline {
 
         if frozen {
             clipStage.player?.holdCurrentFrame(true)
+            // A replay or away loop is substituting upstream of freeze, so
+            // the FrameRing (which holds live camera frames) is the wrong
+            // source entirely — freeze the picture that is actually on air.
+            if replayStage.isEnabled, replayPlayer.isActive {
+                refreezeFromCurrentOutput()
+                return
+            }
             // hasFrame (unlike wantsEncode/currentTexture) touches no
             // frame-path-confined texture caches, and the ring pick + freeze
             // mutation are serialized with process() on frameQueue.
@@ -334,14 +378,53 @@ public final class VideoPipeline {
         lutStage.settings = config.lut
         blurStage.settings = config.blur
         geometryStage.settings = config.geometry
+        gazeStage.settings = config.gaze
+        backgroundStage.settings = config.background
+        overlayStage.settings = config.overlay
+        // The quality tier belongs to the shared segmenter now; blur is
+        // simply where the user happens to set it.
+        segmenter.quality = config.blur.quality
+
         geometryStage.isEnabled = config.flags(for: .geometry).enabled
         adjustStage.isEnabled = config.flags(for: .adjust).enabled
         lutStage.isEnabled = config.flags(for: .lut).enabled
         blurStage.isEnabled = config.flags(for: .blur).enabled
-        // Auto-framing needs the segmentation mask even when blur is off (§5.4).
-        blurStage.maskOnlyMode = config.geometry.autoFrame && !config.flags(for: .blur).enabled
+        backgroundStage.isEnabled = config.flags(for: .background).enabled
+        overlayStage.isEnabled = config.flags(for: .overlay).enabled
+
+        let gazeWasEnabled = gazeStage.isEnabled
+        gazeStage.isEnabled = config.flags(for: .gaze).enabled
+        if !gazeWasEnabled && gazeStage.isEnabled {
+            // Never warp from where the eyes were before the stage was off.
+            gazeStage.reset()
+        }
+
+        // Auto-framing needs the mask even when nothing visual consumes it
+        // (§5.4). Recorded here rather than inferred per frame because it is
+        // the one demand with no corresponding stage.
+        autoFrameNeedsMask = config.geometry.autoFrame
         // Format and latency policy changes are orchestrated by AppState
         // (format renegotiation is a reconnect boundary, §3.2) — not here.
+    }
+
+    /// Arms or disarms the rolling replay buffer (§5.9, §5.10). Separate from
+    /// `apply` because it is behaviour, not a look: a preset switch must not
+    /// silently start or stop recording.
+    public func applyStudio(_ settings: StudioSettings) {
+        stateLock.lock()
+        let frameRate = outputFormat.frameRate
+        stateLock.unlock()
+        replayBuffer.configure(armed: settings.replay.isArmed,
+                               bufferSeconds: settings.replay.clampedBufferSeconds,
+                               maxHeight: settings.replay.maxHeight,
+                               frameRate: frameRate)
+    }
+
+    /// Forwards the pipeline's demand gate to every stage that owns a media
+    /// clock, so an idle PRISM neither decodes nor fast-forwards on wake.
+    public func setDemandActive(_ active: Bool) {
+        backgroundStage.setDemandActive(active)
+        overlayStage.setDemandActive(active)
     }
 
     /// 200ms output crossfade (preset switch, clip → live return). Fades from
@@ -459,6 +542,18 @@ public final class VideoPipeline {
             }
         }
 
+        // Rolling replay buffer (§5.9): raw camera frames only, recorded
+        // upstream of every effect so a replay runs the live chain rather
+        // than double-applying it. The downscale and thumbnail passes ride
+        // this frame's command buffer; the handoff to the encoder waits for
+        // the completed handler, where the pixels are actually finished.
+        var pendingReplay: ReplayBuffer.PendingRecord?
+        if cameraBuffer != nil {
+            pendingReplay = replayBuffer.prepare(commandBuffer: commandBuffer,
+                                                 source: source,
+                                                 hostSeconds: CMTimeGetSeconds(time))
+        }
+
         // Fixed chain (§3.3). Stages whose wantsEncode() is false are skipped
         // entirely — their input passes through. Ping-pong between the two
         // working-resolution intermediates; `current` is never the same
@@ -466,7 +561,31 @@ public final class VideoPipeline {
         var encoded: [StageID] = []
         var current = source
         var useA = true
-        for stage in userStages where stage.wantsEncode() {
+        var segmentationDone = false
+        for stage in userStages {
+            // One segmentation per frame for every mask consumer, taken at
+            // the first consumer's position in the chain. Driven here rather
+            // than from inside a stage so it does not depend on which of blur
+            // / background / overlay happens to be enabled — they all sample
+            // the same post-geometry `current`, and auto-framing needs the
+            // mask when none of them are on at all.
+            if !segmentationDone, Self.maskConsumers.contains(stage.id) {
+                segmentationDone = true
+                let demanded = blurStage.isEnabled
+                    || backgroundStage.needsPersonMask
+                    || overlayStage.needsPersonMask
+                    || autoFrameNeedsMask
+                if demanded {
+                    segmenter.isDemanded = true
+                    segmenter.update(commandBuffer: commandBuffer, input: current)
+                } else if segmenter.isDemanded {
+                    // Last consumer just went away: drop the mask so nothing
+                    // re-enabled later composites against a stale subject.
+                    segmenter.isDemanded = false
+                    segmenter.invalidate()
+                }
+            }
+            guard stage.wantsEncode() else { continue }
             guard let dst = useA ? intermediateA : intermediateB else {
                 throw PipelineError.textureAllocationFailed
             }
@@ -522,6 +641,7 @@ public final class VideoPipeline {
 
         let semaphore = inFlight
         let captureMs = captureToTextureMs
+        let replayRecord = pendingReplay
         commandBuffer.addCompletedHandler { [weak self] finished in
             semaphore.signal()
             guard let self else { return }
@@ -530,6 +650,9 @@ public final class VideoPipeline {
                 self.onTimings?(StageTimings(captureToTextureMs: captureMs, stageMs: [:],
                                              totalGpuMs: 0, wallMs: wallMs, dropped: true))
                 return
+            }
+            if let replayRecord {
+                self.replayBuffer.commit(replayRecord)
             }
             let gpuMs = max(0, (finished.gpuEndTime - finished.gpuStartTime) * 1000)
             let stageMs = Self.attribute(totalGpuMs: gpuMs, to: encoded)

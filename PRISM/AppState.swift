@@ -89,6 +89,28 @@ public final class AppState: ObservableObject {
             }
         }
     }
+    // Studio behaviour: replay / away / panic (§5.9–§5.11). Deliberately not
+    // part of `config` — a preset captures a look, not whether a hardware
+    // encoder is running.
+    @Published public var studio = StudioSettings() {
+        didSet {
+            guard studio != oldValue else { return }
+            pipeline?.applyStudio(studio)
+            persistStudio()
+        }
+    }
+    /// Mirrors ReplayPlayer, republished at 4 Hz for the transport UI.
+    @Published public var replayMode: ReplayMode = .idle
+    @Published public var replayPosition: Double = 0
+    @Published public var replayDuration: Double = 0
+    /// Seconds currently held in the rolling buffer — what "rewind" can reach.
+    @Published public var bufferedSeconds: Double = 0
+    @Published public var isAway = false
+    @Published public var isPanicked = false
+    /// Eye contact has found a face and is actually correcting. A correction
+    /// that silently does nothing is indistinguishable from a broken one.
+    @Published public var eyeContactTracking = false
+
     // Pipeline / format
     @Published public var config = PipelineConfiguration()
     @Published public var stageStatus: [StageID: StageStatus] = [:]
@@ -173,6 +195,7 @@ public final class AppState: ObservableObject {
     private var pollTimer: Timer?
     private var autoFrameTimer: Timer?
     private var noCameraTimer: Timer?
+    private var replayTimer: Timer?
     private var lastCameraFrameAt = Date.distantPast
     private let lastFrameLock = NSLock()
     private var formatsPublishedToExtension = false
@@ -184,12 +207,23 @@ public final class AppState: ObservableObject {
     private var lastSinkDroppedFrames = 0
     private var started = false
 
+    /// Configuration snapshot taken when panic engaged, restored on release.
+    /// Panic mutates `config` so every surface shows what is actually on air,
+    /// but it must never outlive the panic: this is what gets persisted and
+    /// what a preset save captures while the chord is held.
+    private var panicRestore: PipelineConfiguration?
+    /// Whether panic (or away) engaged mute itself, so releasing restores the
+    /// user's own mute rather than blanket-unmuting.
+    private var panicMutedByUs = false
+    private var awayMutedByUs = false
+
     private enum DefaultsKey {
         static let configuration = "PRISM.configuration"
         static let camera = "PRISM.selectedCamera"
         static let microphone = "PRISM.selectedMicrophone"
         static let sections = "PRISM.expandedSections"
         static let popoverLayout = "PRISM.popoverLayout"
+        static let studio = "PRISM.studio"
     }
 
     // MARK: - Init
@@ -229,6 +263,7 @@ public final class AppState: ObservableObject {
         wireDeviceMonitor()
         wireSink()
         wireHotkeys()
+        wireReplayPlayer()
         wireSetupObservers()
 
         previewTextureProvider = { [previewBox] in previewBox.take() }
@@ -258,6 +293,7 @@ public final class AppState: ObservableObject {
         pipeline?.previewEnabled = previewActive
         pipeline?.configure(outputFormat: formatManager.activeFormat)
         pipeline?.apply(config)
+        pipeline?.applyStudio(studio)
         monitor.setPolicy(config.latencyPolicy,
                           frameIntervalMs: formatManager.activeFormat.frameIntervalMs)
 
@@ -325,7 +361,6 @@ public final class AppState: ObservableObject {
         monitor.onAutoDisable = { [weak self] id in
             guard let self else { return }
             self.stage(id)?.isEnabled = false
-            self.reconcileBlurMaskRouting()
             var status = self.stageStatus[id] ?? StageStatus()
             status.autoDisabled = true
             self.stageStatus[id] = status
@@ -339,7 +374,6 @@ public final class AppState: ObservableObject {
             if self.config.flags(for: id).enabled {
                 self.stage(id)?.isEnabled = true
             }
-            self.reconcileBlurMaskRouting()
             var status = self.stageStatus[id] ?? StageStatus()
             status.autoDisabled = false
             self.stageStatus[id] = status
@@ -441,8 +475,27 @@ public final class AppState: ObservableObject {
         hotkeys.onFreeze = { [weak self] in self?.toggleFreeze() }
         hotkeys.onMute = { [weak self] in self?.toggleMute() }
         hotkeys.onFreezeAndMute = { [weak self] in self?.freezeAndMute() }
+        hotkeys.onReplay = { [weak self] in self?.toggleReplay() }
+        hotkeys.onAway = { [weak self] in self?.toggleAway() }
+        hotkeys.onPanic = { [weak self] in self?.togglePanic() }
+        hotkeys.onEyeContact = { [weak self] in self?.toggleEyeContact() }
         hotkeys.onPreset = { [weak self] id in self?.selectPreset(id) }
         pushPresetHotkeyBindings(presetStore.presets)
+    }
+
+    private func wireReplayPlayer() {
+        guard let pipeline else { return }
+        pipeline.replayPlayer.onReplayFinished = { [weak self] in
+            guard let self else { return }
+            // Reaching the live edge is the natural end of a replay; the away
+            // loop never reaches it.
+            guard self.replayMode == .replay else { return }
+            if self.studio.replay.returnToLiveAtEnd {
+                self.stopReplay()
+            } else {
+                self.refreshReplayState()
+            }
+        }
     }
 
     private func pushPresetHotkeyBindings(_ list: [Preset]) {
@@ -548,6 +601,27 @@ public final class AppState: ObservableObject {
             updateMenuBarState()
             reconcileCaptures()
         }
+
+        if let pipeline {
+            let buffered = pipeline.replayBuffer.bufferedSeconds
+            if abs(bufferedSeconds - buffered) > 0.1 { bufferedSeconds = buffered }
+            let tracking = pipeline.gazeStage.isTracking
+                && config.flags(for: .gaze).enabled
+            if eyeContactTracking != tracking { eyeContactTracking = tracking }
+        }
+    }
+
+    /// 4 Hz while a replay or away loop is on air, so the transport row
+    /// tracks without a timer running for a feature nobody is using.
+    private func restartReplayTimerIfNeeded() {
+        replayTimer?.invalidate()
+        replayTimer = nil
+        guard replayMode != .idle else { return }
+        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refreshReplayState() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        replayTimer = timer
     }
 
     /// Drives the pipeline when the camera is not delivering (clip playback
@@ -563,7 +637,12 @@ public final class AppState: ObservableObject {
             guard sinceCamera > interval * 2.5 else { return }
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                // Anything substituting for the camera has to keep producing
+                // frames when the camera itself is not delivering — an away
+                // loop must survive the camera dropping out, since that is
+                // precisely when nobody is there to notice.
                 let substituting = self.clipState != .none || self.isFrozen
+                    || self.replayMode != .idle
                 guard substituting else { return }   // otherwise the extension's placeholder is correct
                 let now = CMClockGetTime(CMClockGetHostTimeClock())
                 self.pipeline?.tickWithoutCamera(at: now)
@@ -657,6 +736,8 @@ public final class AppState: ObservableObject {
                 startAudio()
             }
             clipPlayer?.setDemandActive(true)
+            // Background and overlay videos are media clocks too (§5.7, §5.8).
+            pipeline?.setDemandActive(true)
             restartNoCameraTimer()
         } else {
             cameraCapture.stop()
@@ -664,6 +745,7 @@ public final class AppState: ObservableObject {
             // Suspend the clip clock too: otherwise an idle PRISM keeps
             // decoding, and the next demand fast-forwards through the gap.
             clipPlayer?.setDemandActive(false)
+            pipeline?.setDemandActive(false)
             // No consumers → nothing to tick placeholder frames for.
             noCameraTimer?.invalidate()
             noCameraTimer = nil
@@ -688,15 +770,6 @@ public final class AppState: ObservableObject {
     private func updateAudioRouting() {
         let clipOwnsAudio = (clipState == .playing) && clipUsesClipAudio
         audioCapture.isSuppressed = clipOwnsAudio
-    }
-
-    /// Keeps segmentation alive for auto-framing when blur's enable state
-    /// changes outside apply() (degradation engine): mask-only mode costs no
-    /// GPU blur passes but keeps latestSubjectBox fresh (§5.4).
-    private func reconcileBlurMaskRouting() {
-        guard let pipeline else { return }
-        pipeline.blurStage.maskOnlyMode =
-            config.geometry.autoFrame && !pipeline.blurStage.isEnabled
     }
 
     private func handleSelectedDeviceRemoval(cameraList: [CameraDeviceInfo]?,
@@ -822,6 +895,321 @@ public final class AppState: ObservableObject {
 
     public func scrubClip(to seconds: Double) {
         clipPlayer?.seek(toSeconds: seconds)
+    }
+
+    // MARK: - Intents: background (§5.4 blur / §5.7 replacement)
+
+    /// The single "what is behind me" answer, derived from the two stages
+    /// that can provide it.
+    public var backgroundMode: BackgroundMode {
+        let cfg = editingConfig
+        if cfg.flags(for: .blur).enabled { return .blur }
+        guard cfg.flags(for: .background).enabled else { return .off }
+        switch cfg.background.kind {
+        case .color: return .color
+        case .image: return .image
+        case .video: return .video
+        }
+    }
+
+    /// Sets blur and replacement together so they can never both be on —
+    /// blurring a background you have already replaced is nonsense, and two
+    /// independent switches would let a user create exactly that.
+    public func setBackgroundMode(_ mode: BackgroundMode) {
+        updateEditing { cfg in
+            var blurFlags = cfg.flags(for: .blur)
+            var backgroundFlags = cfg.flags(for: .background)
+            blurFlags.enabled = mode == .blur
+            backgroundFlags.enabled = mode != .off && mode != .blur
+            cfg.flags[.blur] = blurFlags
+            cfg.flags[.background] = backgroundFlags
+            switch mode {
+            case .color: cfg.background.kind = .color
+            case .image: cfg.background.kind = .image
+            case .video: cfg.background.kind = .video
+            case .off, .blur: break
+            }
+        }
+        // A manual choice clears the degradation latch on whichever stage it
+        // just turned on, exactly as setStageEnabled does.
+        if draftConfig == nil {
+            for id: StageID in [.blur, .background] {
+                var status = stageStatus[id] ?? StageStatus()
+                status.autoDisabled = false
+                stageStatus[id] = status
+            }
+        }
+    }
+
+    public func setBackgroundAsset(_ url: URL?) {
+        updateEditing { cfg in
+            cfg.background.assetPath = url?.path
+            if let url {
+                cfg.background.kind = PanicSettings.isVideoPath(url.path) ? .video : .image
+                var flags = cfg.flags(for: .background)
+                flags.enabled = true
+                cfg.flags[.background] = flags
+                var blurFlags = cfg.flags(for: .blur)
+                blurFlags.enabled = false
+                cfg.flags[.blur] = blurFlags
+            }
+        }
+    }
+
+    // MARK: - Intents: overlay layers (§5.8)
+
+    public func addOverlayLayer(url: URL) {
+        guard editingConfig.overlay.layers.count < OverlaySettings.maxLayers else {
+            warning = WarningMessage(
+                text: "PRISM composites up to \(OverlaySettings.maxLayers) layers at once")
+            return
+        }
+        let isVideo = PanicSettings.isVideoPath(url.path)
+        var layer = OverlayLayer(
+            name: url.deletingPathExtension().lastPathComponent,
+            sourceKind: isVideo ? .video : .image,
+            assetPath: url.path)
+        // A video dropped onto the stage is almost always a keyed element —
+        // a green-screen clip or an alpha-less effect loop — so start it on
+        // chroma. A still is usually a PNG that carries its own alpha.
+        layer.keyMode = isVideo ? .chroma : .none
+        updateEditing { cfg in
+            cfg.overlay.layers.append(layer)
+            var flags = cfg.flags(for: .overlay)
+            flags.enabled = true
+            cfg.flags[.overlay] = flags
+        }
+    }
+
+    public func updateOverlayLayer(_ id: UUID,
+                                   _ mutate: (inout OverlayLayer) -> Void) {
+        updateEditing { cfg in
+            guard let index = cfg.overlay.layers.firstIndex(where: { $0.id == id }) else { return }
+            mutate(&cfg.overlay.layers[index])
+        }
+    }
+
+    public func removeOverlayLayer(_ id: UUID) {
+        updateEditing { cfg in
+            cfg.overlay.layers.removeAll { $0.id == id }
+            if cfg.overlay.layers.isEmpty {
+                var flags = cfg.flags(for: .overlay)
+                flags.enabled = false
+                cfg.flags[.overlay] = flags
+            }
+        }
+    }
+
+    public func moveOverlayLayers(fromOffsets: IndexSet, toOffset: Int) {
+        updateEditing { cfg in
+            cfg.overlay.layers.move(fromOffsets: fromOffsets, toOffset: toOffset)
+        }
+    }
+
+    // MARK: - Intents: instant replay (§5.9)
+
+    /// Rewinds to the start of the rolling buffer and plays forward at the
+    /// configured rate. Above 1× the replay catches up to live on its own.
+    public func startReplay() {
+        guard let pipeline else { return }
+        guard studio.replay.isArmed else {
+            warning = WarningMessage(
+                text: "Turn on the rolling buffer to use instant replay",
+                action: .armBuffer)
+            return
+        }
+        guard pipeline.replayPlayer.startReplay(
+            rate: studio.replay.clampedPlaybackRate) else {
+            warning = WarningMessage(text: "Nothing buffered to replay yet")
+            return
+        }
+        // A replay is the one thing on air; a live away loop is not.
+        if isAway { endAway(returnToLive: false) }
+        pipeline.beginCrossfade(durationMs: 200)
+        refreshReplayState()
+        updateMenuBarState()
+    }
+
+    public func stopReplay() {
+        guard let pipeline, pipeline.replayPlayer.isActive else { return }
+        // §5.2: a replay ending while frozen must not resume live video under
+        // a frozen UI — re-arm the freeze from what is currently on air first.
+        if isFrozen {
+            pipeline.refreezeFromCurrentOutput()
+        }
+        pipeline.replayPlayer.stop()
+        pipeline.beginCrossfade(durationMs: 200)
+        refreshReplayState()
+        updateMenuBarState()
+    }
+
+    public func toggleReplay() {
+        if replayMode == .replay {
+            stopReplay()
+        } else {
+            startReplay()
+        }
+    }
+
+    public func scrubReplay(to seconds: Double) {
+        pipeline?.replayPlayer.seek(toSeconds: seconds)
+        replayPosition = seconds
+    }
+
+    /// Arms the rolling buffer from a warning action or a settings toggle.
+    public func setBufferArmed(_ armed: Bool) {
+        studio.replay.isArmed = armed
+        if armed, warning?.action == .armBuffer {
+            warning = nil
+        }
+    }
+
+    // MARK: - Intents: away loop (§5.10)
+
+    public func toggleAway() {
+        if isAway {
+            endAway(returnToLive: true)
+        } else {
+            beginAway()
+        }
+    }
+
+    private func beginAway() {
+        guard let pipeline else { return }
+        guard studio.replay.isArmed else {
+            // First use with the buffer off: arm it and say so. The loop
+            // cannot start yet — nothing is recorded — but the next press
+            // will work, which beats a control that does nothing.
+            if studio.away.armsBufferOnFirstUse {
+                studio.replay.isArmed = true
+                warning = WarningMessage(
+                    text: "Rolling buffer on. The away loop needs a few seconds of video first.")
+            } else {
+                warning = WarningMessage(
+                    text: "Turn on the rolling buffer to use the away loop",
+                    action: .armBuffer)
+            }
+            return
+        }
+        guard pipeline.replayPlayer.startAway(
+            loopSeconds: studio.away.clampedLoopSeconds,
+            crossfadeMs: studio.away.clampedCrossfadeMs) else {
+            warning = WarningMessage(
+                text: "Not enough video buffered yet for an away loop")
+            return
+        }
+        isAway = true
+        pipeline.beginCrossfade(durationMs: 300)
+        if studio.away.mutesAudio, !isMuted {
+            awayMutedByUs = true
+            toggleMute()
+        }
+        refreshReplayState()
+        updateMenuBarState()
+    }
+
+    private func endAway(returnToLive: Bool) {
+        guard let pipeline, isAway else { return }
+        isAway = false
+        // Same freeze-safety rule as stopReplay.
+        if isFrozen {
+            pipeline.refreezeFromCurrentOutput()
+        }
+        pipeline.replayPlayer.stop()
+        if returnToLive {
+            pipeline.beginCrossfade(durationMs: 300)
+        }
+        if awayMutedByUs {
+            awayMutedByUs = false
+            if isMuted { toggleMute() }
+        }
+        refreshReplayState()
+        updateMenuBarState()
+    }
+
+    // MARK: - Intents: panic (§5.11)
+
+    /// One chord, assembled entirely from primitives PRISM already has:
+    /// freeze the picture, mute the microphone, and swap the background for a
+    /// "back in a bit" backdrop. Pressing it again puts everything back
+    /// exactly as it was — including a freeze or mute the user had engaged
+    /// themselves before panicking.
+    public func togglePanic() {
+        if isPanicked {
+            releasePanic()
+        } else {
+            engagePanic()
+        }
+    }
+
+    private func engagePanic() {
+        guard !isPanicked else { return }
+        isPanicked = true
+
+        if studio.panic.swapsBackdrop {
+            // Snapshot before mutating; this is what gets persisted and what
+            // a preset save captures while panic is held.
+            panicRestore = config
+            updateConfig { cfg in
+                cfg.background = self.studio.panic.backdropConfiguration
+                var flags = cfg.flags(for: .background)
+                flags.enabled = true
+                cfg.flags[.background] = flags
+            }
+        }
+        if studio.panic.mutes, !isMuted {
+            panicMutedByUs = true
+            toggleMute()
+        }
+        if studio.panic.freezes, !isFrozen {
+            toggleFreeze()
+        }
+        updateMenuBarState()
+    }
+
+    private func releasePanic() {
+        guard isPanicked else { return }
+        isPanicked = false
+
+        if isFrozen, studio.panic.freezes {
+            toggleFreeze()
+        }
+        if panicMutedByUs {
+            panicMutedByUs = false
+            if isMuted { toggleMute() }
+        }
+        if let restore = panicRestore {
+            panicRestore = nil
+            pipeline?.beginCrossfade(durationMs: 200)
+            updateConfig { $0 = restore }
+        }
+        updateMenuBarState()
+    }
+
+    // MARK: - Intents: eye contact (§5.6)
+
+    public func toggleEyeContact() {
+        let enabled = editingConfig.flags(for: .gaze).enabled
+        setStageEnabled(.gaze, !enabled)
+    }
+
+    // MARK: - Replay state mirroring
+
+    private func refreshReplayState() {
+        guard let pipeline else { return }
+        let player = pipeline.replayPlayer
+        let mode = player.mode
+        if replayMode != mode {
+            replayMode = mode
+            restartReplayTimerIfNeeded()
+        }
+        let duration = player.durationSeconds
+        if abs(replayDuration - duration) > 0.01 { replayDuration = duration }
+        let position = player.positionSeconds
+        if abs(replayPosition - position) > 0.01 { replayPosition = position }
+        // A replay that ran to the live edge with return-to-live off simply
+        // holds there; isAway is unaffected.
+        if mode == .idle, isAway { isAway = false }
     }
 
     // MARK: - Intents: stages / config
@@ -1120,8 +1508,10 @@ public final class AppState: ObservableObject {
 
     public func saveCurrentAsPreset(named name: String) {
         // Mid-draft, "current" is the look the user is previewing — saving
-        // the live config would silently omit every staged edit.
-        var cfg = editingConfig
+        // the live config would silently omit every staged edit. Mid-panic,
+        // "current" is a "back in a bit" card, which nobody means to save as
+        // a preset, so the pre-panic snapshot wins over the live config.
+        var cfg = draftConfig ?? panicRestore ?? config
         cfg.format = formatManager.activeFormat
         let preset = Preset(name: name, configuration: cfg)
         presetStore.add(preset)
@@ -1186,6 +1576,8 @@ public final class AppState: ObservableObject {
     public func quit() {
         audioCapture.stop()
         clipPlayer?.stop()
+        pipeline?.replayPlayer.stop()
+        pipeline?.replayBuffer.reset()
         cameraCapture.stop()
         cmioSink.disconnect()
         audioSink?.close()      // marks producerAlive = 0 → plug-in emits silence
@@ -1195,10 +1587,20 @@ public final class AppState: ObservableObject {
     // MARK: - Derived state
 
     private func updateMenuBarState() {
-        // §8.2 precedence: error > frozen > muted > effects > live > idle.
+        // §8.2 precedence, extended: error > panic > away > replaying >
+        // frozen > muted > effects > live > idle. The four substitution
+        // states outrank the effect states because forgetting you are in one
+        // is the damaging failure — panic and away most of all, since both
+        // mean "the picture on air is not you right now".
         let newState: MenuBarState
         if case .failed = setup.cameraExtension {
             newState = .error
+        } else if isPanicked {
+            newState = .panicked
+        } else if isAway {
+            newState = .away
+        } else if replayMode == .replay {
+            newState = .replaying
         } else if isFrozen {
             newState = .frozen
         } else if isMuted {
@@ -1217,7 +1619,8 @@ public final class AppState: ObservableObject {
 
     private var hasActiveEffects: Bool {
         if clipState != .none { return true }
-        for id: StageID in [.adjust, .lut, .blur] where config.flags(for: id).enabled {
+        for id: StageID in [.adjust, .lut, .blur, .gaze, .background, .overlay]
+        where config.flags(for: id).enabled {
             if !(stageStatus[id]?.autoDisabled ?? false) { return true }
         }
         if config.flags(for: .geometry).enabled && !config.geometry.isIdentity { return true }
@@ -1253,13 +1656,27 @@ public final class AppState: ObservableObject {
            let decoded = try? JSONDecoder().decode([PopoverModuleItem].self, from: data) {
             popoverLayout = PopoverModuleItem.sanitized(decoded)
         }
+        if let data = UserDefaults.standard.data(forKey: DefaultsKey.studio),
+           let decoded = try? JSONDecoder().decode(StudioSettings.self, from: data) {
+            studio = decoded
+        }
         // §8.3 default: Framing, Effects, Format collapsed on first launch —
         // an empty set is exactly that, so no seeding is needed.
     }
 
+    /// Panic's backdrop swap lives in `config` so every surface shows what is
+    /// on air — but it must not survive a quit. Persisting the pre-panic
+    /// snapshot means relaunching after panicking leaves you where you were,
+    /// not stuck behind a "back in a bit" card with no memory of why.
     private func persistConfig() {
-        if let data = try? JSONEncoder().encode(config) {
+        if let data = try? JSONEncoder().encode(panicRestore ?? config) {
             UserDefaults.standard.set(data, forKey: DefaultsKey.configuration)
+        }
+    }
+
+    private func persistStudio() {
+        if let data = try? JSONEncoder().encode(studio) {
+            UserDefaults.standard.set(data, forKey: DefaultsKey.studio)
         }
     }
 

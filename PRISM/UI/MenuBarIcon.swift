@@ -22,7 +22,7 @@ struct MenuBarIcon: View {
     var body: some View {
         baseImage
             .opacity(state == .idle ? 0.4 : 1.0)
-            .foregroundStyle(state == .error
+            .foregroundStyle(state == .error || state == .panicked
                              ? AnyShapeStyle(.red)
                              : AnyShapeStyle(.primary))
             .overlay(alignment: .bottomTrailing) {
@@ -39,7 +39,7 @@ struct MenuBarIcon: View {
         switch state {
         case .idle, .live:
             return false
-        case .effects, .frozen, .muted, .error:
+        case .effects, .replaying, .away, .frozen, .muted, .panicked, .error:
             return true
         }
     }
@@ -55,6 +55,9 @@ struct MenuBarIcon: View {
         switch state {
         case .frozen: return "pause.fill"
         case .muted: return "mic.slash.fill"
+        case .replaying: return "backward.fill"
+        case .away: return "moon.zzz.fill"
+        case .panicked: return "hand.raised.fill"
         default: return nil
         }
     }
@@ -64,8 +67,11 @@ struct MenuBarIcon: View {
         case .idle: return "PRISM, not in use"
         case .live: return "PRISM, live"
         case .effects: return "PRISM, effects active"
+        case .replaying: return "PRISM, playing a replay"
+        case .away: return "PRISM, away loop on air"
         case .frozen: return "PRISM, frozen"
         case .muted: return "PRISM, muted"
+        case .panicked: return "PRISM, panic engaged"
         case .error: return "PRISM, error"
         }
     }

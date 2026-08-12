@@ -171,3 +171,22 @@ kernel void prism_sharpness(texture2d<float, access::sample> src    [[texture(0)
         result[params.slot] = variance;
     }
 }
+
+// Luma thumbnail for the replay ring's away-loop search: writes a
+// width×height grid of Rec.709 luma into result[slot·width·height …].
+// Dispatched over the thumbnail grid itself (32×18 = 576 threads), not over
+// the source — linear filtering does the box-averaging for free.
+kernel void prism_thumbnail(texture2d<float, access::sample> src    [[texture(0)]],
+                            device float*                    result [[buffer(0)]],
+                            constant PRISMThumbnailParams&   params [[buffer(1)]],
+                            uint2                            gid    [[thread_position_in_grid]])
+{
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+
+    constexpr sampler smp(coord::normalized, address::clamp_to_edge, filter::linear);
+    float2 uv = (float2(gid) + 0.5) / float2(params.width, params.height);
+    uint index = params.slot * params.width * params.height + gid.y * params.width + gid.x;
+    result[index] = prism_luma709(src.sample(smp, uv).rgb);
+}

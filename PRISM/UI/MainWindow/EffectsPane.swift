@@ -80,19 +80,14 @@ struct EffectsPane: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Section("Background blur") {
-                stageHeader(.blur)
-                Picker("Quality", selection: blurQualityBinding) {
-                    ForEach(BlurQuality.allCases, id: \.self) { quality in
-                        Text(quality.displayName).tag(quality)
-                    }
-                }
-                .pickerStyle(.segmented)
-                PrismSliderRow(label: "Radius",
-                               value: blurRadiusBinding,
-                               range: 2...48,
-                               defaultValue: 18,
-                               fractionDigits: 0)
+            Section("Background") {
+                // Blur is one answer to "what is behind me", and virtual
+                // backgrounds are the others — they are mutually exclusive
+                // and belong under one control, which lives in Scene.
+                LabeledContent("Currently", value: state.backgroundMode.displayName)
+                Text("Background blur and virtual backgrounds are the same choice, so they share one control in the Scene pane.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Section {
                 Text("A required effect is never turned off automatically when effects exceed the latency budget — the others degrade first.")
@@ -169,22 +164,6 @@ struct EffectsPane: View {
             get: { state.editingConfig.lut.strength },
             set: { strength in
                 state.updateEditing { $0.lut.strength = strength }
-            })
-    }
-
-    private var blurQualityBinding: Binding<BlurQuality> {
-        Binding(
-            get: { state.editingConfig.blur.quality },
-            set: { quality in
-                state.updateEditing { $0.blur.quality = quality }
-            })
-    }
-
-    private var blurRadiusBinding: Binding<Double> {
-        Binding(
-            get: { state.editingConfig.blur.radius },
-            set: { radius in
-                state.updateEditing { $0.blur.radius = radius }
             })
     }
 

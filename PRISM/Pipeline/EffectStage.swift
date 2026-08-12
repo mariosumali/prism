@@ -10,15 +10,29 @@
 import Foundation
 import Metal
 
-/// Fixed chain order (§3.3):
-/// Clip substitution → Freeze → Geometry → Adjust → LUT → Background blur → Output fit
+/// Fixed chain order (§3.3, extended):
+/// Clip → Replay → Freeze → Eye contact → Geometry → Adjust → LUT →
+/// Background blur → Virtual background → Overlay → Output fit
+///
+/// The three substituting stages come first and in escalating order of
+/// authority: a clip replaces the camera, a replay overrides the clip, and a
+/// freeze overrides both — each is a more deliberate "stop showing me live"
+/// than the one before it. Eye contact runs before Geometry so it warps in
+/// the same space Vision measured the landmarks in. Virtual background and
+/// Overlay run after blur because both consume the same person mask and must
+/// composite over the finished look, and Overlay runs last of the two so a
+/// foreground layer sits above a replaced background.
 public enum StageID: String, Codable, CaseIterable, Hashable, Comparable {
     case clip
+    case replay
     case freeze
+    case gaze
     case geometry
     case adjust
     case lut
     case blur
+    case background
+    case overlay
     case outputFit   // always-on final fit; not user-visible as a stage
 
     /// Position in the chain; also the degradation tie-breaker (§3.4:
@@ -26,12 +40,16 @@ public enum StageID: String, Codable, CaseIterable, Hashable, Comparable {
     public var chainIndex: Int {
         switch self {
         case .clip: return 0
-        case .freeze: return 1
-        case .geometry: return 2
-        case .adjust: return 3
-        case .lut: return 4
-        case .blur: return 5
-        case .outputFit: return 6
+        case .replay: return 1
+        case .freeze: return 2
+        case .gaze: return 3
+        case .geometry: return 4
+        case .adjust: return 5
+        case .lut: return 6
+        case .blur: return 7
+        case .background: return 8
+        case .overlay: return 9
+        case .outputFit: return 10
         }
     }
 
@@ -43,11 +61,15 @@ public enum StageID: String, Codable, CaseIterable, Hashable, Comparable {
     public var displayName: String {
         switch self {
         case .clip: return "Clip"
+        case .replay: return "Replay"
         case .freeze: return "Freeze"
+        case .gaze: return "Eye contact"
         case .geometry: return "Framing"
         case .adjust: return "Adjust"
         case .lut: return "LUT"
         case .blur: return "Background blur"
+        case .background: return "Virtual background"
+        case .overlay: return "Overlay"
         case .outputFit: return "Output fit"
         }
     }
