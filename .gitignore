@@ -1,0 +1,19 @@
+# Xcode
+build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcuserstate
+*.moved-aside
+
+# XcodeGen output is regenerable but committed for contributor convenience;
+# user-specific pieces are not.
+xcuserdata/
+
+# Packaging output
+dist/
+*.dmg
+*.pkg
+
+# macOS
+.DS_Store
