@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>PRISM</string>
+	<key>CFBundleDisplayName</key>
+	<string>PRISM</string>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<!-- SPEC §1 specifies LSUIElement = true (menu bar only, no Dock icon).
+	     Overridden deliberately: PRISM shows in the Dock *and* the menu bar.
+	     Clicking the Dock icon opens Settings (see PRISMAppDelegate), since a
+	     menu bar agent has no main window to raise. -->
+	<key>LSUIElement</key>
+	<false/>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.video</string>
+	<key>NSCameraUsageDescription</key>
+	<string>PRISM relays your camera to apps through PRISM Camera. Without camera access there is nothing to relay.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>PRISM relays your microphone to apps through PRISM Microphone. Without microphone access there is nothing to relay.</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Apache License 2.0</string>
+</dict>
+</plist>

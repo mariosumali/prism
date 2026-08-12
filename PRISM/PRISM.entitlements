@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The app is distributed outside the Mac App Store (the HAL plug-in
+	     rules this out anyway, §4.1). Hardened runtime, not sandboxed:
+	     the global hotkey event tap (§5.2) and /Library HAL plug-in checks
+	     are incompatible with the app sandbox. -->
+	<key>com.apple.security.device.camera</key>
+	<true/>
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+	<key>com.apple.developer.system-extension.install</key>
+	<true/>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>744ZKK233L.horse.prism.PRISM</string>
+	</array>
+</dict>
+</plist>

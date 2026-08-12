@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Local development entitlements (Tools/run_local.sh).
+
+	     PRISM.entitlements minus the two keys that Apple will only grant
+	     through a provisioning profile:
+
+	       com.apple.developer.system-extension.install
+	         Required to install the camera extension. There is no local
+	         substitute, so "PRISM Camera" cannot appear in other apps in
+	         this mode — that is the one real limitation.
+
+	       com.apple.security.application-groups
+	         Declared in PRISM.entitlements but never used: the app talks to
+	         the HAL plug-in over POSIX shared memory (/horse.prism.audio.v1)
+	         and to the extension over the CMIO sink stream, so no group
+	         container is ever opened. Dropping it costs nothing.
+
+	     The two kept below are NOT optional. The hardened runtime is on for
+	     every PRISM build, and under it these entitlements gate camera and
+	     microphone access: without them macOS denies both silently — no
+	     prompt, no TCC record, just a black preview. -->
+	<key>com.apple.security.device.camera</key>
+	<true/>
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>
