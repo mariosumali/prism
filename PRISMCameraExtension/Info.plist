@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>PRISM Camera</string>
+	<key>CFBundlePackageType</key>
+	<string>SYSX</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<!-- Bump on EVERY change to extension behavior or its property contract:
+	     ExtensionInstaller compares this against the installed copy at launch
+	     and submits a replacement when they differ. A stale extension serving
+	     an old contract fails in ways that look like app bugs ('who?' on new
+	     properties). -->
+	<key>CFBundleVersion</key>
+	<string>2</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<!-- Required for the com.apple.system_extension.cmio category: without
+	     this key OSSystemExtensionManager rejects the activation request
+	     client-side (error 9) before sysextd ever sees it, with a message the
+	     framework otherwise buries. Shown to the user in the approval dialog. -->
+	<key>NSSystemExtensionUsageDescription</key>
+	<string>PRISM Camera relays PRISM's processed video to apps like FaceTime, Zoom, and Photo Booth as a selectable camera.</string>
+	<key>CMIOExtension</key>
+	<dict>
+		<!-- Must be prefixed by an app group both the app and the extension
+		     hold; this is how the sink stream client (the app) is authorized. -->
+		<key>CMIOExtensionMachServiceName</key>
+		<string>$(TeamIdentifierPrefix)horse.prism.PRISM.camera</string>
+	</dict>
+</dict>
+</plist>
