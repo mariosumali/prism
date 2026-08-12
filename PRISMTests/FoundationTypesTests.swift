@@ -1,0 +1,165 @@
+// FoundationTypesTests.swift
+// PRISMTests
+//
+// Locks down the shared vocabulary the whole app builds on: format ordering
+// and labels, the latency-policy budget table (§3.4), chain order and
+// degradation tie-breaking, and configuration/preset JSON round-trips (§5.5).
+//
+// Licensed under the Apache License, Version 2.0.
+
+import XCTest
+
+final class FoundationTypesTests: XCTestCase {
+
+    // MARK: VideoFormat
+
+    func testDefaultSetMatchesSpecTable() {
+        // §3.2 default published set: 9 entries.
+        let set = VideoFormat.defaultSet
+        XCTAssertEqual(set.count, 9)
+        XCTAssertTrue(set.contains(VideoFormat(width: 3840, height: 2160, frameRate: 30)))
+        for rate in [24, 30, 60] {
+            XCTAssertTrue(set.contains(VideoFormat(width: 1920, height: 1080, frameRate: rate)))
+            XCTAssertTrue(set.contains(VideoFormat(width: 1280, height: 720, frameRate: rate)))
+        }
+        XCTAssertTrue(set.contains(VideoFormat(width: 960, height: 540, frameRate: 30)))
+        XCTAssertTrue(set.contains(VideoFormat(width: 640, height: 480, frameRate: 30)))
+    }
+
+    func testFormatSortLargestFirst() {
+        let sorted = VideoFormat.defaultSet.sorted()
+        XCTAssertEqual(sorted.first, VideoFormat(width: 3840, height: 2160, frameRate: 30))
+        XCTAssertEqual(sorted.last, VideoFormat(width: 640, height: 480, frameRate: 30))
+        // Same dimensions: higher rate first.
+        let i60 = sorted.firstIndex(of: VideoFormat(width: 1920, height: 1080, frameRate: 60))!
+        let i24 = sorted.firstIndex(of: VideoFormat(width: 1920, height: 1080, frameRate: 24))!
+        XCTAssertLessThan(i60, i24)
+    }
+
+    func testResolutionLabels() {
+        XCTAssertEqual(VideoFormat(width: 1920, height: 1080, frameRate: 30).resolutionLabel, "1080p")
+        XCTAssertEqual(VideoFormat(width: 3840, height: 2160, frameRate: 30).resolutionLabel, "4K")
+        XCTAssertEqual(VideoFormat(width: 1234, height: 700, frameRate: 30).resolutionLabel, "1234×700")
+    }
+
+    func testFrameInterval() {
+        XCTAssertEqual(VideoFormat(width: 1920, height: 1080, frameRate: 30).frameIntervalMs,
+                       1000.0 / 30.0, accuracy: 0.001)
+    }
+
+    // MARK: LatencyPolicy budget table (§3.4)
+
+    func testBudgetTable() {
+        let cases: [(LatencyPolicy, Double, Double)] = [
+            (.lowest, 1000.0 / 60.0, 3.3), (.lowest, 1000.0 / 30.0, 6.7),
+            (.lowest, 1000.0 / 24.0, 8.3),
+            (.balanced, 1000.0 / 60.0, 6.7), (.balanced, 1000.0 / 30.0, 13.3),
+            (.balanced, 1000.0 / 24.0, 16.7),
+            (.quality, 1000.0 / 60.0, 11.7), (.quality, 1000.0 / 30.0, 23.3),
+            (.quality, 1000.0 / 24.0, 29.2),
+        ]
+        for (policy, interval, expected) in cases {
+            XCTAssertEqual(policy.budgetMs(frameIntervalMs: interval), expected,
+                           accuracy: 0.05,
+                           "\(policy) at \(interval)ms must match the §3.4 table")
+        }
+    }
+
+    // MARK: Chain order and degradation ordering (§3.3, §3.4)
+
+    func testChainOrderIsFixed() {
+        let ordered = StageID.allCases.sorted()
+        XCTAssertEqual(ordered, [.clip, .freeze, .geometry, .adjust, .lut, .blur, .outputFit])
+    }
+
+    func testDegradationVictimOrdering() {
+        // §3.4: expensive before moderate before cheap; ties broken by later
+        // chain position. Simulate the selection rule over enabled stages.
+        struct Row { let id: StageID; let cost: StageCost }
+        let enabled: [Row] = [
+            Row(id: .geometry, cost: .cheap),
+            Row(id: .adjust, cost: .cheap),
+            Row(id: .lut, cost: .moderate),
+            Row(id: .blur, cost: .expensive),
+        ]
+        func victim(_ rows: [Row]) -> StageID? {
+            rows.sorted {
+                if $0.cost != $1.cost { return $0.cost > $1.cost }
+                return $0.id.chainIndex > $1.id.chainIndex
+            }.first?.id
+        }
+        XCTAssertEqual(victim(enabled), .blur)
+        XCTAssertEqual(victim(enabled.filter { $0.id != .blur }), .lut)
+        // Tie between two cheap stages → later chain position (adjust) first.
+        XCTAssertEqual(victim(enabled.filter { $0.cost == .cheap }), .adjust)
+    }
+
+    // MARK: Configuration / preset round-trips (§5.5)
+
+    func testPipelineConfigurationJSONRoundTrip() throws {
+        var config = PipelineConfiguration()
+        config.adjust.exposureEV = 0.4
+        config.adjust.temperature = -25
+        config.lut.lutName = "Film"
+        config.lut.strength = 0.8
+        config.blur.quality = .accurate
+        config.geometry.zoom = 2.5
+        config.geometry.mirror = .horizontal
+        config.geometry.cropAspect = .r16x9
+        config.geometry.autoFrame = true
+        config.flags[.blur] = StageFlags(enabled: true, pinned: true)
+        config.format = VideoFormat(width: 1280, height: 720, frameRate: 60)
+        config.latencyPolicy = .lowest
+        config.cameraID = "cam-uid"
+
+        let data = try JSONEncoder().encode(config)
+        let decoded = try JSONDecoder().decode(PipelineConfiguration.self, from: data)
+        XCTAssertEqual(decoded, config)
+    }
+
+    func testPresetJSONRoundTrip() throws {
+        var config = PipelineConfiguration()
+        config.latencyPolicy = .quality
+        let preset = Preset(name: "Interview", configuration: config,
+                            hotkey: HotkeyCombo(keyCode: 18, option: true, command: true))
+        let data = try JSONEncoder().encode(preset)
+        let decoded = try JSONDecoder().decode(Preset.self, from: data)
+        XCTAssertEqual(decoded, preset)
+        XCTAssertEqual(decoded.hotkey?.displayString, "⌥⌘1")
+    }
+
+    func testVideoFormatJSONKeysMatchExtensionContract() throws {
+        // The camera extension decodes the 'pfmt' payload with its own
+        // Codable mirror using keys width/height/frameRate. Guard the keys.
+        let data = try JSONEncoder().encode(VideoFormat(width: 1920, height: 1080, frameRate: 30))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(Set(object.keys), ["width", "height", "frameRate"])
+    }
+
+    // MARK: Settings identity checks (drive wantsEncode fast paths)
+
+    func testIdentityDetection() {
+        XCTAssertTrue(AdjustSettings().isIdentity)
+        var adjust = AdjustSettings()
+        adjust.vignette = 0.2
+        XCTAssertFalse(adjust.isIdentity)
+
+        XCTAssertTrue(GeometrySettings().isIdentity)
+        var geometry = GeometrySettings()
+        geometry.orientation = .deg90
+        XCTAssertFalse(geometry.isIdentity)
+    }
+
+    func testKernelParamStructSizes() {
+        // Swift and MSL compile KernelTypes.h independently; a size drift
+        // means misaligned constant buffers. Sizes are fixed by the header.
+        XCTAssertEqual(MemoryLayout<PRISMAdjustParams>.size, 32)
+        XCTAssertEqual(MemoryLayout<PRISMLUTParams>.size, 16)
+        XCTAssertEqual(MemoryLayout<PRISMBlurParams>.size, 16)
+        XCTAssertEqual(MemoryLayout<PRISMCompositeParams>.size, 16)
+        XCTAssertEqual(MemoryLayout<PRISMCrossfadeParams>.size, 16)
+        XCTAssertEqual(MemoryLayout<PRISMSharpnessParams>.size, 16)
+        // simd_float3x3 is 48 bytes (3 × float4-aligned columns).
+        XCTAssertEqual(MemoryLayout<PRISMGeometryParams>.size, 64)
+    }
+}
