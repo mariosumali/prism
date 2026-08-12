@@ -1,0 +1,129 @@
+# XcodeGen manifest — regenerate PRISM.xcodeproj with `xcodegen generate`.
+# Forking: substitute your own Apple Developer Team ID for DEVELOPMENT_TEAM in
+# the `signing` group below, and in the app group of the two .entitlements
+# files (see README, "Building from source"). Only the three shipping targets
+# need it — PRISMTests is ad-hoc signed so the suite runs on a checkout with no
+# Apple Developer account.
+name: PRISM
+options:
+  bundleIdPrefix: horse.prism
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    GENERATE_INFOPLIST_FILE: NO
+    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "1.0"
+    DEAD_CODE_STRIPPING: YES
+
+settingGroups:
+  # Applied only to targets that are actually installed on a user's machine.
+  signing:
+    DEVELOPMENT_TEAM: 744ZKK233L
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_HARDENED_RUNTIME: YES
+
+targets:
+  PRISM:
+    type: application
+    platform: macOS
+    sources:
+      - path: PRISM
+        excludes:
+          - "Info.plist"
+      - path: PRISMShared
+      - path: PRISMKernels
+    settings:
+      groups: [signing]
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: horse.prism.PRISM
+        INFOPLIST_FILE: PRISM/Info.plist
+        CODE_SIGN_ENTITLEMENTS: PRISM/PRISM.entitlements
+        SWIFT_OBJC_BRIDGING_HEADER: PRISM/PRISM-Bridging-Header.h
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        MTL_LANGUAGE_REVISION: Metal30
+        MTL_HEADER_SEARCH_PATHS: "$(SRCROOT)/PRISMKernels"
+    dependencies:
+      - target: PRISMCameraExtension
+        embed: true
+        codeSign: true
+
+  PRISMCameraExtension:
+    type: system-extension
+    platform: macOS
+    sources:
+      - path: PRISMCameraExtension
+        excludes:
+          - "Info.plist"
+    settings:
+      groups: [signing]
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: horse.prism.PRISM.camera
+        PRODUCT_NAME: horse.prism.PRISM.camera
+        INFOPLIST_FILE: PRISMCameraExtension/Info.plist
+        CODE_SIGN_ENTITLEMENTS: PRISMCameraExtension/PRISMCameraExtension.entitlements
+
+  # Standalone logic-test bundle: compiles the app sources directly (minus
+  # the @main entry and SwiftUI layer) so tests run headless without
+  # launching the menu bar app. Deliberately outside the `signing` group —
+  # ad-hoc signed, no Team ID, no hardened runtime, so `xcodebuild test`
+  # works on a checkout with no Apple Developer account.
+  PRISMTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: PRISMTests
+      - path: PRISM
+        excludes:
+          - "PRISMApp.swift"
+          - "Info.plist"
+          - "UI/**"
+      - path: PRISMShared
+      - path: PRISMKernels
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: horse.prism.PRISMTests
+        SWIFT_OBJC_BRIDGING_HEADER: PRISM/PRISM-Bridging-Header.h
+        GENERATE_INFOPLIST_FILE: YES
+        MTL_HEADER_SEARCH_PATHS: "$(SRCROOT)/PRISMKernels"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGNING_REQUIRED: NO
+        ENABLE_HARDENED_RUNTIME: NO
+
+  PRISMAudioPlugIn:
+    type: bundle
+    platform: macOS
+    sources:
+      - path: PRISMAudioPlugIn
+        excludes:
+          - "Info.plist"
+      - path: PRISMShared
+        excludes:
+          - "*.swift"
+    settings:
+      groups: [signing]
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: horse.prism.PRISM.audio
+        PRODUCT_NAME: PRISM
+        WRAPPER_EXTENSION: driver
+        INFOPLIST_FILE: PRISMAudioPlugIn/Info.plist
+        # coreaudiod hosts this bundle; no Swift, no ARC surprises.
+        CLANG_ENABLE_OBJC_ARC: NO
+        HEADER_SEARCH_PATHS: "$(SRCROOT)/PRISMShared"
+    dependencies:
+      - sdk: CoreAudio.framework
+      - sdk: CoreFoundation.framework
+
+schemes:
+  PRISMTests:
+    build:
+      targets:
+        PRISMTests: all
+    test:
+      targets:
+        - PRISMTests
