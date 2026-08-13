@@ -60,11 +60,16 @@ struct StudioPane: View {
 
     // MARK: - Status
 
-    /// "1080p · 30 fps · +7.2 ms", same composition as the popover.
+    /// "1080p · 30 fps · +7.2 ms", same composition as the popover, including
+    /// the deliberate delay when one is engaged (§5.12).
     private var statusLine: String {
         let format = state.config.format
         let added = String(format: "%+.1f", state.latency.totalAddedMs)
-        return "\(format.resolutionLabel) · \(format.frameRate) fps · \(added) ms"
+        var line = "\(format.resolutionLabel) · \(format.frameRate) fps · \(added) ms"
+        if state.latency.deliberateDelayMs >= 50 {
+            line += String(format: " · +%.1f s lag", state.latency.deliberateDelayMs / 1000)
+        }
+        return line
     }
 
     private var inUseLine: String {

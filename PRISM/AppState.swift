@@ -107,6 +107,10 @@ public final class AppState: ObservableObject {
     @Published public var bufferedSeconds: Double = 0
     @Published public var isAway = false
     @Published public var isPanicked = false
+    /// §5.12 — the deliberate delay is engaged.
+    @Published public var isLagging = false
+    /// Playing the backlog out faster than real time after a catch-up release.
+    @Published public var isCatchingUp = false
     /// Eye contact has found a face and is actually correcting. A correction
     /// that silently does nothing is indistinguishable from a broken one.
     @Published public var eyeContactTracking = false
@@ -479,6 +483,7 @@ public final class AppState: ObservableObject {
         hotkeys.onAway = { [weak self] in self?.toggleAway() }
         hotkeys.onPanic = { [weak self] in self?.togglePanic() }
         hotkeys.onEyeContact = { [weak self] in self?.toggleEyeContact() }
+        hotkeys.onLag = { [weak self] pressed in self?.handleLagKey(pressed: pressed) }
         hotkeys.onPreset = { [weak self] id in self?.selectPreset(id) }
         pushPresetHotkeyBindings(presetStore.presets)
     }
@@ -487,8 +492,12 @@ public final class AppState: ObservableObject {
         guard let pipeline else { return }
         pipeline.replayPlayer.onReplayFinished = { [weak self] in
             guard let self else { return }
-            // Reaching the live edge is the natural end of a replay; the away
-            // loop never reaches it.
+            // Two things reach the live edge: a replay running out, and a lag
+            // catch-up consuming its backlog. The away loop never does.
+            if self.isCatchingUp {
+                self.finishCatchUp()
+                return
+            }
             guard self.replayMode == .replay else { return }
             if self.studio.replay.returnToLiveAtEnd {
                 self.stopReplay()
@@ -1018,13 +1027,28 @@ public final class AppState: ObservableObject {
                 action: .armBuffer)
             return
         }
+        // Clear any other substitution BEFORE starting, and without calling
+        // stop(): the player is a single transport, so stopping it after
+        // startReplay has already claimed it would tear down the replay we
+        // just asked for. `begin` supersedes whatever was playing on its own.
+        if isAway {
+            isAway = false
+            if awayMutedByUs {
+                awayMutedByUs = false
+                if isMuted { toggleMute() }
+            }
+        }
+        if isLagging || isCatchingUp {
+            isLagging = false
+            isCatchingUp = false
+            audioCapture.delaySeconds = 0
+        }
+
         guard pipeline.replayPlayer.startReplay(
             rate: studio.replay.clampedPlaybackRate) else {
             warning = WarningMessage(text: "Nothing buffered to replay yet")
             return
         }
-        // A replay is the one thing on air; a live away loop is not.
-        if isAway { endAway(returnToLive: false) }
         pipeline.beginCrossfade(durationMs: 200)
         refreshReplayState()
         updateMenuBarState()
@@ -1091,6 +1115,12 @@ public final class AppState: ObservableObject {
             }
             return
         }
+        // Stepping away supersedes a delay; same no-stop() rule as above.
+        if isLagging || isCatchingUp {
+            isLagging = false
+            isCatchingUp = false
+            audioCapture.delaySeconds = 0
+        }
         guard pipeline.replayPlayer.startAway(
             loopSeconds: studio.away.clampedLoopSeconds,
             crossfadeMs: studio.away.clampedCrossfadeMs) else {
@@ -1123,6 +1153,105 @@ public final class AppState: ObservableObject {
             awayMutedByUs = false
             if isMuted { toggleMute() }
         }
+        refreshReplayState()
+        updateMenuBarState()
+    }
+
+    // MARK: - Intents: lag switch (§5.12)
+
+    /// Engages the deliberate delay. The picture holds where it is for the
+    /// configured delay and then resumes that far behind live — a stall, not
+    /// a rewind, which is what adding latency actually looks like.
+    public func engageLag() {
+        guard let pipeline, !isLagging else { return }
+        guard studio.replay.isArmed else {
+            warning = WarningMessage(
+                text: "Turn on the rolling buffer to use the lag switch",
+                action: .armBuffer)
+            return
+        }
+        guard replayMode != .replay else {
+            warning = WarningMessage(text: "Stop the replay before adding delay")
+            return
+        }
+        // Away and lag are both "what is on air is not live"; the newer
+        // intent wins. Cleared without stop() for the same reason startReplay
+        // does — `begin` supersedes the transport by itself.
+        if isAway {
+            isAway = false
+            if awayMutedByUs {
+                awayMutedByUs = false
+                if isMuted { toggleMute() }
+            }
+        }
+        let requested = studio.lag.delaySeconds
+        // The delay is held in the rolling buffer, so it cannot exceed it.
+        let available = min(requested, studio.replay.clampedBufferSeconds - 0.5)
+        guard available > 0.1, pipeline.replayPlayer.startLag(delaySeconds: available) else {
+            warning = WarningMessage(text: "Nothing buffered to delay yet")
+            return
+        }
+        isLagging = true
+        if studio.lag.delaysAudio {
+            audioCapture.delaySeconds = available
+        }
+        refreshReplayState()
+        updateMenuBarState()
+    }
+
+    /// Releases it. Snap-back cuts to live and never sends the backlog; catch
+    /// up plays the backlog out faster than real time first.
+    public func releaseLag() {
+        guard let pipeline, isLagging else { return }
+        isLagging = false
+        // Audio has no honest catch-up: speeding up a delay line means
+        // resampling or dropping samples, and both sound worse than the skew.
+        // The microphone therefore always snaps back (§5.12).
+        audioCapture.delaySeconds = 0
+
+        switch studio.lag.release {
+        case .snapBack:
+            if isFrozen {
+                pipeline.refreezeFromCurrentOutput()
+            }
+            pipeline.replayPlayer.stop()
+            pipeline.beginCrossfade(durationMs: 200)
+            refreshReplayState()
+        case .catchUp:
+            isCatchingUp = true
+            pipeline.replayPlayer.beginCatchUp(rate: studio.lag.clampedCatchUpRate)
+        }
+        updateMenuBarState()
+    }
+
+    /// Hotkey edge. A press while already lagging releases, so a missed key
+    /// release (focus change, revoked input monitoring) can never strand the
+    /// switch on.
+    public func handleLagKey(pressed: Bool) {
+        if pressed {
+            if isLagging {
+                releaseLag()
+            } else {
+                engageLag()
+            }
+        } else if studio.lag.holdToLag, isLagging {
+            releaseLag()
+        }
+    }
+
+    public func toggleLag() {
+        if isLagging { releaseLag() } else { engageLag() }
+    }
+
+    /// Called when a catch-up reaches the live edge.
+    private func finishCatchUp() {
+        guard isCatchingUp, let pipeline else { return }
+        isCatchingUp = false
+        if isFrozen {
+            pipeline.refreezeFromCurrentOutput()
+        }
+        pipeline.replayPlayer.stop()
+        pipeline.beginCrossfade(durationMs: 200)
         refreshReplayState()
         updateMenuBarState()
     }
@@ -1209,7 +1338,15 @@ public final class AppState: ObservableObject {
         if abs(replayPosition - position) > 0.01 { replayPosition = position }
         // A replay that ran to the live edge with return-to-live off simply
         // holds there; isAway is unaffected.
-        if mode == .idle, isAway { isAway = false }
+        if mode == .idle {
+            if isAway { isAway = false }
+            if isLagging { isLagging = false }
+            if isCatchingUp { isCatchingUp = false }
+        }
+        // The deliberate delay is reported to the monitor, and therefore to
+        // the user, for as long as it is being applied (§6).
+        monitor.setDeliberateDelayMs(
+            mode == .lag ? player.appliedDelaySeconds * 1000 : 0)
     }
 
     // MARK: - Intents: stages / config
@@ -1223,6 +1360,16 @@ public final class AppState: ObservableObject {
             var flags = cfg.flags(for: id)
             flags.enabled = enabled
             cfg.flags[id] = flags
+            // Turning a stage on whose parameters are all at identity flips a
+            // switch and changes nothing (PipelineConfiguration.isInert). LUT
+            // is the one case with an unambiguous remedy: it is inert only
+            // because "Neutral" IS the identity LUT, so switching it on picks
+            // the first real look. Adjust has no equivalent — there is no
+            // "some exposure" to guess at — so its surfaces say so instead.
+            if enabled, id == .lut, cfg.lut.isNeutral,
+               let firstLook = LUTStore.shared.firstNonNeutralLUT {
+                cfg.lut.lutName = firstLook
+            }
         }
         // Clearing a manual LIVE toggle also clears any auto-disable latch;
         // a drafted toggle leaves the live chain (and its latch) alone —
@@ -1231,6 +1378,24 @@ public final class AppState: ObservableObject {
             var status = stageStatus[id] ?? StageStatus()
             status.autoDisabled = false
             stageStatus[id] = status
+        }
+    }
+
+    /// Picking a LUT is the same intent as switching the stage on, and
+    /// picking Neutral is the same intent as switching it off — Neutral is
+    /// the identity LUT, so any other pairing puts the picker and the switch
+    /// in visible disagreement about whether a look is applied.
+    public func setLUTName(_ name: String) {
+        updateEditing { cfg in
+            cfg.lut.lutName = name
+            var flags = cfg.flags(for: .lut)
+            flags.enabled = !LUTSettings.isNeutral(name)
+            cfg.flags[.lut] = flags
+        }
+        if draftConfig == nil {
+            var status = stageStatus[.lut] ?? StageStatus()
+            status.autoDisabled = false
+            stageStatus[.lut] = status
         }
     }
 
@@ -1599,6 +1764,8 @@ public final class AppState: ObservableObject {
             newState = .panicked
         } else if isAway {
             newState = .away
+        } else if isLagging || isCatchingUp {
+            newState = .lagging
         } else if replayMode == .replay {
             newState = .replaying
         } else if isFrozen {
@@ -1619,11 +1786,14 @@ public final class AppState: ObservableObject {
 
     private var hasActiveEffects: Bool {
         if clipState != .none { return true }
-        for id: StageID in [.adjust, .lut, .blur, .gaze, .background, .overlay]
-        where config.flags(for: id).enabled {
+        // Enabled is not the same as doing something: a stage the pipeline
+        // skips (isInert) changes no pixels, and the menu bar must not claim
+        // an effect is on air when the picture is untouched. Geometry was
+        // always excluded this way; isInert applies the same test to the rest.
+        for id: StageID in [.adjust, .lut, .blur, .gaze, .background, .overlay, .geometry]
+        where config.flags(for: id).enabled && !config.isInert(id) {
             if !(stageStatus[id]?.autoDisabled ?? false) { return true }
         }
-        if config.flags(for: .geometry).enabled && !config.geometry.isIdentity { return true }
         return false
     }
 

@@ -259,7 +259,7 @@ a prefix of the ring would be undecodable.
 ### ReplayPlayer (`PRISM/Pipeline/ReplayPlayer.swift`)
 
 ```swift
-public enum ReplayMode: Equatable { case idle, replay, away }
+public enum ReplayMode: Equatable { case idle, replay, away, lag }
 
 public final class ReplayPlayer {
     public struct Frame {
@@ -276,12 +276,26 @@ public final class ReplayPlayer {
     @discardableResult public func startReplay(rate: Double) -> Bool
     @discardableResult public func startAway(loopSeconds: Double,
                                              crossfadeMs: Double) -> Bool
+    /// §5.12. Holds the current live frame for `delaySeconds`, then resumes
+    /// at 1× permanently that far behind — a delay line, not a rewind.
+    @discardableResult public func startLag(delaySeconds: Double) -> Bool
+    /// Consumes the lag backlog at `rate` until it reaches live, then fires
+    /// `onReplayFinished`. `stop()` is the snap-back path.
+    public func beginCatchUp(rate: Double)
+    /// Delay currently applied, for LatencyMonitor.setDeliberateDelayMs.
+    public var appliedDelaySeconds: Double { get }
     public func stop()
-    public func seek(toSeconds: Double)
+    public func seek(toSeconds: Double)      // replay/away only
     /// Frame queue only.
     public func currentFrame(at hostTime: CMTime) -> Frame?
 }
 ```
+
+Lag mode re-reads the ring on every pump, because it trails a buffer that is
+both growing at the back and trimming at the front. Indices are therefore not
+stable across snapshots, and both the range base and the feed position are
+carried as absolute host-clock times (`baseSeconds`, `lastFedSeconds`) rather
+than as indices.
 
 Decode backpressure is mandatory: VideoToolbox may decode asynchronously, so
 the feed stops on `fifo.count + inFlight`, never on `fifo.count` alone.
@@ -673,6 +687,8 @@ public final class AppState: ObservableObject {
     @Published public var bufferedSeconds: Double
     @Published public var isAway: Bool
     @Published public var isPanicked: Bool
+    @Published public var isLagging: Bool
+    @Published public var isCatchingUp: Bool
     @Published public var eyeContactTracking: Bool
     // Clip
     @Published public var clipState: ClipState
@@ -732,6 +748,13 @@ public final class AppState: ObservableObject {
     public func toggleAway()
     public func togglePanic()
     public func toggleEyeContact()
+    // Lag switch (§5.12)
+    public func engageLag()
+    public func releaseLag()
+    public func toggleLag()
+    /// Hotkey edge: `true` on keyDown, `false` on keyUp. A press while
+    /// already lagging releases, so a missed key release cannot strand it on.
+    public func handleLagKey(pressed: Bool)
     public func updateConfig(_ mutate: (inout PipelineConfiguration) -> Void)
     public func setActiveFormat(_ format: VideoFormat)     // free within published set
     public func requestPublishedFormatsChange(_ formats: [VideoFormat])  // reconnect confirm if clients live

@@ -38,6 +38,7 @@ public enum MenuBarState: Equatable {
     case effects       // filled
     case replaying     // filled + rewind badge: clients are seeing the past
     case away          // filled + moon badge: the idle loop is on air
+    case lagging       // filled + hourglass badge: deliberate delay engaged
     case frozen        // filled + pause bar
     case muted         // filled + slash
     case panicked      // filled + raised hand, red tint

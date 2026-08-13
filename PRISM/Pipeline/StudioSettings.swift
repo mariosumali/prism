@@ -81,6 +81,66 @@ public struct AwaySettings: Codable, Equatable {
     public var clampedCrossfadeMs: Double { min(max(crossfadeMs, 0), 1500) }
 }
 
+// MARK: - Lag switch (§5.12)
+
+/// What happens to the accumulated delay when the switch is released.
+public enum LagRelease: String, Codable, CaseIterable {
+    /// Cut straight back to live. The delayed backlog is never sent — the
+    /// same thing a real connection does when it recovers by dropping its
+    /// buffer. This is what a lag switch looks like.
+    case snapBack
+    /// Play out the backlog faster than real time until it is caught up, so
+    /// nothing you said while lagging is lost.
+    case catchUp
+
+    public var displayName: String {
+        switch self {
+        case .snapBack: return "Snap back to live"
+        case .catchUp: return "Catch up"
+        }
+    }
+}
+
+/// Deliberate added latency (§5.12) — the exact inverse of everything else
+/// this app does.
+///
+/// Legitimate uses, in rough order of how often they come up: buying a few
+/// seconds before you have to answer; making a call look like it is
+/// struggling; correcting A/V skew when the audio path is running ahead of
+/// the video path; and exercising PRISM's own latency reporting and
+/// degradation engine with a known, controllable delay.
+public struct LagSettings: Codable, Equatable {
+    /// How far behind live to run. Bounded by the rolling buffer, which is
+    /// where the delayed video is held (§5.9).
+    public var delayMs: Double = 3000            // 200…10000
+    /// Delay the microphone by the same amount. On by default: video running
+    /// three seconds behind live audio does not read as a bad connection, it
+    /// reads as broken software.
+    public var delaysAudio: Bool = true
+    public var release: LagRelease = .snapBack
+    /// Speed used to consume the backlog on a catch-up release.
+    public var catchUpRate: Double = 2.0         // 1.25…4
+    /// Hold the hotkey to lag, rather than pressing it to toggle. A switch
+    /// you hold is what the name describes, and it cannot be left on by
+    /// accident — but it depends on seeing the key release, so the tile
+    /// stays a plain toggle regardless.
+    public var holdToLag: Bool = true
+    public init() {}
+
+    public var clampedDelayMs: Double { min(max(delayMs, 200), 10_000) }
+    public var delaySeconds: Double { clampedDelayMs / 1000 }
+    public var clampedCatchUpRate: Double { min(max(catchUpRate, 1.25), 4) }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        delayMs = c.tolerant(.delayMs, 3000)
+        delaysAudio = c.tolerant(.delaysAudio, true)
+        release = c.tolerant(.release, .snapBack)
+        catchUpRate = c.tolerant(.catchUpRate, 2.0)
+        holdToLag = c.tolerant(.holdToLag, true)
+    }
+}
+
 // MARK: - Panic chord (§5.11)
 
 /// One chord, built entirely from primitives PRISM already has. Every part
@@ -139,10 +199,11 @@ public struct StudioSettings: Codable, Equatable {
     public var replay = ReplaySettings()
     public var away = AwaySettings()
     public var panic = PanicSettings()
+    public var lag = LagSettings()
     public init() {}
 
     public enum CodingKeys: String, CodingKey {
-        case replay, away, panic
+        case replay, away, panic, lag
     }
 
     /// Same forward-compatibility contract as PipelineConfiguration: a field
@@ -155,6 +216,7 @@ public struct StudioSettings: Codable, Equatable {
         replay = decode(.replay, ReplaySettings())
         away = decode(.away, AwaySettings())
         panic = decode(.panic, PanicSettings())
+        lag = decode(.lag, LagSettings())
     }
 
     /// The rolling buffer runs when replay is armed, or when the away loop

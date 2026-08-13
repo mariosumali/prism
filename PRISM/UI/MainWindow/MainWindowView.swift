@@ -199,6 +199,7 @@ private struct GeneralPane: View {
                 LabeledContent("Away loop", value: "⌥⌘A")
                 LabeledContent("Panic", value: "⌥⌘P")
                 LabeledContent("Eye contact", value: "⌥⌘E")
+                LabeledContent("Lag switch", value: "⌥⌘L")
                 ForEach(state.presets.filter { $0.hotkey != nil }) { preset in
                     LabeledContent(preset.name,
                                    value: preset.hotkey?.displayString ?? "")

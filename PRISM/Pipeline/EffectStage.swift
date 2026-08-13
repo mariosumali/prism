@@ -148,6 +148,17 @@ public struct LatencyReport: Equatable {
     public var audioAddedMs: Double
     public var syncSkewMs: Double            // video − audio
 
+    /// Latency the user asked for (§5.12 lag switch), reported separately
+    /// from `totalAddedMs` rather than folded into it.
+    ///
+    /// Both choices are defensible and this one is deliberate. The meter's
+    /// whole job is showing what PRISM costs you against a budget; three
+    /// seconds of requested delay would peg it permanently and destroy the
+    /// one number the app exists to keep honest. So the meter keeps
+    /// measuring the involuntary cost, and the deliberate delay is shown
+    /// beside it in full — never hidden, never averaged in.
+    public var deliberateDelayMs: Double
+
     public init(captureMs: Double = 0,
                 stages: [StageID: Double] = [:],
                 handoffMs: Double = 0,
@@ -156,7 +167,8 @@ public struct LatencyReport: Equatable {
                 frameIntervalMs: Double = 33.3,
                 droppedFrames: Int = 0,
                 audioAddedMs: Double = 0,
-                syncSkewMs: Double = 0) {
+                syncSkewMs: Double = 0,
+                deliberateDelayMs: Double = 0) {
         self.captureMs = captureMs
         self.stages = stages
         self.handoffMs = handoffMs
@@ -166,5 +178,10 @@ public struct LatencyReport: Equatable {
         self.droppedFrames = droppedFrames
         self.audioAddedMs = audioAddedMs
         self.syncSkewMs = syncSkewMs
+        self.deliberateDelayMs = deliberateDelayMs
     }
+
+    /// Everything between the lens and the client app, deliberate delay
+    /// included. This is the number that answers "how far behind am I?"
+    public var endToEndMs: Double { totalAddedMs + deliberateDelayMs }
 }

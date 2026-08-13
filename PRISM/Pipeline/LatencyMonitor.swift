@@ -89,6 +89,7 @@ public final class LatencyMonitor: ObservableObject {
 
     private var handoffMs: Double = 0
     private var audioAddedMs: Double = 0
+    private var deliberateDelayMs: Double = 0
     private var droppedFrames = 0
 
     private let publishTimer: DispatchSourceTimer
@@ -199,6 +200,14 @@ public final class LatencyMonitor: ObservableObject {
         lock.unlock()
     }
 
+    /// Latency the user asked for (§5.12). Reported alongside the measured
+    /// cost, never folded into it — see `LatencyReport.deliberateDelayMs`.
+    public func setDeliberateDelayMs(_ ms: Double) {
+        lock.lock()
+        deliberateDelayMs = ms
+        lock.unlock()
+    }
+
     public func noteDroppedFrame() {
         lock.lock()
         droppedFrames += 1
@@ -258,7 +267,8 @@ public final class LatencyMonitor: ObservableObject {
             frameIntervalMs: frameIntervalMs,
             droppedFrames: droppedFrames,
             audioAddedMs: audioAddedMs,
-            syncSkewMs: totalAdded - audioAddedMs)
+            syncSkewMs: totalAdded - audioAddedMs,
+            deliberateDelayMs: deliberateDelayMs)
         lock.unlock()
         report = next
     }

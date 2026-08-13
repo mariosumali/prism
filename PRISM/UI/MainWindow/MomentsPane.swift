@@ -22,9 +22,68 @@ struct MomentsPane: View {
             bufferSection
             replaySection
             awaySection
+            lagSection
             panicSection
         }
         .formStyle(.grouped)
+    }
+
+    // MARK: - Lag switch
+
+    private var lagSection: some View {
+        Section("Lag switch") {
+            HStack {
+                Button(state.isLagging ? "Back to live" : "Lag now") {
+                    state.toggleLag()
+                }
+                .disabled(!state.studio.replay.isArmed && !state.isLagging)
+                Spacer()
+                Text(state.studio.lag.holdToLag ? "hold ⌥⌘L" : "⌥⌘L")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            PrismSliderRow(label: "Delay",
+                           value: lagDelayBinding,
+                           range: 200...maxLagMs,
+                           defaultValue: 3000,
+                           fractionDigits: 0,
+                           unit: " ms")
+            Toggle("Delay the microphone too", isOn: lagAudioBinding)
+            Toggle("Hold the key rather than toggling", isOn: holdToLagBinding)
+            Picker("On release", selection: lagReleaseBinding) {
+                ForEach(LagRelease.allCases, id: \.self) { release in
+                    Text(release.displayName).tag(release)
+                }
+            }
+            .pickerStyle(.segmented)
+            if state.studio.lag.release == .catchUp {
+                PrismSliderRow(label: "Catch-up speed",
+                               value: catchUpRateBinding,
+                               range: 1.25...4,
+                               defaultValue: 2,
+                               fractionDigits: 2)
+                Text("Video plays the backlog out at this speed until it reaches live. The microphone returns to live immediately either way — speeding up an audio delay means resampling or dropping samples, and both sound worse than the skew.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if state.isLagging || state.isCatchingUp {
+                LabeledContent("Currently",
+                               value: String(format: "%.1f s behind live",
+                                             state.latency.deliberateDelayMs / 1000))
+            }
+            Text("Engaging holds the picture where it is and only then resumes, that far behind — a stall, not a rewind. Jumping straight back would make you say the same thing twice.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("The delayed video lives in the same rolling buffer replay and away use, so the delay cannot exceed the buffer length, and delayed video passes through its encoder. The latency meter keeps measuring what PRISM costs you involuntarily; this delay is reported next to it, never folded into it.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// The delay is held in the rolling buffer, so it cannot outrun it.
+    private var maxLagMs: Double {
+        max(400, (state.studio.replay.clampedBufferSeconds - 0.5) * 1000)
     }
 
     // MARK: - Rolling buffer
@@ -226,6 +285,31 @@ struct MomentsPane: View {
     private var armsOnFirstUseBinding: Binding<Bool> {
         Binding(get: { state.studio.away.armsBufferOnFirstUse },
                 set: { state.studio.away.armsBufferOnFirstUse = $0 })
+    }
+
+    private var lagDelayBinding: Binding<Double> {
+        Binding(get: { min(state.studio.lag.delayMs, maxLagMs) },
+                set: { state.studio.lag.delayMs = $0 })
+    }
+
+    private var lagAudioBinding: Binding<Bool> {
+        Binding(get: { state.studio.lag.delaysAudio },
+                set: { state.studio.lag.delaysAudio = $0 })
+    }
+
+    private var holdToLagBinding: Binding<Bool> {
+        Binding(get: { state.studio.lag.holdToLag },
+                set: { state.studio.lag.holdToLag = $0 })
+    }
+
+    private var lagReleaseBinding: Binding<LagRelease> {
+        Binding(get: { state.studio.lag.release },
+                set: { state.studio.lag.release = $0 })
+    }
+
+    private var catchUpRateBinding: Binding<Double> {
+        Binding(get: { state.studio.lag.catchUpRate },
+                set: { state.studio.lag.catchUpRate = $0 })
     }
 
     private func panicBinding(

@@ -125,6 +125,14 @@ Default behavior is transparent pass-through. On top of that, PRISM adds:
 - **Panic** (⌥⌘P) — one chord: freeze + mute + swap to a "back in a bit"
   backdrop, each part switchable. Pressing it again restores exactly what
   you had, including a freeze or mute you'd engaged yourself.
+- **Lag switch** (hold ⌥⌘L) — deliberate added latency, the exact inverse of
+  everything else here. Engaging holds the picture where it is and only then
+  resumes, up to 10 seconds behind: a stall, not a rewind, because jumping
+  back would make you say the same thing twice. Audio follows by default.
+  Release snaps back to live, or catches up by playing the backlog out fast.
+  The delay is always stated outright — the latency meter keeps measuring
+  what PRISM costs you involuntarily, and the status line gains `+3.0 s lag`
+  next to it.
 
 The rolling buffer behind instant replay and the away loop is **off by
 default** and records only while something is actually using PRISM. An armed

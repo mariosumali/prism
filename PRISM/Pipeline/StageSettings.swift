@@ -58,16 +58,29 @@ public struct AdjustSettings: Codable, Equatable {
 }
 
 public struct LUTSettings: Codable, Equatable {
+    /// The identity LUT. Shipped as a file and synthesized as a fallback, so
+    /// "LUT = Neutral" and "LUT off" are the same picture — which is why
+    /// every surface has to treat them as the same state (see `isInert`).
+    public static let neutralName = "Neutral"
+
     /// Name of a bundled or imported .cube file, without extension.
-    public var lutName: String = "Neutral"
+    public var lutName: String = LUTSettings.neutralName
     public var strength: Double = 1        // 0…1
     public init() {}
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        lutName = c.tolerant(.lutName, "Neutral")
+        lutName = c.tolerant(.lutName, LUTSettings.neutralName)
         strength = c.tolerant(.strength, 1)
     }
+
+    /// Lookup is case-insensitive everywhere (LUTStore keys on lowercase), so
+    /// the neutral test has to be too.
+    public static func isNeutral(_ name: String) -> Bool {
+        name.caseInsensitiveCompare(neutralName) == .orderedSame
+    }
+
+    public var isNeutral: Bool { Self.isNeutral(lutName) }
 }
 
 public enum BlurQuality: String, Codable, CaseIterable {
@@ -467,6 +480,55 @@ public struct PipelineConfiguration: Codable, Equatable {
 
     public func flags(for id: StageID) -> StageFlags {
         flags[id] ?? StageFlags()
+    }
+
+    /// True when a stage is switched ON but its parameters make the pass a
+    /// no-op, so `wantsEncode()` declines it and the pipeline skips it
+    /// entirely (§5.4 fast paths: Adjust at identity, LUT at Neutral or zero
+    /// strength, Geometry at identity, Overlay with no file).
+    ///
+    /// Skipping the pass is right — it is free latency. Saying nothing about
+    /// it is not: a switch that is on and changes nothing is indistinguishable
+    /// from a broken one, and that is exactly how it gets reported. Every
+    /// surface that draws the switch reads this so it can say which it is.
+    public func isInert(_ id: StageID) -> Bool {
+        guard flags(for: id).enabled else { return false }
+        switch id {
+        case .adjust:
+            return adjust.isIdentity
+        case .lut:
+            return lut.isNeutral || lut.strength <= 0
+        case .geometry:
+            return geometry.isIdentity
+        case .overlay:
+            return overlay.renderableLayers.isEmpty
+        case .blur, .background, .gaze, .clip, .replay, .freeze, .outputFit:
+            // These change the picture whenever they are on (background
+            // replacement falls back to its colour rather than to nothing,
+            // and blur waits for the mask rather than declining).
+            return false
+        }
+    }
+
+    /// Why the stage is doing nothing, in the user's words — nil when it is
+    /// doing something. Lives here rather than in either Effects surface so
+    /// the popover and the main window cannot drift apart on the answer.
+    public func inertReason(_ id: StageID) -> String? {
+        guard isInert(id) else { return nil }
+        switch id {
+        case .adjust:
+            return "On, but every adjustment is still at its default."
+        case .lut:
+            return lut.strength <= 0
+                ? "On, but strength is 0."
+                : "On, but Neutral is the identity LUT."
+        case .geometry:
+            return "On, but framing is still at its default."
+        case .overlay:
+            return "On, but no layer has a file."
+        default:
+            return nil
+        }
     }
 
     public enum CodingKeys: String, CodingKey {

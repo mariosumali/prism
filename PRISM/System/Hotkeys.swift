@@ -31,6 +31,9 @@ public final class Hotkeys {
     /// Deliberately un-shifted: a panic key you have to reach for is not one.
     public static let panicCombo = HotkeyCombo(keyCode: 35, option: true, command: true)
     public static let eyeContactCombo = HotkeyCombo(keyCode: 14, option: true, command: true)
+    /// §5.12. The only combo that also reports its key release, so it can be
+    /// held rather than toggled — which is what "switch" means.
+    public static let lagCombo = HotkeyCombo(keyCode: 37, option: true, command: true)
 
     // MARK: Callbacks (invoked on the main thread)
 
@@ -41,6 +44,9 @@ public final class Hotkeys {
     public var onAway: (() -> Void)?               // ⌥⌘A
     public var onPanic: (() -> Void)?              // ⌥⌘P
     public var onEyeContact: (() -> Void)?         // ⌥⌘E
+    /// ⌥⌘L press and release. `true` on keyDown, `false` on keyUp, so the
+    /// receiver can implement either hold-to-lag or a toggle (§5.12).
+    public var onLag: ((Bool) -> Void)?
     public var onPreset: ((UUID) -> Void)?
 
     // MARK: State
@@ -70,7 +76,10 @@ public final class Hotkeys {
     public func start() {
         stop()
 
-        let mask = CGEventMask(1 << CGEventType.keyDown.rawValue)
+        // keyUp is in the mask only for the lag switch (§5.12), which is held
+        // rather than toggled. Every other combo ignores it.
+        let mask = CGEventMask((1 << CGEventType.keyDown.rawValue)
+            | (1 << CGEventType.keyUp.rawValue))
         let callback: CGEventTapCallBack = { _, type, event, refcon in
             guard let refcon else { return Unmanaged.passUnretained(event) }
             let hotkeys = Unmanaged<Hotkeys>.fromOpaque(refcon).takeUnretainedValue()
@@ -84,12 +93,12 @@ public final class Hotkeys {
                 return Unmanaged.passUnretained(event)
             }
 
+            let keyCode = UInt16(truncatingIfNeeded:
+                event.getIntegerValueField(.keyboardEventKeycode))
             if type == .keyDown {
                 // Ignore key autorepeat: holding ⌥⌘F must not toggle freeze
                 // on every repeat.
                 if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
-                    let keyCode = UInt16(truncatingIfNeeded:
-                        event.getIntegerValueField(.keyboardEventKeycode))
                     let flags = event.flags
                     hotkeys.match(keyCode: keyCode,
                                   option: flags.contains(.maskAlternate),
@@ -97,6 +106,8 @@ public final class Hotkeys {
                                   shift: flags.contains(.maskShift),
                                   control: flags.contains(.maskControl))
                 }
+            } else if type == .keyUp {
+                hotkeys.matchRelease(keyCode: keyCode)
             }
             // Listen-only tap: the return value is ignored, but returning the
             // event unmodified is the documented convention.
@@ -121,10 +132,12 @@ public final class Hotkeys {
         // other apps (it cannot consume them — fine, PRISM never consumes);
         // a local monitor covers keystrokes while PRISM itself is frontmost
         // (e.g. the popover is open), which global monitors do not see.
-        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        globalMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.keyDown, .keyUp]) { [weak self] event in
             self?.handle(nsEvent: event)
         }
-        localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        localMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.keyDown, .keyUp]) { [weak self] event in
             self?.handle(nsEvent: event)
             return event   // never consume
         }
@@ -154,6 +167,10 @@ public final class Hotkeys {
     // MARK: - Matching
 
     private func handle(nsEvent event: NSEvent) {
+        if event.type == .keyUp {
+            matchRelease(keyCode: event.keyCode)
+            return
+        }
         guard !event.isARepeat else { return }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         match(keyCode: event.keyCode,
@@ -161,6 +178,18 @@ public final class Hotkeys {
               command: flags.contains(.command),
               shift: flags.contains(.shift),
               control: flags.contains(.control))
+    }
+
+    /// Key releases are matched on the keycode alone, deliberately.
+    ///
+    /// Nobody releases ⌥, ⌘ and L in a defined order, so requiring the full
+    /// combo on the way up would routinely miss the release and leave the lag
+    /// switch stuck on — exactly the failure this app cares most about.
+    /// Matching the bare keycode means a stray L keyup releases a lag that
+    /// was not engaged, which is harmless.
+    private func matchRelease(keyCode: UInt16) {
+        guard keyCode == Self.lagCombo.keyCode else { return }
+        fire { $0.onLag?(false) }
     }
 
     /// Exact modifier matching over {⌥, ⌘, ⇧, ⌃} so ⌥⌘F and ⌥⌘⇧F stay
@@ -189,6 +218,8 @@ public final class Hotkeys {
             fire { $0.onPanic?() }
         } else if matches(Self.eyeContactCombo) {
             fire { $0.onEyeContact?() }
+        } else if matches(Self.lagCombo) {
+            fire { $0.onLag?(true) }
         } else if let (id, _) = presetBindings.first(where: { matches($0.1) }) {
             fire { $0.onPreset?(id) }
         }

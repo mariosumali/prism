@@ -495,6 +495,28 @@ Pressing it again restores **exactly** the prior state, including a freeze or mu
 
 The backdrop swap mutates the live configuration so every surface shows what is actually on air, but the pre-panic configuration snapshot is what gets persisted and what a preset save captures. Relaunching after a panic must leave the user where they were, not stuck behind a "back in a bit" card with no memory of why.
 
+### 5.12 Lag switch
+
+Deliberate added latency — the exact inverse of everything else in this document.
+
+| Property | Specification |
+|---|---|
+| Trigger | Moments tile, plus global hotkey ⌥⌘L (held by default) |
+| Delay | 200 ms – 10 s, default 3 s, bounded by the rolling buffer |
+| Video | Trails live via the §5.9 rolling buffer |
+| Audio | Circular PCM delay line in the capture path, on by default |
+| Release | Snap back (default) or catch up |
+
+**Engaging holds, it does not rewind.** Jumping the output back three seconds would replay the last three seconds — viewers would watch the user say the same thing twice. Instead the output holds the frame it was on for the full delay, and only then resumes at 1×, permanently that far behind. That is what a transport hiccup does and it is what "add latency" means. Audio behaves identically: the delay line emits silence until it has filled.
+
+**The two paths are delayed by completely different mechanisms, because their costs are nothing alike.** Ten seconds of 48 kHz stereo float is under 4 MB, so the microphone gets a plain preallocated circular buffer on the RT path. Ten seconds of 1080p is gigabytes, so video is delayed by trailing the compressed rolling buffer instead. This is also why the delay cannot exceed the buffer length, and why delayed video passes through the buffer's encoder.
+
+**Release.** *Snap back* cuts to live and never sends the backlog — what a recovering connection does. *Catch up* plays the backlog out at 1.25–4× until it reaches live, so nothing said while lagging is lost. Audio always snaps back regardless: speeding up an audio delay line means resampling or dropping samples, and both sound worse than the skew. Say so in the UI rather than pretending otherwise.
+
+**Hold, don't toggle.** The hotkey is momentary by default — a switch you hold is what the name describes, and it cannot be left on by accident. It is the only combo whose key *release* is observed. Releases are matched on the keycode alone: nobody releases ⌥, ⌘ and L in a defined order, and requiring the full combo on the way up would routinely miss the release and strand the switch on. As a second failsafe, a press while already lagging releases.
+
+**Reporting (§6).** The delay is reported in `LatencyReport.deliberateDelayMs`, **separate from** `totalAddedMs`. The latency meter's entire job is showing what PRISM costs you against a budget; folding three seconds of requested delay into it would peg it permanently and destroy the one number this app exists to keep honest. So the meter keeps measuring the involuntary cost, the status line gains `· +3.0 s lag`, and `endToEndMs` is the field that combines them. Never hide a deliberate delay.
+
 ---
 
 ## 6. Latency requirements
@@ -625,12 +647,13 @@ enum Metrics {
 | Effects active | Filled prism |
 | Replaying | Filled prism with rewind badge |
 | Away | Filled prism with moon badge |
+| Lagging | Filled prism with hourglass badge |
 | Frozen | Filled prism with pause bar |
 | Muted | Filled prism with slash |
 | Panic engaged | Filled prism with raised-hand badge, `.red` tint |
 | Error | Filled prism, `.red` tint |
 
-Precedence: error > panic > away > replaying > frozen > muted > effects > live > idle.
+Precedence: error > panic > away > lagging > replaying > frozen > muted > effects > live > idle.
 
 The four substitution states outrank the effect states because forgetting you are in one is the damaging failure this app can produce. Replay, away and panic each get their own glyph rather than folding into frozen, because *"why can nobody see me moving"* has to be answerable at a glance.
 
@@ -718,6 +741,12 @@ Sentence case throughout. Active voice. Name things by what the user controls, n
 | Eye contact active | `Tracking your eyes` |
 | Replay on air | `Playing back at 1.5× — everyone is seeing the past right now.` |
 | Away on air | `Looping. Everyone sees the idle clip until you turn this off.` |
+| Lag without a buffer | `Turn on the rolling buffer to use the lag switch` + action `Turn on` |
+| Lag during a replay | `Stop the replay before adding delay` |
+| Lag absorbing the delay | `Holding — 1.2s of 3.0s absorbed` |
+| Lag engaged | `3.0s behind live` |
+| Lag catching up | `Catching up at 2×…` |
+| Status line while lagging | `1080p · 30 fps · +7.2 ms · +3.0 s lag` |
 
 Errors state what happened and what to do. They do not apologize and are never vague.
 

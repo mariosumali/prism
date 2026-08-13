@@ -122,6 +122,7 @@
 		BAB9FD099963309479EE4809 /* VideoPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AEF33697F8E471A59D55333 /* VideoPipeline.swift */; };
 		BABD2F2BAD9320FD8E4A13D2 /* ExtensionProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A3CC15AE7381523F9118087 /* ExtensionProvider.swift */; };
 		BB34570CB4BC16A19750B926 /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E0756772A7F36507B633C11 /* OnboardingView.swift */; };
+		BB874307742987434C08B75C /* LagSwitchTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 12F1949F342D9034712EF641 /* LagSwitchTests.swift */; };
 		BC4C31E12F7CECB787D530B9 /* Layers.metal in Sources */ = {isa = PBXBuildFile; fileRef = CEA5572941CB1B51AFC54052 /* Layers.metal */; };
 		BCDF72069FFEF0E8FB8FABE6 /* PlaceholderRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD229C9E3A81527D84843A1B /* PlaceholderRenderer.swift */; };
 		BCEFA3727CF838AA2FBB8E62 /* FormatSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = ED9EEE45DD9D6C7C1C7D098E /* FormatSection.swift */; };
@@ -199,6 +200,7 @@
 		0E4230754DD0CC06066B1699 /* SceneSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneSection.swift; sourceTree = "<group>"; };
 		12068898E3D79E293BC12ADD /* LUTStage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LUTStage.swift; sourceTree = "<group>"; };
 		12C343B3A84A51C036889902 /* MomentsSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MomentsSection.swift; sourceTree = "<group>"; };
+		12F1949F342D9034712EF641 /* LagSwitchTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LagSwitchTests.swift; sourceTree = "<group>"; };
 		13032872A117E6CB8B3E2A1D /* DeviceSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceSource.swift; sourceTree = "<group>"; };
 		16D7CFDB5202A947C70C2542 /* Blur.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Blur.metal; sourceTree = "<group>"; };
 		18AF5ECE4C7193418E1A8B65 /* BlurStage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlurStage.swift; sourceTree = "<group>"; };
@@ -341,6 +343,7 @@
 				CEF4CED9705F22BC22756360 /* GazeStageTests.swift */,
 				C9FFE81443EA611E13E70543 /* GeometryMathTests.swift */,
 				DE29DCB396A6FB8888F5B0A4 /* KernelTests.swift */,
+				12F1949F342D9034712EF641 /* LagSwitchTests.swift */,
 				348E827CEB7C3F19DA35DCE0 /* LatencyMonitorTests.swift */,
 				E157BD293B9E7F816DA6241C /* LUTStoreTests.swift */,
 				A4189198EA5B988CFF03C050 /* PresetStoreTests.swift */,
@@ -802,6 +805,7 @@
 				F5A5381BE6CFDF4D148084D8 /* LUTStage.swift in Sources */,
 				043B4B1E28A11209B6EAB227 /* LUTStore.swift in Sources */,
 				95E8F5036531F2CC17E18CE5 /* LUTStoreTests.swift in Sources */,
+				BB874307742987434C08B75C /* LagSwitchTests.swift in Sources */,
 				C678B23F7C7EC63113052A37 /* LatencyMonitor.swift in Sources */,
 				3A8D5BAF924702E627A68B62 /* LatencyMonitorTests.swift in Sources */,
 				FB6455BB81B2A1051B00A28C /* LayerSource.swift in Sources */,

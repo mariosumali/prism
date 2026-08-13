@@ -76,9 +76,7 @@ public final class LUTStage: EffectStage {
 
     /// "Neutral" IS the identity LUT (bundled or synthesized), so applying it
     /// at any strength has no visual effect.
-    private var isNeutral: Bool {
-        settings.lutName.caseInsensitiveCompare("Neutral") == .orderedSame
-    }
+    private var isNeutral: Bool { settings.isNeutral }
 
     private func reloadTexture() {
         lutTexture = LUTStore.shared.texture(named: settings.lutName, device: device)

@@ -185,6 +185,46 @@ public final class AudioCapture {
     private var rtSilence: UnsafePointer<Float>?
     private var rtSilenceFrames = 0
 
+    // MARK: Deliberate delay line (§5.12)
+    //
+    // Delaying audio is cheap in a way delaying video is not: ten seconds of
+    // 48 kHz stereo float is under 4 MB, where the same ten seconds of 1080p
+    // is gigabytes. So the microphone gets a plain circular delay buffer
+    // here, while video is delayed by trailing the compressed rolling buffer
+    // (§5.9). Preallocated in start(); the RT callback only indexes it.
+
+    /// Interleaved stereo, `delayCapacityFrames` frames. Allocated once.
+    private var delayData: UnsafeMutablePointer<Float>?
+    private var delayCapacityFrames = 0
+    /// Write cursor in frames, monotonic; wrapped on use.
+    private var delayWritten: UInt64 = 0
+    /// Target delay in frames. Same single-writer/lock-on-set-only discipline
+    /// as isMuted: the setter serializes writers, the RT callback reads raw.
+    private var _delayFrames = 0
+    /// Requested delay in seconds; 0 disables the line entirely so the
+    /// off case costs one comparison on the RT path.
+    public var delaySeconds: Double {
+        get {
+            os_unfair_lock_lock(flagLock)
+            defer { os_unfair_lock_unlock(flagLock) }
+            return Double(_delayFrames) / 48_000.0
+        }
+        set {
+            // Clamped against the static maximum, not the live capacity:
+            // `delayCapacityFrames` belongs to the RT path, and reading it
+            // from the setter would be a race for no benefit. The RT path
+            // clamps again against what it actually has.
+            let seconds = min(max(newValue, 0), Self.maxDelaySeconds)
+            let frames = Int((seconds * 48_000.0).rounded())
+            os_unfair_lock_lock(flagLock)
+            _delayFrames = frames
+            os_unfair_lock_unlock(flagLock)
+        }
+    }
+
+    /// Longest delay the line can hold (§5.12 clamps the UI to this).
+    public static let maxDelaySeconds: Double = 10
+
     // Device/client format, fixed for the life of one start().
     private var deviceSampleRate: Double = 48_000
     private var clientChannels: Int = 2
@@ -412,15 +452,29 @@ public final class AudioCapture {
             alignment: MemoryLayout<Float>.alignment)
         stereoCapacityFrames = convertCapacityFrames
         stereoData = UnsafeMutablePointer<Float>.allocate(capacity: stereoCapacityFrames * 2)
+
+        // Deliberate delay line (§5.12). Preallocated with the rest of the RT
+        // buffers even when lag is never used: 10 s of 48 kHz stereo float is
+        // 3.8 MB, and the alternative — allocating when the switch is first
+        // thrown — would mean swapping a pointer the RT callback is reading.
+        // Sized with one extra slice of headroom so the read window can never
+        // overlap the frames being written this callback.
+        delayCapacityFrames = Int(Self.maxDelaySeconds * 48_000) + Self.maxSliceFrames
+        delayData = UnsafeMutablePointer<Float>.allocate(capacity: delayCapacityFrames * 2)
+        delayData?.initialize(repeating: 0, count: delayCapacityFrames * 2)
+        delayWritten = 0
     }
 
     private func freeBuffers() {
         renderData?.deallocate(); renderData = nil
         convertData?.deallocate(); convertData = nil
         stereoData?.deallocate(); stereoData = nil
+        delayData?.deallocate(); delayData = nil
         renderCapacityBytes = 0
         convertCapacityFrames = 0
         stereoCapacityFrames = 0
+        delayCapacityFrames = 0
+        delayWritten = 0
     }
 
     // MARK: Real-time render path
@@ -508,11 +562,73 @@ public final class AudioCapture {
                 stereoData[i * 2] = v
                 stereoData[i * 2 + 1] = v
             }
-            PRISMRingBufferWrite(ring, stereoData, UInt32(frames))
+            rtEmit(ring: ring, samples: stereoData, frameCount: frames)
         } else {
-            PRISMRingBufferWrite(ring, samples, UInt32(frames))
+            rtEmit(ring: ring, samples: samples, frameCount: frames)
         }
         return noErr
+    }
+
+    /// Ring write, through the deliberate delay line when one is set (§5.12).
+    /// RT-safe: indexes a preallocated circular buffer and calls the C ring
+    /// API. With no delay this is one comparison and the original direct
+    /// write, so the feature costs nothing when it is off.
+    private func rtEmit(ring: UnsafeMutablePointer<PRISMRingBuffer>,
+                        samples: UnsafePointer<Float>,
+                        frameCount: Int) {
+        let capacity = delayCapacityFrames
+        // Clamp against what the line actually has, leaving a slice of
+        // headroom so the read window never overlaps this callback's write.
+        let delay = min(_delayFrames, max(0, capacity - AudioCapture.maxSliceFrames))
+        guard delay > 0, let delayData, capacity > 0, frameCount <= capacity else {
+            PRISMRingBufferWrite(ring, samples, UInt32(frameCount))
+            return
+        }
+
+        // Append this slice to the circular buffer.
+        var cursor = Int(delayWritten % UInt64(capacity))
+        var remaining = frameCount
+        var source = samples
+        while remaining > 0 {
+            let chunk = min(remaining, capacity - cursor)
+            memcpy(delayData + cursor * 2, source,
+                   chunk * 2 * MemoryLayout<Float>.size)
+            cursor = (cursor + chunk) % capacity
+            source += chunk * 2
+            remaining -= chunk
+        }
+        delayWritten &+= UInt64(frameCount)
+
+        // Emit the slice sitting `delay` frames behind the new write cursor.
+        let start = Int64(delayWritten) - Int64(delay) - Int64(frameCount)
+        guard start >= 0 else {
+            // The line has not filled yet — this is the stall at the start of
+            // a delay, and silence is the honest thing to send. Video does
+            // exactly the same by holding its engage frame.
+            let missing = min(frameCount, Int(-start))
+            rtWriteSilence(ring: ring, frameCount: missing)
+            let rest = frameCount - missing
+            if rest > 0 {
+                rtWriteDelayed(ring: ring, from: 0, count: rest)
+            }
+            return
+        }
+        rtWriteDelayed(ring: ring, from: Int(start % Int64(capacity)), count: frameCount)
+    }
+
+    /// Writes `count` frames from the delay line starting at frame index
+    /// `from`, split across the wrap point. RT-safe.
+    private func rtWriteDelayed(ring: UnsafeMutablePointer<PRISMRingBuffer>,
+                                from: Int, count: Int) {
+        guard let delayData, delayCapacityFrames > 0 else { return }
+        var cursor = from
+        var remaining = count
+        while remaining > 0 {
+            let chunk = min(remaining, delayCapacityFrames - cursor)
+            PRISMRingBufferWrite(ring, delayData + cursor * 2, UInt32(chunk))
+            cursor = (cursor + chunk) % delayCapacityFrames
+            remaining -= chunk
+        }
     }
 
     /// RT-safe silence write: chunks the preallocated zero block through the

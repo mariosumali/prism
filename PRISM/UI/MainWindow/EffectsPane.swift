@@ -124,6 +124,14 @@ struct EffectsPane: View {
                  : "Off on the live camera to keep video smooth")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        } else if let reason = state.editingConfig.inertReason(id) {
+            // The stage is on but the pipeline skips it, so nothing below
+            // this row is reaching the picture yet. The controls that fix
+            // that are the next rows down — the caption only has to say
+            // which state the switch is actually in.
+            Text(reason)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -154,9 +162,7 @@ struct EffectsPane: View {
     private var lutNameBinding: Binding<String> {
         Binding(
             get: { state.editingConfig.lut.lutName },
-            set: { name in
-                state.updateEditing { $0.lut.lutName = name }
-            })
+            set: { name in state.setLUTName(name) })
     }
 
     private var lutStrengthBinding: Binding<Double> {

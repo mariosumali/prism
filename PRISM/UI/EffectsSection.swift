@@ -65,11 +65,31 @@ struct EffectsSection: View {
                 Text("Off to keep video smooth")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+            } else if let reason = state.editingConfig.inertReason(id) {
+                inertCaption(id, reason: reason)
             }
         }
         .contextMenu {
             // §3.4 — pinning exempts a stage from automatic degradation.
             Toggle("Require this effect", isOn: pinnedBinding(id))
+        }
+    }
+
+    /// A switch that is on and changing nothing says so — and, where this
+    /// popover holds no control that would fix it, points at the surface that
+    /// does. Adjust's five parameters live only in the main window, so its row
+    /// here can otherwise look permanently broken (§8.4).
+    @ViewBuilder
+    private func inertCaption(_ id: StageID, reason: String) -> some View {
+        HStack(spacing: Metrics.itemGap) {
+            Text(reason)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            if id == .adjust {
+                Button("Set adjustments…") { state.showMainWindow() }
+                    .buttonStyle(.link)
+                    .font(.caption2)
+            }
         }
     }
 
@@ -130,9 +150,7 @@ struct EffectsSection: View {
     private var lutNameBinding: Binding<String> {
         Binding(
             get: { state.editingConfig.lut.lutName },
-            set: { name in
-                state.updateEditing { $0.lut.lutName = name }
-            })
+            set: { name in state.setLUTName(name) })
     }
 
     private var blurQualityBinding: Binding<BlurQuality> {

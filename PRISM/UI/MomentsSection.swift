@@ -20,7 +20,13 @@ struct MomentsSection: View {
                 awayTile
                 panicTile
             }
-            if state.replayMode != .idle {
+            HStack(spacing: Metrics.itemGap) {
+                lagTile
+                Spacer(minLength: 0)
+            }
+            if state.isLagging || state.isCatchingUp {
+                lagLine
+            } else if state.replayMode != .idle {
                 transportRow
             } else if state.studio.replay.isArmed {
                 bufferLine
@@ -69,11 +75,61 @@ struct MomentsSection: View {
         return "\(actions) · ⌥⌘P"
     }
 
+    private var lagTile: some View {
+        ControlTile(title: "Lag",
+                    symbol: "hourglass",
+                    isActive: state.isLagging || state.isCatchingUp,
+                    accessibilityValue: lagAccessibilityValue) {
+            state.toggleLag()
+        }
+        .frame(maxWidth: (Metrics.popoverWidth - Metrics.gutter * 2
+                          - Metrics.itemGap * 2) / 3)
+        .help(lagHelp)
+    }
+
+    private var lagHelp: String {
+        let seconds = state.studio.lag.delaySeconds
+        let audio = state.studio.lag.delaysAudio ? "picture and sound" : "picture only"
+        return String(format: "Fall %.1fs behind live (%@) · hold ⌥⌘L", seconds, audio)
+    }
+
+    private var lagAccessibilityValue: String {
+        if state.isCatchingUp { return "catching up to live" }
+        if state.isLagging {
+            return String(format: "%.1f seconds behind live",
+                          state.latency.deliberateDelayMs / 1000)
+        }
+        return "off"
+    }
+
+    /// The delay is stated outright rather than folded into the latency
+    /// meter, which stays a measure of what PRISM costs you involuntarily.
+    private var lagLine: some View {
+        Text(lagCaption)
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(.secondary)
+    }
+
+    private var lagCaption: String {
+        if state.isCatchingUp {
+            return String(format: "Catching up at %.2g×…",
+                          state.studio.lag.clampedCatchUpRate)
+        }
+        let behind = state.latency.deliberateDelayMs / 1000
+        let target = state.studio.lag.delaySeconds
+        if behind < target - 0.15 {
+            // Still absorbing the delay: the picture is held, not moving.
+            return String(format: "Holding — %.1fs of %.1fs absorbed", behind, target)
+        }
+        return String(format: "%.1fs behind live", behind)
+    }
+
     private var replayAccessibilityValue: String {
         switch state.replayMode {
         case .idle: return state.studio.replay.isArmed ? "ready" : "buffer off"
         case .replay: return "playing"
         case .away: return "away loop on air"
+        case .lag: return "delay engaged"
         }
     }
 
@@ -112,7 +168,7 @@ struct MomentsSection: View {
                 ? "Playing back"
                 : String(format: "Playing back at %.2g×", rate)
             return "\(rateText) — everyone is seeing the past right now."
-        case .idle:
+        case .lag, .idle:
             return ""
         }
     }

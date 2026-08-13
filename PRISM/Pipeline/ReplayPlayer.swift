@@ -43,6 +43,9 @@ public enum ReplayMode: Equatable {
     case idle
     case replay
     case away
+    /// Deliberate delay line (§5.12): trails live by a fixed offset,
+    /// indefinitely, re-reading the buffer as it grows.
+    case lag
 }
 
 public final class ReplayPlayer {
@@ -128,6 +131,71 @@ public final class ReplayPlayer {
         return true
     }
 
+    /// Engages the deliberate delay line (§5.12): output holds the current
+    /// live frame for `delaySeconds`, then resumes at 1× permanently that far
+    /// behind live.
+    ///
+    /// Holding first is what makes this a delay rather than a rewind. Jumping
+    /// straight back would replay the last few seconds — viewers would watch
+    /// you say the same thing twice. Stalling and then resuming behind is
+    /// what a real transport hiccup does, and it is what "add latency"
+    /// actually means.
+    ///
+    /// Returns false when nothing is buffered to trail.
+    @discardableResult
+    public func startLag(delaySeconds: Double) -> Bool {
+        let entries = buffer.snapshot()
+        guard let description = buffer.sampleFormatDescription,
+              let newest = entries.last else { return false }
+
+        begin(entries: entries, description: description,
+              range: (entries.count - 1, entries.count - 1), mode: .lag,
+              rate: 1, crossfadeSeconds: 0,
+              base: newest.seconds, lag: max(0, delaySeconds))
+        return true
+    }
+
+    /// Consumes the accumulated backlog at `rate` until the output reaches
+    /// live, then fires `onReplayFinished`. `stop()` remains the snap-back
+    /// path — cut straight to live and never send the backlog at all.
+    public func beginCatchUp(rate: Double) {
+        let now = CMClockGetTime(CMClockGetHostTimeClock())
+        lock.lock()
+        guard modeStorage == .lag else {
+            lock.unlock()
+            return
+        }
+        // Re-anchor so the output position is continuous across the rate
+        // change: whatever elapsed time the delay had produced becomes the
+        // new starting offset, and the lag is now zero because it is already
+        // baked into it.
+        elapsedAtPause = elapsedLocked(atHost: now)
+        lagSeconds = 0
+        playStart = now
+        playbackRate = min(max(rate, 1.01), 4)
+        finishedFired = false
+        lock.unlock()
+    }
+
+    /// Delay currently being applied to the output, in seconds. Reported to
+    /// the latency monitor so the deliberate cost is visible (§6).
+    ///
+    /// Measured against the buffer's live edge rather than against elapsed
+    /// wall time. A catch-up re-anchors the clock, so "time since engage"
+    /// stops meaning anything the moment the release begins — and that is
+    /// exactly the window where the number matters most, because it is the
+    /// one shrinking back to zero.
+    ///
+    /// Lock order is player → buffer throughout this class; never the
+    /// reverse.
+    public var appliedDelaySeconds: Double {
+        lock.lock()
+        defer { lock.unlock() }
+        guard modeStorage == .lag, let newest = buffer.span?.end else { return 0 }
+        let now = CMClockGetTime(CMClockGetHostTimeClock())
+        return max(0, newest - (baseSeconds + elapsedLocked(atHost: now)))
+    }
+
     public func stop() {
         lock.lock()
         generation &+= 1
@@ -140,8 +208,11 @@ public final class ReplayPlayer {
         inFlight = 0
         rangeStart = 0
         rangeEnd = 0
+        baseSeconds = 0
         loopLength = 0
         crossfade = 0
+        lagSeconds = 0
+        playbackRate = 1
         playStart = nil
         elapsedAtPause = 0
         finishedFired = false
@@ -150,10 +221,11 @@ public final class ReplayPlayer {
         decodeQueue.async { [weak self] in self?.teardownSession() }
     }
 
-    /// Scrub within a replay, in seconds from its start.
+    /// Scrub within a replay, in seconds from its start. Meaningless while
+    /// lagging — the offset from live is the control there, not a position.
     public func seek(toSeconds seconds: Double) {
         lock.lock()
-        guard modeStorage != .idle, !entries.isEmpty else {
+        guard modeStorage == .replay || modeStorage == .away, !entries.isEmpty else {
             lock.unlock()
             return
         }
@@ -170,13 +242,14 @@ public final class ReplayPlayer {
         }
         let snapshot = entries
         let start = rangeStart
-        let base = snapshot[start].seconds
+        let base = baseSeconds
         lock.unlock()
 
         decodeQueue.async { [weak self] in
             guard let self else { return }
             self.feedIndex = Self.decodeStart(in: snapshot, at: start,
                                               targetSeconds: base + target)
+            self.lastFedSeconds = -.greatestFiniteMagnitude
             self.pump(generation: gen)
         }
     }
@@ -208,9 +281,17 @@ public final class ReplayPlayer {
             elapsed = loopLength
             reachedEnd = !finishedFired
             finishedFired = true
+        } else if modeStorage == .lag, playbackRate > 1, !finishedFired {
+            // Catching up: done once the output reaches the live edge. The
+            // buffer's own span is the authority on where that is, and this
+            // only runs while a catch-up is in flight.
+            if let newest = buffer.span?.end, baseSeconds + elapsed >= newest {
+                reachedEnd = true
+                finishedFired = true
+            }
         }
 
-        let target = entries[rangeStart].seconds + elapsed
+        let target = baseSeconds + elapsed
         while let first = fifo.first, first.seconds <= target {
             lastDelivered = first
             fifo.removeFirst()
@@ -286,8 +367,17 @@ public final class ReplayPlayer {
     private var inFlight = 0
     private var rangeStart = 0
     private var rangeEnd = 0
+    /// Absolute host-clock time of the played range's first frame. Stored
+    /// rather than derived from `entries[rangeStart]` because the rolling
+    /// buffer trims from the front, so indices are not stable across the
+    /// re-snapshots lag mode performs.
+    private var baseSeconds: Double = 0
     private var loopLength: Double = 0
     private var crossfade: Double = 0
+    /// Lag mode's trailing offset. Folded into the clock rather than the
+    /// range, so the output holds the engage frame for `lagSeconds` and only
+    /// then starts moving — a delay line, not a rewind.
+    private var lagSeconds: Double = 0
     private var playStart: CMTime?
     private var elapsedAtPause: Double = 0
     private var generation: UInt64 = 0
@@ -302,6 +392,10 @@ public final class ReplayPlayer {
     /// Where a loop wrap resumes feeding: the newest keyframe at or before
     /// the range start, so the decoder always restarts from a decodable point.
     private var loopFeedStart = 0
+    /// Presentation time of the last frame fed to the decoder. Lag mode
+    /// resolves its feed position by time rather than index for the same
+    /// trimming reason as `baseSeconds`.
+    private var lastFedSeconds: Double = -.greatestFiniteMagnitude
 
     // Frame-queue-confined texture wrapper cache.
     private var cachedBuffer: CVPixelBuffer?
@@ -315,8 +409,14 @@ public final class ReplayPlayer {
                        range: (start: Int, end: Int),
                        mode newMode: ReplayMode,
                        rate: Double,
-                       crossfadeSeconds: Double) {
-        let length = snapshot[range.end].seconds - snapshot[range.start].seconds
+                       crossfadeSeconds: Double,
+                       base: Double? = nil,
+                       lag: Double = 0) {
+        let start = base ?? snapshot[range.start].seconds
+        // Lag never ends: it trails live for as long as it is engaged.
+        let length = newMode == .lag
+            ? Double.greatestFiniteMagnitude
+            : snapshot[range.end].seconds - start
 
         lock.lock()
         generation &+= 1
@@ -324,8 +424,10 @@ public final class ReplayPlayer {
         entries = snapshot
         rangeStart = range.start
         rangeEnd = range.end
+        baseSeconds = start
         loopLength = length
         crossfade = crossfadeSeconds
+        lagSeconds = lag
         playbackRate = rate
         modeStorage = newMode
         fifo.removeAll()
@@ -342,18 +444,23 @@ public final class ReplayPlayer {
         decodeQueue.async { [weak self] in
             guard let self else { return }
             self.configureSession(for: description)
-            let start = Self.decodeStart(in: snapshot, at: range.start,
-                                         targetSeconds: snapshot[range.start].seconds)
-            self.loopFeedStart = start
-            self.feedIndex = start
+            let feed = Self.decodeStart(in: snapshot, at: range.start,
+                                        targetSeconds: start)
+            self.loopFeedStart = feed
+            self.feedIndex = feed
+            self.lastFedSeconds = -.greatestFiniteMagnitude
             self.pump(generation: gen)
         }
     }
 
-    /// Caller holds `lock`. Elapsed replay seconds, scaled by playback rate.
+    /// Caller holds `lock`. Elapsed seconds from `baseSeconds`, scaled by
+    /// playback rate and offset by the lag. Clamped at zero, which is what
+    /// makes lag hold the engage frame until the delay has been absorbed.
     private func elapsedLocked(atHost host: CMTime) -> Double {
-        guard let start = playStart else { return elapsedAtPause }
-        return elapsedAtPause + max(0, CMTimeSubtract(host, start).seconds) * playbackRate
+        guard let start = playStart else { return max(0, elapsedAtPause - lagSeconds) }
+        let advanced = elapsedAtPause
+            + max(0, CMTimeSubtract(host, start).seconds) * playbackRate
+        return max(0, advanced - lagSeconds)
     }
 
     /// Index to start feeding the decoder from: the newest keyframe at or
@@ -422,14 +529,33 @@ public final class ReplayPlayer {
             lock.unlock()
             return
         }
-        let snapshot = entries
-        let start = rangeStart
-        let end = rangeEnd
+        var snapshot = entries
+        var end = rangeEnd
         let looping = modeStorage == .away
+        let isLag = modeStorage == .lag
+        let base = baseSeconds
         lock.unlock()
 
         guard let session else { return }
-        let base = snapshot[start].seconds
+
+        if isLag {
+            // Trailing live: re-read the ring, which has both grown at the
+            // back and possibly trimmed at the front since the last pump, so
+            // the feed position has to be resolved by time rather than by a
+            // carried index.
+            snapshot = buffer.snapshot()
+            guard !snapshot.isEmpty else { return }
+            end = snapshot.count - 1
+            feedIndex = Self.resumeIndex(in: snapshot,
+                                         afterSeconds: lastFedSeconds,
+                                         base: base)
+            lock.lock()
+            if gen == generation {
+                entries = snapshot
+                rangeEnd = end
+            }
+            lock.unlock()
+        }
 
         while true {
             lock.lock()
@@ -442,6 +568,8 @@ public final class ReplayPlayer {
             guard queued < Self.decodeAhead else { return }
 
             guard feedIndex <= end, feedIndex < snapshot.count else {
+                // Lag has simply outrun the recorder for the moment; the next
+                // frame arrives on its own and the next pump picks it up.
                 guard looping else { return }
                 feedIndex = loopFeedStart
                 continue
@@ -449,6 +577,7 @@ public final class ReplayPlayer {
 
             let entry = snapshot[feedIndex]
             feedIndex += 1
+            lastFedSeconds = entry.seconds
             // Frames before the range start are reference frames only:
             // decode them so the range's first frame is correct, but do not
             // queue them and do not count them against the backlog.
@@ -460,6 +589,20 @@ public final class ReplayPlayer {
             }
             decode(entry, session: session, generation: gen, keep: keep)
         }
+    }
+
+    /// Where lag mode resumes feeding in a freshly re-read ring: the first
+    /// frame after the last one fed, or — on the very first pump — the newest
+    /// keyframe at or before the engage point.
+    static func resumeIndex(in entries: [ReplayBuffer.RecordedFrame],
+                            afterSeconds: Double,
+                            base: Double) -> Int {
+        guard !entries.isEmpty else { return 0 }
+        if afterSeconds == -.greatestFiniteMagnitude {
+            let anchor = entries.lastIndex { $0.seconds <= base } ?? (entries.count - 1)
+            return decodeStart(in: entries, at: anchor, targetSeconds: base)
+        }
+        return entries.firstIndex { $0.seconds > afterSeconds } ?? entries.count
     }
 
     private func decode(_ entry: ReplayBuffer.RecordedFrame,
