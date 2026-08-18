@@ -135,9 +135,62 @@ public final class AudioCapture {
     /// §4.4: device buffer latency at the device's actual rate (the buffer
     /// size is granted in device-rate frames) plus the ring-traversal
     /// estimate (one client buffer period; 256 frames @ 48kHz assumed
-    /// = 5.33ms).
+    /// = 5.33ms), plus whatever the voice changer's pitch grains are costing
+    /// right now (§5.13) — an opt-in cost, but a real one, so it is reported
+    /// like every other.
     public var addedLatencyMs: Double {
         Double(effectiveBufferFrames) / deviceSampleRate * 1000.0 + 256.0 / 48_000.0 * 1000.0
+            + voiceChanger.reportedLatencyMs
+    }
+
+    // MARK: Voice changer (§5.13)
+    //
+    // The microphone voice-effect chain. Parameters arrive from the main
+    // thread via voiceChanger.apply(); processing happens inside the RT
+    // callback between format conversion and the ring write, so the
+    // deliberate delay line (§5.12) and the ring both carry the processed
+    // voice. Stored as a `let` on purpose: the RT path may call methods on a
+    // constant reference the class owns for its whole lifetime without ARC
+    // traffic, the same argument rtRing makes for the sink.
+    public let voiceChanger = VoiceChanger()
+
+    /// RT-private: set on the muted and suppressed early-outs, consumed just
+    /// before the voice hook. While muted (or while clip audio owns the
+    /// ring) the voice chain does not run, so its delay lines freeze holding
+    /// pre-mute audio; clearing them on resume keeps a mute acoustically
+    /// clean in both directions — an unmute must never replay the echo tail
+    /// of the last thing said before the mute. Only the RT callback touches
+    /// this flag.
+    private var voicePathInterrupted = false
+
+    // MARK: Mic check tap (§5.13)
+    //
+    // A passive, armed-on-demand copy of the post-effect microphone signal,
+    // so the mic check can play back exactly what the ring receives.
+    // Allocated once at init (like the voice changer's buffers) so the main
+    // thread's reader can never race a teardown's deallocation.
+
+    let micTap = MicTapRing()
+    /// Same single-writer/lock-on-set-only discipline as isMuted.
+    private var _micTapArmed = false
+
+    /// Arms the mic-check tap. Main thread; the RT callback observes the
+    /// flag raw, at worst one IO slice late.
+    public func setMicTapArmed(_ armed: Bool) {
+        os_unfair_lock_lock(flagLock)
+        _micTapArmed = armed
+        os_unfair_lock_unlock(flagLock)
+    }
+
+    /// Where a mic-check recording should start reading from: the write
+    /// head as of now, so a take contains only frames captured after arming.
+    public var micTapCursor: UInt64 { micTap.head }
+
+    /// Drains tap frames written since `cursor`. Main thread.
+    public func readMicTap(from cursor: UInt64,
+                           into buffer: UnsafeMutablePointer<Float>,
+                           maxFrames: Int) -> (cursor: UInt64, frames: Int) {
+        micTap.read(from: cursor, into: buffer, maxFrames: maxFrames)
     }
 
     public init() {
@@ -453,6 +506,14 @@ public final class AudioCapture {
         stereoCapacityFrames = convertCapacityFrames
         stereoData = UnsafeMutablePointer<Float>.allocate(capacity: stereoCapacityFrames * 2)
 
+        // Voice changer (§5.13): size its mixdown scratch for the worst
+        // post-conversion slice and clear stale effect tails. RT unit is not
+        // running here, so touching its buffers is safe.
+        voiceChanger.prepare(maxFrames: convertCapacityFrames)
+        voicePathInterrupted = false
+        // The tap's lap-skip margin must dominate the largest single write.
+        micTap.setMaxWriteFrames(convertCapacityFrames)
+
         // Deliberate delay line (§5.12). Preallocated with the rest of the RT
         // buffers even when lag is never used: 10 s of 48 kHz stereo float is
         // 3.8 MB, and the alternative — allocating when the switch is first
@@ -514,7 +575,10 @@ public final class AudioCapture {
         let status = AudioUnitRender(unit, ioActionFlags, timeStamp,
                                      busNumber, frameCount, &abl)
         guard status == noErr else { return status }
-        if suppressed { return noErr }
+        if suppressed {
+            voicePathInterrupted = true
+            return noErr
+        }
 
         // Frame count after conversion to 48k (used for the mute path too so
         // the ring advances at the true output rate).
@@ -523,6 +587,7 @@ public final class AudioCapture {
             : Int((Double(frameCount) * 48_000.0 / deviceSampleRate).rounded())
 
         if muted {
+            voicePathInterrupted = true
             rtWriteSilence(ring: ring, frameCount: outEstimate)
             return noErr
         }
@@ -553,6 +618,33 @@ public final class AudioCapture {
         }
 
         guard frames > 0 else { return noErr }
+
+        // §5.13: the voice effect processes the 48 kHz signal in place,
+        // before mono duplication and before the delay line, so everything
+        // downstream — the deliberate delay included — carries the processed
+        // voice. Off costs one trylock and one comparison.
+        if voicePathInterrupted {
+            voicePathInterrupted = false
+            // RT-safe: bounded memsets of preallocated buffers.
+            voiceChanger.clearDSPState()
+        }
+        if clientChannels == 1 {
+            voiceChanger.processMono(samples, frameCount: frames)
+        } else {
+            voiceChanger.processStereoInterleaved(samples, frameCount: frames)
+        }
+
+        // §5.13 mic check: when armed, copy the post-effect mono signal into
+        // the tap ring for the main thread to play back. Passive — the
+        // on-air path is untouched — and pre-delay, so a lag switch does not
+        // delay the check. Off costs one comparison.
+        if _micTapArmed {
+            if clientChannels == 1 {
+                micTap.writeMono(samples, frameCount: frames)
+            } else {
+                micTap.writeStereoMixdown(samples, frameCount: frames)
+            }
+        }
 
         if clientChannels == 1 {
             // Mono duplicated to both channels (§4.2).

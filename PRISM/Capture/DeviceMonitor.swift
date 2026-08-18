@@ -21,6 +21,14 @@ public final class DeviceMonitor {
     public var onCamerasChanged: (([CameraDeviceInfo]) -> Void)?      // main thread
     public var onMicrophonesChanged: (([AudioDeviceInfo]) -> Void)?   // main thread
     public var onWake: (() -> Void)?                                  // §7, main thread
+    /// Fires when some process starts or stops recording from "PRISM
+    /// Microphone" (kAudioDevicePropertyDeviceIsRunningSomewhere on the
+    /// virtual device). This is the audio counterpart of the CMIO sink's
+    /// client list: capture must follow it, or the ring starves exactly when
+    /// an app is listening. Main thread; primed with the current value on
+    /// start() and re-resolved when the device list changes (a coreaudiod
+    /// restart hands the device a new AudioObjectID).
+    public var onVirtualMicInUseChanged: ((Bool) -> Void)?            // main thread
 
     public init() {}
 
@@ -37,8 +45,20 @@ public final class DeviceMonitor {
     private let audioListenerQueue = DispatchQueue(
         label: "horse.prism.PRISM.device-monitor", qos: .utility)
 
+    // Virtual-mic in-use monitoring. All three fields are confined to
+    // audioListenerQueue; lastVirtualMicInUse dedupes the main-thread
+    // callback so property-listener chatter cannot spam reconciliation.
+    private var virtualMicID: AudioDeviceID?
+    private var virtualMicListenerBlock: AudioObjectPropertyListenerBlock?
+    private var lastVirtualMicInUse: Bool?
+
     private static var devicesAddress = AudioObjectPropertyAddress(
         mSelector: kAudioHardwarePropertyDevices,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+
+    private static var runningSomewhereAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain)
 
@@ -59,9 +79,12 @@ public final class DeviceMonitor {
             forName: .AVCaptureDeviceWasDisconnected,
             object: nil, queue: nil, using: handler))
 
-        // Microphones: CoreAudio hardware device-list listener (§5.1).
+        // Microphones: CoreAudio hardware device-list listener (§5.1). The
+        // same event re-resolves the virtual-mic monitor: after a coreaudiod
+        // restart the PRISM device comes back under a new AudioObjectID.
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             self?.notifyMicrophonesChanged()
+            self?.refreshVirtualMicMonitor()
         }
         let status = AudioObjectAddPropertyListenerBlock(
             AudioObjectID(kAudioObjectSystemObject),
@@ -71,6 +94,9 @@ public final class DeviceMonitor {
         if status == noErr {
             audioListenerInstalled = true
             audioListenerBlock = block
+        }
+        audioListenerQueue.async { [weak self] in
+            self?.refreshVirtualMicMonitor()
         }
 
         // Wake (§7): capture layer restarts on this signal.
@@ -105,6 +131,55 @@ public final class DeviceMonitor {
         if let wakeObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
             self.wakeObserver = nil
+        }
+
+        audioListenerQueue.sync {
+            removeVirtualMicListener()
+            lastVirtualMicInUse = nil
+        }
+    }
+
+    // MARK: - Virtual-mic in-use monitoring (audioListenerQueue only)
+
+    private func refreshVirtualMicMonitor() {
+        let current = CoreAudioDevices.allDeviceIDs().first {
+            CoreAudioDevices.isPrismVirtualMicrophone($0)
+        }
+        if current != virtualMicID {
+            removeVirtualMicListener()
+            if let id = current {
+                let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                    self?.notifyVirtualMicInUse()
+                }
+                if AudioObjectAddPropertyListenerBlock(
+                    id, &DeviceMonitor.runningSomewhereAddress,
+                    audioListenerQueue, block) == noErr {
+                    virtualMicID = id
+                    virtualMicListenerBlock = block
+                }
+            }
+        }
+        notifyVirtualMicInUse()
+    }
+
+    private func removeVirtualMicListener() {
+        if let id = virtualMicID, let block = virtualMicListenerBlock {
+            AudioObjectRemovePropertyListenerBlock(
+                id, &DeviceMonitor.runningSomewhereAddress,
+                audioListenerQueue, block)
+        }
+        virtualMicID = nil
+        virtualMicListenerBlock = nil
+    }
+
+    private func notifyVirtualMicInUse() {
+        // Device absent (plug-in not installed, or mid-coreaudiod-restart)
+        // reads as not in use; the device-list listener re-primes on return.
+        let inUse = virtualMicID.map { CoreAudioDevices.isRunningSomewhere($0) } ?? false
+        guard inUse != lastVirtualMicInUse else { return }
+        lastVirtualMicInUse = inUse
+        DispatchQueue.main.async { [weak self] in
+            self?.onVirtualMicInUseChanged?(inUse)
         }
     }
 
@@ -218,6 +293,22 @@ enum CoreAudioDevices {
         let ablPtr = raw.assumingMemoryBound(to: AudioBufferList.self)
         let buffers = UnsafeMutableAudioBufferListPointer(ablPtr)
         return buffers.reduce(0) { $0 + Int($1.mNumberChannels) }
+    }
+
+    /// True when at least one process is running IO on the device
+    /// (kAudioDevicePropertyDeviceIsRunningSomewhere — maintained by the
+    /// HAL across processes, so it sees a Zoom or a Sound-settings level
+    /// meter capturing from the virtual microphone).
+    static func isRunningSomewhere(_ deviceID: AudioDeviceID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value) == noErr
+        else { return false }
+        return value != 0
     }
 
     /// PRISM's own virtual microphone must never appear in pickers or be
