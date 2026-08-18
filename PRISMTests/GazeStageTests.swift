@@ -12,6 +12,20 @@ import simd
 
 final class GazeStageTests: XCTestCase {
 
+    private static var sharedMetal: MetalContext?
+    private static var metalError: Error?
+    private static let metalOnce: Void = {
+        do { sharedMetal = try MetalContext() } catch { metalError = error }
+    }()
+
+    private func makeStage() throws -> GazeStage {
+        _ = Self.metalOnce
+        guard let metal = Self.sharedMetal else {
+            throw XCTSkip("Metal unavailable: \(String(describing: Self.metalError))")
+        }
+        return try GazeStage(metal: metal)
+    }
+
     /// An eye at the centre of the frame with the pupil offset by `drift`.
     private func eye(drift: SIMD2<Float>,
                      irisRadii: SIMD2<Float> = SIMD2<Float>(0.02, 0.035))
@@ -149,5 +163,21 @@ final class GazeStageTests: XCTestCase {
         XCTAssertLessThanOrEqual(defaults.maxShift, 0.5)
         XCTAssertGreaterThan(defaults.smoothing, 0.5, "iris jitter is visible")
         XCTAssertGreaterThan(defaults.verticalBias, 0, "laptops put the camera above the screen")
+    }
+
+    // MARK: - Scheduling
+
+    /// The stage schedules its own landmark detection from encode(), so it
+    /// has to ask for the pass *before* it is tracking anything. Declining
+    /// until tracked is a deadlock: no pass, no detection, no tracking, so
+    /// the correction never starts.
+    func testWantsEncodeBeforeTrackingIsAcquired() throws {
+        let stage = try makeStage()
+        XCTAssertFalse(stage.wantsEncode(), "disabled by default")
+        stage.isEnabled = true
+        XCTAssertFalse(stage.isTracking, "nothing detected yet")
+        XCTAssertTrue(stage.wantsEncode(), "the acquiring pass must still run")
+        stage.settings.strength = 0
+        XCTAssertFalse(stage.wantsEncode(), "zero strength is off")
     }
 }

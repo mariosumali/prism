@@ -72,7 +72,7 @@ final class FoundationTypesTests: XCTestCase {
         let ordered = StageID.allCases.sorted()
         XCTAssertEqual(ordered, [.clip, .replay, .freeze, .gaze, .geometry,
                                  .adjust, .lut, .blur, .background, .overlay,
-                                 .outputFit])
+                                 .style, .connection, .outputFit])
     }
 
     /// The three substituting stages escalate: a replay overrides a clip, a

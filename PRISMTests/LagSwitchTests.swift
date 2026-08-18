@@ -124,6 +124,64 @@ final class LagSwitchTests: XCTestCase {
         XCTAssertEqual(decoded.lag.release, .snapBack)
     }
 
+    // MARK: - Live retargeting (§5.12)
+
+    /// Deepening an engaged delay must never rewind: the base stays on the
+    /// frame currently on air and the difference becomes a fresh hold.
+    func testDeepeningHoldsInPlaceInsteadOfRewinding() throws {
+        // On air: base 100, elapsed 5 → frame at 105; live edge 108 → 3 s
+        // behind. Retarget to 5 s.
+        let rebased = try XCTUnwrap(ReplayPlayer.retarget(
+            base: 100, elapsed: 5, newest: 108, target: 5))
+        XCTAssertEqual(rebased.base, 105, accuracy: 1e-9,
+                       "position is continuous — no jump backwards")
+        XCTAssertEqual(rebased.lag, 2, accuracy: 1e-9,
+                       "only the difference is held, not the whole delay")
+    }
+
+    /// Shortening drops exactly the difference in backlog — a partial
+    /// snap-back — and leaves nothing to absorb.
+    func testShorteningDropsExactlyTheDifference() throws {
+        // 3 s behind (as above); retarget to 1 s.
+        let rebased = try XCTUnwrap(ReplayPlayer.retarget(
+            base: 100, elapsed: 5, newest: 108, target: 1))
+        XCTAssertEqual(rebased.base, 107, accuracy: 1e-9,
+                       "jumps forward by the 2 s of dropped backlog")
+        XCTAssertEqual(rebased.lag, 0, accuracy: 1e-9)
+    }
+
+    /// Float noise is not intent: sub-10 ms changes do nothing, so a finger
+    /// resting on the slider cannot make the clock churn.
+    func testTinyChangesAreIgnored() {
+        XCTAssertNil(ReplayPlayer.retarget(base: 100, elapsed: 5,
+                                           newest: 108, target: 3.005))
+    }
+
+    /// The threshold sits below one slider step (50 ms) and far below
+    /// anything typed, so every deliberate millisecond figure is applied —
+    /// a field that reports a delay it did not apply would be lying about
+    /// what is on air.
+    func testTypedMillisecondChangesAreApplied() throws {
+        // One 50 ms slider step down from 3 s behind.
+        let step = try XCTUnwrap(ReplayPlayer.retarget(
+            base: 100, elapsed: 5, newest: 108, target: 2.95))
+        XCTAssertEqual(step.base, 105.05, accuracy: 1e-9)
+
+        // A typed 3040 ms, 40 ms deeper than the 3 s on air.
+        let typed = try XCTUnwrap(ReplayPlayer.retarget(
+            base: 100, elapsed: 5, newest: 108, target: 3.04))
+        XCTAssertEqual(typed.lag, 0.04, accuracy: 1e-9)
+    }
+
+    /// A shorten past live clamps to live rather than into the future.
+    func testShorteningPastLiveClampsToLive() throws {
+        let rebased = try XCTUnwrap(ReplayPlayer.retarget(
+            base: 100, elapsed: 5, newest: 108, target: -4))
+        XCTAssertEqual(rebased.base, 108, accuracy: 1e-9,
+                       "never ahead of the newest buffered frame")
+        XCTAssertEqual(rebased.lag, 0, accuracy: 1e-9)
+    }
+
     // MARK: - Transport exclusivity
 
     /// Lag is a distinct on-air state, not a flavour of replay: the menu bar
