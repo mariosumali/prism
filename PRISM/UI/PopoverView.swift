@@ -7,6 +7,12 @@
 // Bar pane. The §8.3 default order is PopoverModuleItem.defaultLayout.
 // Dropping a .cube file anywhere on the popover imports it as a LUT.
 //
+// The metadata modules — preview, status, meter, in-use — describe one
+// thing, so they are spaced as one block (Metrics.metaGap) rather than as
+// four sections, and the status line and meter share a row when they are
+// adjacent. Content taller than the screen scrolls instead of running off
+// the bottom.
+//
 // Licensed under the Apache License, Version 2.0.
 
 import AppKit
@@ -16,32 +22,124 @@ import UniformTypeIdentifiers
 struct PopoverView: View {
     @EnvironmentObject var state: AppState
 
+    @State private var contentHeight: CGFloat?
+
     var body: some View {
-        let visibleModules = state.popoverLayout.filter(\.visible)
-        VStack(alignment: .leading, spacing: Metrics.sectionGap) {
+        ScrollView(.vertical) {
+            content
+                .background(
+                    GeometryReader { proxy in
+                        Color.clear.preference(key: ContentHeightKey.self,
+                                               value: proxy.size.height)
+                    })
+        }
+        .onPreferenceChange(ContentHeightKey.self) { height in
+            contentHeight = height
+        }
+        // Fits content, and stops fitting once the popover would run past
+        // the bottom of the screen — a dropdown you cannot see the end of
+        // is worse than one that scrolls.
+        .frame(width: Metrics.popoverWidth,
+               height: contentHeight.map { min($0, maxHeight) })
+        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+            handleDrop(providers)
+        }
+    }
+
+    private var content: some View {
+        let rows = moduleRows
+        return VStack(alignment: .leading, spacing: 0) {
             if !state.setup.isComplete {
                 OnboardingView()
+                    .padding(.bottom, Metrics.sectionGap)
             }
             if let warning = state.warning {
                 warningRow(warning)
+                    .padding(.bottom, Metrics.sectionGap)
             }
             if state.draftConfig != nil {
                 draftBanner
+                    .padding(.bottom, Metrics.sectionGap)
             }
-            ForEach(visibleModules) { item in
-                moduleView(item.module)
+            ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
+                rowView(row)
+                    .padding(.top, index == 0
+                             ? 0
+                             : gap(before: row, after: rows[index - 1]))
             }
-            if visibleModules.isEmpty {
+            if rows.isEmpty {
                 allHiddenHint
             }
+            Divider()
+                .padding(.top, Metrics.sectionGap)
+                .padding(.bottom, Metrics.itemGap)
             bottomBar
         }
         .padding(.horizontal, Metrics.gutter)
         .padding(.vertical, Metrics.gutter)
         .frame(width: Metrics.popoverWidth)
-        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
-            handleDrop(providers)
+    }
+
+    private var maxHeight: CGFloat {
+        let available = NSScreen.main?.visibleFrame.height ?? 720
+        return max(available - Metrics.sectionGap * 2, 360)
+    }
+
+    // MARK: - Rows
+
+    /// One line of the popover: usually a single module, but the status
+    /// line and the latency meter share a row when they sit next to each
+    /// other — the meter is the second half of that sentence, not a
+    /// separate section.
+    private struct ModuleRow: Identifiable {
+        let modules: [PopoverModule]
+
+        var id: String { modules.map(\.rawValue).joined(separator: "+") }
+
+        /// Metadata about the output rather than a control over it.
+        var isMeta: Bool {
+            modules.allSatisfy { PopoverView.metaModules.contains($0) }
         }
+    }
+
+    private static let metaModules: Set<PopoverModule> = [.preview, .status,
+                                                          .latencyMeter, .inUse]
+
+    private var moduleRows: [ModuleRow] {
+        let visible = state.visiblePopoverModules
+        var rows: [ModuleRow] = []
+        var index = 0
+        while index < visible.count {
+            if visible[index] == .status,
+               index + 1 < visible.count,
+               visible[index + 1] == .latencyMeter,
+               !isLagging {
+                rows.append(ModuleRow(modules: [.status, .latencyMeter]))
+                index += 2
+            } else {
+                rows.append(ModuleRow(modules: [visible[index]]))
+                index += 1
+            }
+        }
+        return rows
+    }
+
+    @ViewBuilder
+    private func rowView(_ row: ModuleRow) -> some View {
+        if row.modules == [.status, .latencyMeter] {
+            HStack(spacing: Metrics.itemGap) {
+                statusText
+                    .fixedSize()
+                latencyMeter
+            }
+        } else if let module = row.modules.first {
+            moduleView(module)
+        }
+    }
+
+    /// Metadata reads as one block; controls get section air around them.
+    private func gap(before row: ModuleRow, after previous: ModuleRow) -> CGFloat {
+        row.isMeta && previous.isMeta ? Metrics.metaGap : Metrics.sectionGap
     }
 
     // MARK: - Modules
@@ -61,31 +159,19 @@ struct PopoverView: View {
                                     ? "Output preview"
                                     : "Draft preview of unapplied changes")
         case .status:
-            Text(statusLine)
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
+            statusText
         case .latencyMeter:
-            LatencyMeter(onTap: {
-                // §8.6 affordance — but the Format module may be hidden by
-                // the user's dropdown layout; the setting then lives in the
-                // main window, so lead there instead of tapping into nothing.
-                if state.visiblePopoverModules.contains(.format) {
-                    if !state.expandedSections.contains(.format) {
-                        state.toggleSection(.format)
-                    }
-                    state.latencyPolicyFocusRequest += 1
-                } else {
-                    state.showMainWindow()
-                }
-            }, tapHint: "Opens the Format section")
+            latencyMeter
         case .inUse:
             Text(inUseLine)
                 .font(.caption)
                 .foregroundStyle(.secondary)
         case .controls:
-            tiles
-            if state.clipState != .none {
-                scrubRow
+            VStack(alignment: .leading, spacing: Metrics.itemGap) {
+                tiles
+                if state.clipState != .none {
+                    scrubRow
+                }
             }
         case .moments:
             MomentsSection()
@@ -93,6 +179,8 @@ struct PopoverView: View {
             PresetBar()
         case .scene:
             SceneSection()
+        case .voice:
+            VoiceSection()
         case .framing:
             FramingSection()
         case .effects:
@@ -102,6 +190,28 @@ struct PopoverView: View {
         case .devices:
             devicePickers
         }
+    }
+
+    private var statusText: some View {
+        Text(statusLine)
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.secondary)
+    }
+
+    private var latencyMeter: some View {
+        LatencyMeter(onTap: {
+            // §8.6 affordance — but the Format module may be hidden by
+            // the user's dropdown layout; the setting then lives in the
+            // main window, so lead there instead of tapping into nothing.
+            if state.visiblePopoverModules.contains(.format) {
+                if !state.expandedSections.contains(.format) {
+                    state.toggleSection(.format)
+                }
+                state.latencyPolicyFocusRequest += 1
+            } else {
+                state.showMainWindow()
+            }
+        }, tapHint: "Opens the Format section")
     }
 
     /// Shown while preview-before-apply (main window toggle) has edits
@@ -135,17 +245,29 @@ struct PopoverView: View {
         }
     }
 
-    /// "1080p · 30 fps · +7.2 ms", plus the deliberate delay when one is
-    /// engaged (§5.12) — three seconds of requested lag must never hide
-    /// behind a reading of "+7.2 ms".
+    /// "1080p · 30 fps", plus the deliberate delay when one is engaged
+    /// (§5.12) — three seconds of requested lag must never hide behind a
+    /// reading of "+7.2 ms".
+    ///
+    /// Added latency is the meter's job and is printed here only when the
+    /// meter is hidden: the same number twice, one line apart, is clutter
+    /// rather than reassurance.
     private var statusLine: String {
         let format = state.config.format
-        let added = String(format: "%+.1f", state.latency.totalAddedMs)
-        var line = "\(format.resolutionLabel) · \(format.frameRate) fps · \(added) ms"
-        if state.latency.deliberateDelayMs >= 50 {
+        var line = "\(format.resolutionLabel) · \(format.frameRate) fps"
+        if !state.visiblePopoverModules.contains(.latencyMeter) {
+            line += String(format: " · %+.1f ms", state.latency.totalAddedMs)
+        }
+        if isLagging {
             line += String(format: " · +%.1f s lag", state.latency.deliberateDelayMs / 1000)
         }
         return line
+    }
+
+    /// A lag callout makes the status line too long to share a row with
+    /// the meter, so the pair splits back into two lines while it shows.
+    private var isLagging: Bool {
+        state.latency.deliberateDelayMs >= 50
     }
 
     /// §8.4 — "In use by Zoom, FaceTime" / "Not in use".
@@ -341,6 +463,7 @@ struct PopoverView: View {
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
             .accessibilityLabel("Quit PRISM")
+            .help("Quit PRISM")
         }
     }
 
@@ -396,5 +519,14 @@ struct PopoverView: View {
             }
         }
         return accepted
+    }
+}
+
+/// Measures the popover's natural height so the frame can cap it at the
+/// screen without ever being taller than its content.
+private struct ContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }

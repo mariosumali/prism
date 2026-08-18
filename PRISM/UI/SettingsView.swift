@@ -52,6 +52,8 @@ private struct GeneralSettingsTab: View {
                 LabeledContent("Panic", value: "⌥⌘P")
                 LabeledContent("Eye contact", value: "⌥⌘E")
                 LabeledContent("Lag switch", value: "⌥⌘L")
+                LabeledContent("Bad connection", value: "⌥⌘B")
+                LabeledContent("Voice changer", value: "⌃⌥⌘V")
                 ForEach(state.presets.filter { $0.hotkey != nil }) { preset in
                     LabeledContent(preset.name,
                                    value: preset.hotkey?.displayString ?? "")

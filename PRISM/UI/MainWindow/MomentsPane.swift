@@ -23,6 +23,7 @@ struct MomentsPane: View {
             replaySection
             awaySection
             lagSection
+            connectionSection
             panicSection
         }
         .formStyle(.grouped)
@@ -47,7 +48,11 @@ struct MomentsPane: View {
                            range: 200...maxLagMs,
                            defaultValue: 3000,
                            fractionDigits: 0,
-                           unit: " ms")
+                           unit: " ms",
+                           snap: 50)
+            Text("Drag for 50 ms steps, hold ⌥ to drag finer, or type an exact value in the field — \(exactDelayHint).")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Toggle("Delay the microphone too", isOn: lagAudioBinding)
             Toggle("Hold the key rather than toggling", isOn: holdToLagBinding)
             Picker("On release", selection: lagReleaseBinding) {
@@ -75,15 +80,81 @@ struct MomentsPane: View {
             Text("Engaging holds the picture where it is and only then resumes, that far behind — a stall, not a rewind. Jumping straight back would make you say the same thing twice.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            Text("Dragging the delay while engaged applies immediately: deeper holds again for the difference, shallower drops that much backlog and never replays anything.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Text("The delayed video lives in the same rolling buffer replay and away use, so the delay cannot exceed the buffer length, and delayed video passes through its encoder. The latency meter keeps measuring what PRISM costs you involuntarily; this delay is reported next to it, never folded into it.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
     }
 
-    /// The delay is held in the rolling buffer, so it cannot outrun it.
+    /// The delay is held in the rolling buffer, so it cannot outrun it — and
+    /// never exceeds the 10 s the settings themselves clamp to, so the
+    /// control cannot offer a value that would be silently reduced in use.
     private var maxLagMs: Double {
-        max(400, (state.studio.replay.clampedBufferSeconds - 0.5) * 1000)
+        min(10_000, max(400, (state.studio.replay.clampedBufferSeconds - 0.5) * 1000))
+    }
+
+    /// States the exact figure that is (or would be) on air, in both units —
+    /// the field speaks milliseconds, the rest of the UI speaks seconds.
+    private var exactDelayHint: String {
+        let ms = min(state.studio.lag.clampedDelayMs, maxLagMs)
+        return String(format: "%.0f ms is %.2f s", ms, ms / 1000)
+    }
+
+    // MARK: - Bad connection
+
+    private var connectionSection: some View {
+        Section("Bad connection") {
+            HStack {
+                Button(state.isBadConnection ? "Recover" : "Degrade now") {
+                    state.toggleBadConnection()
+                }
+                Spacer()
+                Text("⌥⌘B")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            PrismSliderRow(label: "Severity",
+                           value: severityBinding,
+                           range: 0.1...1,
+                           defaultValue: 0.6,
+                           fractionDigits: 2)
+            // One knob, so the readout says what it buys — nobody should
+            // have to engage the stunt to learn what 0.6 means.
+            LabeledContent("Looks like", value: connectionPreviewLine)
+            Toggle("Refresh in irregular bursts, a few frames per second",
+                   isOn: connectionBinding(\.dropsFrames))
+            Toggle("Fall behind live too", isOn: connectionBinding(\.addsLag))
+            if state.studio.connection.addsLag {
+                PrismSliderRow(label: "Delay",
+                               value: connectionLagBinding,
+                               range: 200...min(4000, maxLagMs),
+                               defaultValue: 1200,
+                               fractionDigits: 0,
+                               unit: " ms",
+                               snap: 50)
+                Text("The delay rides the same rolling-buffer transport as the lag switch, so it needs the buffer on and cannot exceed its length. The microphone is delayed to match — a picture behind live audio reads as broken software, not a bad connection. Releasing snaps straight back to live, which is what a recovering connection does with its backlog.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Text("Everything on air degrades together — backdrop, overlays and effects included — because a real connection never pixelates just your face. The numbers above are averages: timing stutters and stalls in bursts, only some blocks refresh each frame (moving things smear), and quality drifts the way a struggling call's does. Underneath, PRISM keeps running your full chain untouched, so recovery is instant.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var connectionPreviewLine: String {
+        let connection = state.studio.connection
+        var parts = [
+            String(format: "%.0f px blocks", connection.blockSize(forHeight: 1080)),
+            String(format: "%.0f colour steps", connection.posterizeLevels),
+        ]
+        if connection.dropsFrames {
+            parts.append(String(format: "≈%.0f fps", connection.throttledFps))
+        }
+        return parts.joined(separator: " · ")
     }
 
     // MARK: - Rolling buffer
@@ -310,6 +381,23 @@ struct MomentsPane: View {
     private var catchUpRateBinding: Binding<Double> {
         Binding(get: { state.studio.lag.catchUpRate },
                 set: { state.studio.lag.catchUpRate = $0 })
+    }
+
+    private var severityBinding: Binding<Double> {
+        Binding(get: { state.studio.connection.severity },
+                set: { state.studio.connection.severity = $0 })
+    }
+
+    private var connectionLagBinding: Binding<Double> {
+        Binding(get: { min(state.studio.connection.lagMs, maxLagMs) },
+                set: { state.studio.connection.lagMs = $0 })
+    }
+
+    private func connectionBinding(
+        _ keyPath: WritableKeyPath<ConnectionSettings, Bool>
+    ) -> Binding<Bool> {
+        Binding(get: { state.studio.connection[keyPath: keyPath] },
+                set: { state.studio.connection[keyPath: keyPath] = $0 })
     }
 
     private func panicBinding(

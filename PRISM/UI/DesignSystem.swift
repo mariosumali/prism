@@ -16,6 +16,7 @@ enum Metrics {
     static let popoverWidth: CGFloat  = 320
     static let gutter: CGFloat        = 16   // popover horizontal inset
     static let sectionGap: CGFloat    = 16
+    static let metaGap: CGFloat       = 6    // between preview/status/meter/in-use
     static let itemGap: CGFloat       = 8
     static let cardRadius: CGFloat    = 10
     static let tileRadius: CGFloat    = 10

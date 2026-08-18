@@ -4,10 +4,11 @@
 // The full effects chain over a live preview, one section per stage:
 // enable + "require" (pin, §3.4 — exempt from automatic degradation) + live
 // measured cost, then every parameter. Adjust's five sliders, LUT
-// choice/strength/import, blur quality/radius. Edits stage into the draft
-// (previewed privately, applied from the Apply bar). Radius and strength
-// are clamped again by the stages, so the slider ranges here are UI
-// ergonomics, not safety.
+// choice/strength/import, the Style catalogue grid with its intensity
+// slider, blur quality/radius. Edits stage into the draft (previewed
+// privately, applied from the Apply bar). Radius and strength are clamped
+// again by the stages, so the slider ranges here are UI ergonomics, not
+// safety.
 //
 // Licensed under the Apache License, Version 2.0.
 
@@ -80,6 +81,20 @@ struct EffectsPane: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            Section("Style") {
+                stageHeader(.style)
+                styleGrid(title: "Distortions",
+                          effects: [.normal] + StyleEffect.distortions)
+                styleGrid(title: "Motion",
+                          effects: StyleEffect.motion)
+                styleGrid(title: "Looks",
+                          effects: StyleEffect.looks)
+                PrismSliderRow(label: "Intensity",
+                               value: styleIntensityBinding,
+                               range: 0...1,
+                               defaultValue: 1,
+                               fractionDigits: 2)
+            }
             Section("Background") {
                 // Blur is one answer to "what is behind me", and virtual
                 // backgrounds are the others — they are mutually exclusive
@@ -135,6 +150,54 @@ struct EffectsPane: View {
         }
     }
 
+    // MARK: - Style catalogue grid
+
+    /// Photo Booth's effect picker reduced to what it is: a grid of named
+    /// tiles, Normal leading, selection = the applied look. Tapping a tile
+    /// routes through setStyleEffect so the picker and the enable switch can
+    /// never disagree about whether a look is on air.
+    @ViewBuilder
+    private func styleGrid(title: String, effects: [StyleEffect]) -> some View {
+        VStack(alignment: .leading, spacing: Metrics.itemGap) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 96),
+                                         spacing: Metrics.itemGap)],
+                      spacing: Metrics.itemGap) {
+                ForEach(effects) { effect in
+                    styleTile(effect)
+                }
+            }
+        }
+    }
+
+    private func styleTile(_ effect: StyleEffect) -> some View {
+        let isSelected = state.editingConfig.style.effect == effect
+        return Button {
+            state.setStyleEffect(effect)
+        } label: {
+            Text(effect.displayName)
+                .font(.callout)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, Metrics.itemGap)
+                .background(
+                    RoundedRectangle(cornerRadius: Metrics.controlRadius,
+                                     style: .continuous)
+                        .fill(isSelected ? Color.accentColor.opacity(0.22)
+                                         : Color.primary.opacity(0.05)))
+                .overlay(
+                    RoundedRectangle(cornerRadius: Metrics.controlRadius,
+                                     style: .continuous)
+                        .strokeBorder(isSelected ? Color.accentColor : .clear))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(effect.displayName)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
     // MARK: - Bindings (updateEditing: live by default, staged mid-draft)
 
     private func enabledBinding(_ id: StageID) -> Binding<Bool> {
@@ -170,6 +233,14 @@ struct EffectsPane: View {
             get: { state.editingConfig.lut.strength },
             set: { strength in
                 state.updateEditing { $0.lut.strength = strength }
+            })
+    }
+
+    private var styleIntensityBinding: Binding<Double> {
+        Binding(
+            get: { state.editingConfig.style.intensity },
+            set: { intensity in
+                state.updateEditing { $0.style.intensity = intensity }
             })
     }
 

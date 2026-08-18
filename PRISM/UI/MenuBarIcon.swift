@@ -39,8 +39,8 @@ struct MenuBarIcon: View {
         switch state {
         case .idle, .live:
             return false
-        case .effects, .replaying, .away, .lagging, .frozen, .muted,
-             .panicked, .error:
+        case .effects, .replaying, .away, .badConnection, .lagging, .frozen,
+             .muted, .panicked, .error:
             return true
         }
     }
@@ -58,6 +58,7 @@ struct MenuBarIcon: View {
         case .muted: return "mic.slash.fill"
         case .replaying: return "backward.fill"
         case .away: return "moon.zzz.fill"
+        case .badConnection: return "wifi.exclamationmark"
         case .lagging: return "hourglass"
         case .panicked: return "hand.raised.fill"
         default: return nil
@@ -71,6 +72,7 @@ struct MenuBarIcon: View {
         case .effects: return "PRISM, effects active"
         case .replaying: return "PRISM, playing a replay"
         case .away: return "PRISM, away loop on air"
+        case .badConnection: return "PRISM, bad connection simulated"
         case .lagging: return "PRISM, delay engaged"
         case .frozen: return "PRISM, frozen"
         case .muted: return "PRISM, muted"

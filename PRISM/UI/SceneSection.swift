@@ -127,12 +127,21 @@ struct SceneSection: View {
 
     // MARK: - Shared
 
+    /// Reserved for the whole section as soon as any one stage reports a
+    /// number, so the controls hold a single vertical line rather than
+    /// shifting sideways as stages are turned on and off.
+    private var showsCostColumn: Bool {
+        [StageID.blur, .background, .gaze, .overlay].contains {
+            (state.stageStatus[$0] ?? StageStatus()).measuredMs > 0
+        }
+    }
+
     @ViewBuilder
     private func costLabel(for id: StageID) -> some View {
-        let measured = (state.stageStatus[id] ?? StageStatus()).measuredMs
-        if measured > 0 {
+        if showsCostColumn {
+            let measured = (state.stageStatus[id] ?? StageStatus()).measuredMs
             // §8.6 — per-stage cost inline, .caption2 .secondary.
-            Text(String(format: "%.1f ms", measured))
+            Text(measured > 0 ? String(format: "%.1f ms", measured) : "")
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 44, alignment: .trailing)

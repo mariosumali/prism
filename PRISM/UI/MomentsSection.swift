@@ -15,16 +15,18 @@ struct MomentsSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Metrics.itemGap) {
+            // One full row rather than three tiles and an orphan: a lone
+            // tile with two empty slots beside it reads as a layout bug.
             HStack(spacing: Metrics.itemGap) {
                 replayTile
                 awayTile
                 panicTile
-            }
-            HStack(spacing: Metrics.itemGap) {
                 lagTile
-                Spacer(minLength: 0)
+                glitchTile
             }
-            if state.isLagging || state.isCatchingUp {
+            if state.isBadConnection {
+                connectionLine
+            } else if state.isLagging || state.isCatchingUp {
                 lagLine
             } else if state.replayMode != .idle {
                 transportRow
@@ -82,8 +84,6 @@ struct MomentsSection: View {
                     accessibilityValue: lagAccessibilityValue) {
             state.toggleLag()
         }
-        .frame(maxWidth: (Metrics.popoverWidth - Metrics.gutter * 2
-                          - Metrics.itemGap * 2) / 3)
         .help(lagHelp)
     }
 
@@ -91,6 +91,49 @@ struct MomentsSection: View {
         let seconds = state.studio.lag.delaySeconds
         let audio = state.studio.lag.delaysAudio ? "picture and sound" : "picture only"
         return String(format: "Fall %.1fs behind live (%@) · hold ⌥⌘L", seconds, audio)
+    }
+
+    /// §5.14 — tile copy is "Glitch" because "Bad connection" cannot fit a
+    /// tile label; the help line and the caption below name the feature.
+    private var glitchTile: some View {
+        ControlTile(title: "Glitch",
+                    symbol: "wifi.exclamationmark",
+                    isActive: state.isBadConnection,
+                    accessibilityValue: state.isBadConnection
+                        ? "bad connection on air" : "off") {
+            state.toggleBadConnection()
+        }
+        .help(glitchHelp)
+    }
+
+    private var glitchHelp: String {
+        let lag = state.studio.connection.addsLag
+            ? String(format: " and %.1f s behind live",
+                     state.studio.connection.lagSeconds)
+            : ""
+        return "Look like a bad connection — pixelated, choppy\(lag) · ⌥⌘B"
+    }
+
+    /// Same honesty rule as the lag line: while the picture on air is
+    /// degraded, say exactly how, in the terms the settings use.
+    private var connectionLine: some View {
+        Text(connectionCaption)
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(.secondary)
+    }
+
+    private var connectionCaption: String {
+        let connection = state.studio.connection
+        var parts = [String(format: "%.0f px blocks",
+                            connection.blockSize(forHeight: 1080))]
+        if connection.dropsFrames {
+            parts.append(String(format: "≈%.0f fps", connection.throttledFps))
+        }
+        if state.isLagging {
+            parts.append(String(format: "%.1f s behind live",
+                                state.latency.deliberateDelayMs / 1000))
+        }
+        return "Looking like a bad connection — " + parts.joined(separator: " · ")
     }
 
     private var lagAccessibilityValue: String {
