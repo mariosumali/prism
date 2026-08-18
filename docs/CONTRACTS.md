@@ -436,9 +436,17 @@ public final class AudioCapture {
     public private(set) var effectiveBufferFrames: Int   // 256 requested (§4.4)
     public var addedLatencyMs: Double { get }      // buffer/48k*1000 + ring estimate
                                                    // + voiceChanger.reportedLatencyMs
+                                                   // + voiceCleanup.reportedLatencyMs (0)
+    /// §5.15 cleanup: noise expander / compressor / EQ, ahead of the voice
+    /// effects in the chain and independent of them.
+    public let voiceCleanup: VoiceCleanup
     /// §5.13 voice changer: parameters from the main thread via apply();
     /// processing on the RT callback between conversion and the ring write.
     public let voiceChanger: VoiceChanger
+    /// §5.15 input level: RMS published from the RT callback into a
+    /// lock-free mailbox. Demand-gated — nothing is measured unarmed.
+    public func setInputLevelArmed(_ armed: Bool)
+    public var inputLevelReading: (rms: Double, sequence: UInt32) { get }
     /// §5.13 mic check tap: a passive, armed-on-demand copy of the
     /// post-effect mono signal. Arm from the main thread; read at leisure.
     public func setMicTapArmed(_ armed: Bool)
@@ -453,11 +461,12 @@ public final class AudioCapture {
 }
 ```
 
-Render callback: pull from HALOutput input scope, convert to 48kHz stereo
-float interleaved (AudioConverter when needed), process through the voice
-changer (§5.13, mono duplicated after), then `sink.write(...)`. **The
-callback body must be free of ObjC/Swift allocation; preallocate all
-conversion buffers in `start`.**
+Render callback: pull from HALOutput input scope, meter the raw slice
+(§5.15, ahead of mute so the level stays true while muted), convert to 48kHz
+stereo float interleaved (AudioConverter when needed), process through
+cleanup then the voice changer (§5.15 before §5.13; mono duplicated after),
+then `sink.write(...)`. **The callback body must be free of ObjC/Swift
+allocation; preallocate all conversion buffers in `start`.**
 
 ### VoiceChanger (`PRISM/Capture/VoiceChanger.swift`)
 
@@ -525,6 +534,81 @@ recording is refused (muted / no mic permission / clip owns the ring), nil
 when it may run. AppState cancels an in-flight recording when an inhibition
 appears mid-take (mute, clip audio, capture demand dropping), so a take the
 app itself silenced is never misdiagnosed as a dead microphone.
+
+### VoiceCleanup (`PRISM/Capture/VoiceCleanup.swift`)
+
+```swift
+public enum VoiceCleanupMode: String, Codable, CaseIterable, Identifiable {
+    case off, cleanUp, studio
+    public var displayName: String { get }
+    public var blurb: String { get }               // one line, §8.4 voice
+}
+
+public final class VoiceCleanup {
+    public init()
+    /// Main thread. Builds the chain for the settings and publishes it to
+    /// the RT path through a trylock mailbox; never blocks the RT thread.
+    public func apply(_ settings: VoiceCleanupSettings)
+    /// Always 0 (§5.15): nothing in the chain looks ahead, and the §6 audio
+    /// budget has no room for anything that would. Reported anyway, so a
+    /// stage that ever did buy lookahead could not be added silently.
+    public let reportedLatencyMs: Double
+    /// Clears filters, envelopes and the learned noise floor.
+    public func reset()
+    // RT-only, in-place 48 kHz processing (internal):
+    // processMono(_:frameCount:), processStereoInterleaved(_:frameCount:)
+    // clearDSPState() — RT-safe state clear; the RT path runs it on resume
+    // from mute/suppression and on off→on, because a floor learned before
+    // an interruption describes a room that may no longer be there.
+}
+```
+
+Chain, in order: 80Hz high-pass → two-band downward expander (complementary
+split at 1.2kHz, so the bands reconstruct the input exactly when neither is
+gating) → feed-forward compressor with a smoothed knee → corrective EQ
+(Studio only). Filters run per channel; the dynamics are detected on the
+channel mean and applied to both, so a stereo microphone keeps its image
+rather than being folded to mono the way the voice effects deliberately are.
+`.off` returns before touching a sample — bit-exact pass-through, asserted
+by test. `VoiceCleanupSettings` lives in `StudioSettings`. Pure, testable
+pieces: `program(for:)`, `rate(ms:)`, `linear(db:)`, and
+`peakGainAtFullScale(_:)` — the headroom bound the tests use to prove no
+mode relies on the output clamp.
+
+### InputLevel (`PRISM/Capture/InputLevel.swift`)
+
+```swift
+final class InputLevelMailbox {                     // §5.15
+    static let windowFrames: Int                    // 1024, ~21 ms @ 48 kHz
+    /// RT: accumulate one interleaved slice; publishes per full window.
+    func accumulate(_ samples: UnsafePointer<Float>, frameCount: Int,
+                    channels: Int)
+    func publish(rms: Float)
+    func resetAccumulator()                         // unit stopped only
+    /// Main thread. An unchanged `sequence` means no audio arrived.
+    var reading: (rms: Double, sequence: UInt32) { get }
+}
+
+final class MicWatch {                              // §5.15
+    private(set) var isTalking: Bool
+    @discardableResult
+    func update(rms: Double, offAir: Bool, at now: Date) -> Bool
+    func reset(keepingHistory: Bool = false)
+}
+```
+
+The mailbox packs the value and a publish counter into one `UInt64` and
+moves it with the `PRISMAtomicU64StoreRelease` / `LoadAcquire` shims in
+RingBuffer.h, so a reader can never pair a fresh counter with a stale
+level. RMS rather than peak: both consumers are asking how much *voice*
+is arriving, and a peak meter would let a keyboard click read as speech.
+
+`MicWatch` is pure logic so the debounce can be tested against a clock.
+Rules, all of them about not nagging: sustained speech only (accumulated,
+with short gaps not counted, so a cough cannot reach the threshold); one
+alert per mute, re-armed only by going back on air; a holdoff floor across
+mutes; and the signal clears when the talking stops. A gap between samples
+counts as one step, never as elapsed silence.
 
 ### DeviceMonitor (`PRISM/Capture/DeviceMonitor.swift`)
 
@@ -799,11 +883,20 @@ public final class AppState: ObservableObject {
     @Published public var latency: LatencyReport
     @Published public var clientsInUse: [String]          // display names
     @Published public var warning: WarningMessage?
+    /// §5.15 — informational, and deliberately a second slot: a notice must
+    /// never evict a warning.
+    @Published public var notice: NoticeMessage?
     @Published public var menuBarState: MenuBarState
     @Published public var setup: SetupStatus
     // Controls
     @Published public var isFrozen: Bool
     @Published public var isMuted: Bool
+    /// §5.15 — 0…1, scaled by MicCheck.displayLevel so the always-on meter
+    /// and the mic check's meter read the same signal the same way. Zero
+    /// unless something is watching.
+    @Published public private(set) var inputLevel: Double
+    /// §5.15 — sustained speech into a microphone nobody is hearing.
+    @Published public private(set) var mutedTalking: Bool
     // Studio behaviour (§5.9–§5.11) — persisted separately from presets
     @Published public var studio: StudioSettings
     @Published public var replayMode: ReplayMode
@@ -879,6 +972,10 @@ public final class AppState: ObservableObject {
     public func setVoiceEffect(_ effect: VoiceEffect)  // .off = same intent as off
     public func setVoiceAmount(_ amount: Double)
     public func toggleVoice()                          // ⌃⌥⌘V, recalls last effect
+    // Cleanup and the mic watch (§5.15)
+    public func setVoiceCleanupMode(_ mode: VoiceCleanupMode)
+    public var isVoiceCleanupActive: Bool { get }
+    public func setMicWatchBanner(_ shows: Bool)
     // Lag switch (§5.12)
     public func engageLag()
     public func releaseLag()
@@ -909,6 +1006,15 @@ public final class AppState: ObservableObject {
 }
 ```
 
+Demand gating extends to the microphone meter (§5.15): the RT accumulation
+is armed, and the 10 Hz sampling timer runs, only while a preview surface is
+open *or* the microphone is off air (muted, or standing down for clip
+audio) — the two situations where somebody is actually reading the level.
+Idle in the menu bar and unmuted, nothing is measured, nothing is
+published, and no timer runs. Suppression is acknowledged on the RT thread,
+so the 1 Hz poll reconciles the gate as a backstop against a change no
+intent announced.
+
 ### UI (`PRISM/UI/*.swift`)
 
 - `DesignSystem.swift` — `enum Metrics` exactly as §8.1; helper view
@@ -925,7 +1031,10 @@ public final class AppState: ObservableObject {
   hover breakdown popover, click → expand Format section, a11y variants).
 - `PresetBar.swift`, `EffectsSection.swift`, `FormatSection.swift`,
   `FramingSection.swift`, `VoiceSection.swift` (§5.13 effect picker + on-air
-  honesty caption), `OnboardingView.swift` (three-step state machine
+  honesty caption, §5.15 cleanup picker, and `InputLevelMeter` — the shared
+  always-on meter view both the popover and the main window's Voice pane
+  render, so the two can never disagree about how loud you are),
+  `OnboardingView.swift` (three-step state machine
   §9 + persistent setup banner), `SettingsView.swift` (deeper controls:
   pan, crop aspect, orientation, per-adjustment sliders, published format
   set editor, hotkey list, login item toggle, LUT management).

@@ -41,6 +41,7 @@ public enum MenuBarState: Equatable {
     case badConnection // filled + wifi badge: §5.14 fake bad connection on air
     case lagging       // filled + hourglass badge: deliberate delay engaged
     case frozen        // filled + pause bar
+    case mutedTalking  // filled + slash, tinted: muted, and talking anyway
     case muted         // filled + slash
     case panicked      // filled + raised hand, red tint
     case error         // filled, red tint
@@ -80,6 +81,31 @@ public struct WarningMessage: Equatable, Identifiable {
         case raiseBudget          // §3.4 pinned chain over budget
         case armBuffer            // §5.9 replay/away asked for without a buffer
         case openSettings
+        case none
+    }
+
+    public var id = UUID()
+    public var text: String
+    public var action: Action = .none
+
+    public init(text: String, action: Action = .none) {
+        self.text = text
+        self.action = action
+    }
+}
+
+/// Informational row under the status line (§8.3) — something PRISM noticed
+/// that you may want to act on, as opposed to something that has gone wrong.
+///
+/// Deliberately a second slot rather than a second use of `warning`. There
+/// is exactly one warning, so posting a notice through it would silently
+/// evict whatever was there — and the notice PRISM most wants to show
+/// ("you're muted") arrives precisely during the kind of call where a
+/// device-disconnect warning matters most. Two slots, two questions, no
+/// race to be the last writer.
+public struct NoticeMessage: Equatable, Identifiable {
+    public enum Action: Equatable {
+        case unmute               // §5.15 muted-and-talking
         case none
     }
 

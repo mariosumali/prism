@@ -315,6 +315,49 @@ public struct VoiceSettings: Codable, Equatable {
     }
 }
 
+// MARK: - Voice cleanup (§5.15)
+
+/// Noise suppression and levelling on the microphone path. Behaviour, not
+/// look — same argument as the voice changer, and the same neighbourhood:
+/// switching from Meeting to Studio must not quietly start gating your room.
+///
+/// One field, because the feature is one picker (§8.7). The struct exists
+/// anyway so the mode has somewhere to grow a companion without breaking a
+/// user's saved file.
+public struct VoiceCleanupSettings: Codable, Equatable {
+    /// `.off` is bit-exact pass-through, and it is the default: PRISM owns
+    /// the microphone whether or not you asked it to process anything, so
+    /// processing has to be something you asked for.
+    public var mode: VoiceCleanupMode = .off
+    public init() {}
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        mode = c.tolerant(.mode, .off)
+    }
+
+    public var isActive: Bool { mode != .off }
+}
+
+// MARK: - Muted-and-talking watch (§5.15)
+
+/// What PRISM does when it notices you talking into a muted microphone.
+///
+/// The detection itself is not optional — it costs one comparison per meter
+/// tick and it only ever runs while the microphone is already off air — and
+/// the menu bar's ambient signal rides on it. What *is* optional, and off by
+/// default, is the banner: an interruption is a strong claim to make about
+/// somebody's meeting, and PRISM has no idea whether the mute was a mistake.
+public struct MicWatchSettings: Codable, Equatable {
+    public var showsBanner: Bool = false
+    public init() {}
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        showsBanner = c.tolerant(.showsBanner, false)
+    }
+}
+
 // MARK: - Aggregate
 
 public struct StudioSettings: Codable, Equatable {
@@ -323,11 +366,13 @@ public struct StudioSettings: Codable, Equatable {
     public var panic = PanicSettings()
     public var lag = LagSettings()
     public var voice = VoiceSettings()
+    public var cleanup = VoiceCleanupSettings()
+    public var micWatch = MicWatchSettings()
     public var connection = ConnectionSettings()
     public init() {}
 
     public enum CodingKeys: String, CodingKey {
-        case replay, away, panic, lag, voice, connection
+        case replay, away, panic, lag, voice, cleanup, micWatch, connection
     }
 
     /// Same forward-compatibility contract as PipelineConfiguration: a field
@@ -342,6 +387,8 @@ public struct StudioSettings: Codable, Equatable {
         panic = decode(.panic, PanicSettings())
         lag = decode(.lag, LagSettings())
         voice = decode(.voice, VoiceSettings())
+        cleanup = decode(.cleanup, VoiceCleanupSettings())
+        micWatch = decode(.micWatch, MicWatchSettings())
         connection = decode(.connection, ConnectionSettings())
     }
 

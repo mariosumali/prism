@@ -297,7 +297,9 @@ Capacity of 32768 frames is ~683ms at 48kHz — roughly 4× the largest realisti
 
 `AudioCapture` uses an HAL input `AudioUnit` (`kAudioUnitSubType_HALOutput`, input scope enabled, output scope disabled) bound to the selected physical device. Requested IO buffer size: **256 frames**. If the device rejects 256, accept the nearest supported value and surface the resulting latency in the UI.
 
-Sample-rate conversion to 48kHz, when required, uses `AudioConverterRef` in the capture callback. Audio processing is pass-through plus mute, the deliberate delay line (§5.12), and the voice changer (§5.13) — no noise suppression, no automatic gain, no EQ. Everything runs inside the capture callback under the §4.3 rules.
+Sample-rate conversion to 48kHz, when required, uses `AudioConverterRef` in the capture callback. Audio processing is pass-through plus mute, the input level meter (§5.15), the cleanup chain (§5.15), the voice changer (§5.13) and the deliberate delay line (§5.12), in that order. Everything runs inside the capture callback under the §4.3 rules, and every stage is skipped when it is off, so a default install still costs one comparison apiece.
+
+Cleanup is opt-in and defaults to off. Nothing in it looks ahead: the §6 budget allows 12ms of added audio and the HAL buffer plus ring traversal already spend ~10.7ms, which leaves no room to buy lookahead. That rules out a spectral denoiser, and is the reason the chain is entirely recursive filters and instantaneous gains.
 
 ---
 
@@ -597,6 +599,36 @@ The per-block shimmer is reseeded on every refresh so held frames "boil" between
 
 Connection settings persist in `StudioSettings`, not in presets: switching from Meeting to Studio must not silently fake a network problem. Engagement itself is never persisted — PRISM always launches with a clean feed.
 
+
+### 5.15 Input level, muted-and-talking, and cleanup
+
+Three answers to one complaint: PRISM owns your microphone and until now told you nothing about it.
+
+| Property | Specification |
+|---|---|
+| Input meter | Continuous RMS from the RT capture callback via a lock-free scalar mailbox, sampled by the UI at 10Hz. Shown in the popover's Voice section and the main window's Voice pane, with the mic check's scaling and decay |
+| Demand | Armed only while a preview surface is open **or** the microphone is off air. Idle, unmuted, no window: nothing is measured, nothing is published, no timer runs |
+| Muted-and-talking | Sustained speech (≥ 0.03 RMS for 1.2s accumulated, gaps under 0.5s not counted) while the mic is off air. Drives `AppState.mutedTalking`, the menu bar's `mutedTalking` state, and — opt-in — a notice row |
+| Cleanup | One picker: Off / Clean up / Studio. Default Off, and Off is bit-exact pass-through |
+| Chain | High-pass 80Hz → two-band noise expander (complementary split at 1.2kHz) → feed-forward compressor → light corrective EQ (Studio only) |
+| Cost | Zero added latency in every mode; ~50 flops per sample, far inside the §6 ≤ 1.0ms processing budget |
+
+**The meter is read ahead of everything.** It is taken from the raw device slice, before mute, before suppression, before cleanup and before the voice changer, because the question it answers — *is my microphone hearing me* — has to keep being answerable while muted. That is also the entire basis of the muted-and-talking watch, and it is what somebody troubleshooting a dead-sounding microphone actually wants to see. The bar therefore keeps moving while muted, in a different colour, captioned so the distinction is not a guess.
+
+**The mailbox is a mailbox, not a ring.** A meter only ever wants the newest value; a ring would hand the reader a backlog it would immediately discard. One release-store per 1024-frame window, one acquire-load per UI tick, through the same C atomic shims `MicTapRing` uses (§4.3). The window counter shares the atomic word with the value, so a reader seeing an unchanged counter knows no audio arrived — capture stopped, device gone, meter disarmed — and decays rather than holding a stale reading forever.
+
+**The muted-and-talking watch exists to be quiet.** The design problem is nagging, not detection. So: a cough never fires it (150ms against a 1.2s sustain, where a gap over 0.5s resets the accumulator); it fires **once per mute**, and will not fire again until the microphone goes back on air, which is the user acting on it; and a holdoff floors the interval between alerts so mashing the mute key cannot turn "once per mute" into a stutter. The signal clears when the talking stops, so the menu bar stops pointing at a problem that has gone away.
+
+**It does not use the warning slot.** There is exactly one `warning`, and posting through it would evict whatever was there — including a device-disconnect message, which is a fact, in favour of a hint. `AppState.notice` is a second, independent slot with its own row (§8.3), and the two can show at once. The banner ships **off**: an interruption is a strong claim to make about somebody's meeting and PRISM has no idea whether the mute was a mistake. The ambient menu-bar signal is not opt-in, because it costs nothing and changes no behaviour.
+
+**Cleanup runs before the voice changer, and the order is load-bearing.** It exists to hand the effects a clean signal: the autotune detector and the grain shifter both degrade on a noisy input. Expanding a deliberately ring-modulated or echoed signal afterwards would chew the effect's own tail. The two are otherwise independent — you can clean up a chipmunk — and cleanup never reaches the menu bar's effect glyph, because it is a repair, not a costume.
+
+**The denoiser tracks a minimum, not an average.** Each band's noise floor is the minimum its envelope reached over the last 750ms window, eased toward rather than snapped to. Minimum-tracking is what lets a floor sit under a voice without being dragged up by one — speech dips between syllables and steady noise does not — and, unlike a tracker gated on being *near* the floor already, it converges from below, so a floor that starts underneath the real one can still find it. A ceiling at −34dBFS caps the damage a sustained loud input can do: nothing above that is a noise floor, and without the cap a test tone would train the expander into gating the voice it exists to protect.
+
+**Studio is not "Clean up, more".** It expands harder *and* adds the EQ — a 350Hz boxiness cut and a 4.5kHz presence shelf — which is exactly the point where tidying a microphone turns into changing what somebody sounds like. Keeping that behind its own name is the honest split, and it is why Clean up carries no EQ beyond the high-pass.
+
+Cleanup and watch settings persist in `StudioSettings`, not in presets: switching from Meeting to Studio must not quietly start gating your room, for the same reason it must not change what you sound like.
+
 ---
 
 ## 6. Latency requirements
@@ -630,6 +662,8 @@ Higher frame rates yield lower total added latency but a tighter effects budget.
 | Processing | ≤ 1.0ms |
 | Ring traversal | 1 client buffer period |
 | **Total added** | **≤ 12.0ms** |
+
+The buffer and the ring alone spend ~10.7ms of that, so the remaining budget is ~1.3ms and it is *not* enough to buy lookahead. Every always-available audio stage is therefore zero-latency by construction: mute, the input meter (§5.15) and the whole cleanup chain (§5.15) add nothing. The one exception is opt-in and declared — a pitched voice effect (§5.13) adds ~21ms, reported through `addedLatencyMs` and visible in the meter, and it disappears the moment the effect is off.
 
 ### A/V sync
 
@@ -731,13 +765,14 @@ enum Metrics {
 | Bad connection | Filled prism with wifi badge |
 | Lagging | Filled prism with hourglass badge |
 | Frozen | Filled prism with pause bar |
+| Muted while talking | Filled prism with slash, `.orange` tint |
 | Muted | Filled prism with slash |
 | Panic engaged | Filled prism with raised-hand badge, `.red` tint |
 | Error | Filled prism, `.red` tint |
 
-Precedence: error > panic > away > bad connection > lagging > replaying > frozen > muted > effects > live > idle.
+Precedence: error > panic > away > bad connection > lagging > replaying > frozen > muted-and-talking > muted > effects > live > idle.
 
-The substitution states outrank the effect states because forgetting you are in one is the damaging failure this app can produce. Replay, away and panic each get their own glyph rather than folding into frozen, because *"why can nobody see me moving"* has to be answerable at a glance. Bad connection outranks lagging because when the switch engaged the delay itself, the delay is part of the stunt — the badge names what the user engaged.
+The substitution states outrank the effect states because forgetting you are in one is the damaging failure this app can produce. Replay, away and panic each get their own glyph rather than folding into frozen, because *"why can nobody see me moving"* has to be answerable at a glance. Bad connection outranks lagging because when the switch engaged the delay itself, the delay is part of the stunt — the badge names what the user engaged. Muted-and-talking (§5.15) sits directly above muted because it is the muted state plus the one fact that makes it urgent; it takes the warning colour rather than the error one, since red is reserved for *wrong* and this is a nudge. It does not outrank freeze, which is a bigger lie about a bigger surface.
 
 ### 8.3 Popover layout
 
@@ -821,6 +856,8 @@ Every slider has a discrete numeric field beside it. Option-drag gives fine adju
 
 **Warning row**, when present, sits directly under the status line: `exclamationmark.triangle.fill` in `.red`, message in `.caption`.
 
+**Notice row** sits directly under the warning row and is a separate slot (§5.15): a symbol naming what was noticed in `.orange`, message in `.caption`, and a one-tap action. Two slots rather than two uses of one, because a warning is a fact and a notice is a hint, and the hint must never evict the fact.
+
 ### 8.4 Copy
 
 Sentence case throughout. Active voice. Name things by what the user controls, never by implementation.
@@ -853,6 +890,8 @@ Sentence case throughout. Active voice. Name things by what the user controls, n
 | Status line | `1080p · 30 fps` (`· +7.2 ms` only when the meter is hidden) |
 | Status line while lagging | `1080p · 30 fps · +3.0 s lag` |
 | Voice effect on air | `Everyone else hears it — you hear yourself unchanged.` |
+| Talking while muted | `You're muted — nobody can hear you.` + action `Unmute` |
+| Input meter, muted | `Muted — this is what PRISM hears, not what the call does.` |
 | Mic check recording | `Say something…` |
 | Mic check playing | `This is what everyone else hears.` |
 | Mic check heard silence | `PRISM didn't hear anything. Check the microphone picker.` |

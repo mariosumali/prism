@@ -62,11 +62,21 @@ public final class AppState: ObservableObject {
     @Published public var latency = LatencyReport()
     @Published public var clientsInUse: [String] = []
     @Published public var warning: WarningMessage?
+    /// §5.15 — informational, and deliberately not the warning slot: there
+    /// is only one warning, and evicting a device-disconnect message to say
+    /// "you're muted" would trade a fact for a hint.
+    @Published public var notice: NoticeMessage?
     @Published public var menuBarState: MenuBarState = .idle
     @Published public var setup = SetupStatus()
     // Controls
     @Published public var isFrozen = false
     @Published public var isMuted = false
+    /// §5.15 — live microphone level, 0…1, perceptually scaled by the same
+    /// mapping the mic check uses so the two meters read alike. Zero unless
+    /// something is watching (see inputLevelDemand).
+    @Published public private(set) var inputLevel: Double = 0
+    /// §5.15 — sustained speech into a microphone nobody is hearing.
+    @Published public private(set) var mutedTalking = false
     // Clip
     @Published public var clipState: ClipState = .none
     @Published public var clipDuration: Double = 0
@@ -101,6 +111,14 @@ public final class AppState: ObservableObject {
                 // the menu bar treats an active voice as an active effect.
                 audioCapture.voiceChanger.apply(studio.voice)
                 updateMenuBarState()
+            }
+            if studio.cleanup != oldValue.cleanup {
+                // §5.15: cleanup is a repair, not a costume — it never
+                // reaches the menu bar's effect glyph.
+                audioCapture.voiceCleanup.apply(studio.cleanup)
+            }
+            if studio.micWatch != oldValue.micWatch {
+                refreshMutedTalkingNotice()
             }
             // §5.12: dragging the delay while engaged retargets it live —
             // whichever knob owns the current delay. During a catch-up the
@@ -222,6 +240,14 @@ public final class AppState: ObservableObject {
     private let draftPreviewBox = PreviewTextureBox()
     private var cancellables: Set<AnyCancellable> = []
     private var pollTimer: Timer?
+    /// §5.15 — 10 Hz while the input meter has an audience. The RT side is
+    /// armed and disarmed with it, so a PRISM nobody is looking at measures
+    /// nothing.
+    private var levelTimer: Timer?
+    private let micWatch = MicWatch()
+    /// Last window counter seen from the level mailbox; an unchanged counter
+    /// means no audio arrived and the meter decays instead of freezing.
+    private var lastInputLevelSequence: UInt32 = 0
     private var autoFrameTimer: Timer?
     private var noCameraTimer: Timer?
     private var replayTimer: Timer?
@@ -328,6 +354,12 @@ public final class AppState: ObservableObject {
         pipeline?.configure(outputFormat: formatManager.activeFormat)
         pipeline?.apply(config)
         pipeline?.applyStudio(studio)
+        // The studio didSet only fires on a *change*; a launch with no
+        // persisted file (or a file identical to the defaults) would
+        // otherwise leave both microphone chains holding their init-time
+        // programs rather than the ones the user can see on screen.
+        audioCapture.voiceChanger.apply(studio.voice)
+        audioCapture.voiceCleanup.apply(studio.cleanup)
         monitor.setPolicy(config.latencyPolicy,
                           frameIntervalMs: formatManager.activeFormat.frameIntervalMs)
 
@@ -650,12 +682,99 @@ public final class AppState: ObservableObject {
             reconcileCaptures()
         }
 
+        // §5.15: suppression is acknowledged on the RT thread, so the mic can
+        // go off air without any intent firing. 1 Hz reconciliation caps how
+        // long the watch can be looking the wrong way.
+        reconcileInputLevel()
+
         if let pipeline {
             let buffered = pipeline.replayBuffer.bufferedSeconds
             if abs(bufferedSeconds - buffered) > 0.1 { bufferedSeconds = buffered }
             let tracking = pipeline.gazeStage.isTracking
                 && config.flags(for: .gaze).enabled
             if eyeContactTracking != tracking { eyeContactTracking = tracking }
+        }
+    }
+
+    /// §5.15: the input meter runs only while it has an audience — a preview
+    /// surface showing the bar, or the muted-and-talking watch, which can
+    /// only fire while the microphone is already off air. With PRISM idle in
+    /// the menu bar, unmuted, nothing here computes anything: no RT
+    /// accumulation, no timer, no publishes.
+    private var inputLevelDemand: Bool {
+        guard started, audioCapture.isCapturing else { return false }
+        return previewActive || micIsOffAir
+    }
+
+    /// The microphone is not reaching the call. Mute is the obvious case;
+    /// clip audio owning the ring (§5.3) is the same thing from the talker's
+    /// point of view, and is the case people actually get caught by, because
+    /// nothing about playing a clip looks like a mute.
+    private var micIsOffAir: Bool {
+        isMuted || audioCapture.suppressionEngaged
+    }
+
+    private func reconcileInputLevel() {
+        let demand = inputLevelDemand
+        audioCapture.setInputLevelArmed(demand)
+        guard demand != (levelTimer != nil) else { return }
+        levelTimer?.invalidate()
+        levelTimer = nil
+        guard demand else {
+            // Nothing is measuring, so nothing may be claimed: drop the
+            // meter and the watch rather than leave either asserting a
+            // reading that stopped arriving.
+            if inputLevel != 0 { inputLevel = 0 }
+            micWatch.reset(keepingHistory: true)
+            if mutedTalking { mutedTalking = false }
+            refreshMutedTalkingNotice()
+            return
+        }
+        lastInputLevelSequence = audioCapture.inputLevelReading.sequence
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.inputLevelTick() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        levelTimer = timer
+    }
+
+    private func inputLevelTick() {
+        let reading = audioCapture.inputLevelReading
+        let fresh = reading.sequence != lastInputLevelSequence
+        lastInputLevelSequence = reading.sequence
+        // A window that never arrived is not silence — it is the absence of
+        // evidence — so the bar decays the way the mic check's does rather
+        // than snapping to zero or holding the last value forever.
+        let level = fresh
+            ? max(MicCheck.displayLevel(rms: reading.rms),
+                  inputLevel * MicCheck.meterDecay)
+            : inputLevel * MicCheck.meterDecay
+        if abs(level - inputLevel) > 0.005 || (level == 0 && inputLevel != 0) {
+            inputLevel = level
+        }
+
+        let talking = micWatch.update(rms: fresh ? reading.rms : 0,
+                                      offAir: micIsOffAir,
+                                      at: Date())
+        if talking != mutedTalking {
+            mutedTalking = talking
+            refreshMutedTalkingNotice()
+            updateMenuBarState()
+        }
+    }
+
+    /// The banner is opt-in (§5.15); the menu bar signal is not. Only ever
+    /// touches the notice slot it owns, so a notice posted by anything else
+    /// survives.
+    private func refreshMutedTalkingNotice() {
+        let wanted = mutedTalking && studio.micWatch.showsBanner
+        if wanted {
+            if notice?.action != .unmute {
+                notice = NoticeMessage(text: "You're muted — nobody can hear you.",
+                                       action: .unmute)
+            }
+        } else if notice?.action == .unmute {
+            notice = nil
         }
     }
 
@@ -823,6 +942,7 @@ public final class AppState: ObservableObject {
         } else {
             audioCapture.stop()
         }
+        reconcileInputLevel()
     }
 
     private func startCamera() {
@@ -848,6 +968,7 @@ public final class AppState: ObservableObject {
         if clipOwnsAudio, micCheck.phase == .recording {
             micCheck.cancel()
         }
+        reconcileInputLevel()
     }
 
     private func handleSelectedDeviceRemoval(cameraList: [CameraDeviceInfo]?,
@@ -915,6 +1036,14 @@ public final class AppState: ObservableObject {
         if isMuted, micCheck.phase == .recording {
             micCheck.cancel()
         }
+        // §5.15: unmuting resolves the watch immediately rather than waiting
+        // for the next tick to notice — the badge must not outlive the mute.
+        if !isMuted, mutedTalking {
+            micWatch.reset(keepingHistory: true)
+            mutedTalking = false
+            refreshMutedTalkingNotice()
+        }
+        reconcileInputLevel()
         updateMenuBarState()
     }
 
@@ -1516,6 +1645,22 @@ public final class AppState: ObservableObject {
         setVoiceEffect(isVoiceActive ? .off : studio.voice.recallEffect)
     }
 
+    // MARK: - Intents: voice cleanup and the mic watch (§5.15)
+
+    /// One picker, because "how much should PRISM tidy the microphone" is
+    /// one question (§8.7). Cleanup is independent of the voice effects and
+    /// always runs ahead of them.
+    public func setVoiceCleanupMode(_ mode: VoiceCleanupMode) {
+        studio.cleanup.mode = mode
+    }
+
+    public var isVoiceCleanupActive: Bool { studio.cleanup.isActive }
+
+    /// The banner is opt-in; the menu bar signal is not (§5.15).
+    public func setMicWatchBanner(_ shows: Bool) {
+        studio.micWatch.showsBanner = shows
+    }
+
     /// Why the mic check cannot run right now, or nil when it can. The check
     /// taps the same path the ring hears, so anything silencing that path
     /// would only record silence — better to say why than to play nothing.
@@ -1977,6 +2122,8 @@ public final class AppState: ObservableObject {
 
     public func quit() {
         micCheck.cancel()
+        levelTimer?.invalidate()
+        levelTimer = nil
         audioCapture.stop()
         clipPlayer?.stop()
         pipeline?.replayPlayer.stop()
@@ -1991,13 +2138,16 @@ public final class AppState: ObservableObject {
 
     private func updateMenuBarState() {
         // §8.2 precedence, extended: error > panic > away > bad connection >
-        // lagging > replaying > frozen > muted > effects > live > idle. The
-        // substitution states outrank the effect states because forgetting
-        // you are in one is the damaging failure — panic and away most of
-        // all, since both mean "the picture on air is not you right now".
-        // Bad connection outranks lagging: when the switch engaged the delay
-        // itself, the delay is a part of the stunt, and the badge should name
-        // the stunt the user engaged.
+        // lagging > replaying > frozen > muted-and-talking > muted > effects
+        // > live > idle. The substitution states outrank the effect states
+        // because forgetting you are in one is the damaging failure — panic
+        // and away most of all, since both mean "the picture on air is not
+        // you right now". Bad connection outranks lagging: when the switch
+        // engaged the delay itself, the delay is a part of the stunt, and the
+        // badge should name the stunt the user engaged. Muted-and-talking
+        // sits directly above muted because it is the muted state plus the
+        // one fact that makes it urgent (§5.15); it does not outrank freeze,
+        // which is a bigger lie about a bigger surface.
         let newState: MenuBarState
         if case .failed = setup.cameraExtension {
             newState = .error
@@ -2013,6 +2163,8 @@ public final class AppState: ObservableObject {
             newState = .replaying
         } else if isFrozen {
             newState = .frozen
+        } else if mutedTalking {
+            newState = .mutedTalking
         } else if isMuted {
             newState = .muted
         } else if hasActiveEffects {

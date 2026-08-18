@@ -336,7 +336,8 @@ public final class MicCheck: ObservableObject {
         if drained > 0 {
             level = Self.displayLevel(of: take.suffix(drained))
         } else {
-            level *= 0.7          // decay rather than freeze on a quiet gap
+            // Decay rather than freeze on a quiet gap.
+            level *= Self.meterDecay
         }
         recordedSeconds = Double(take.count) / Self.sampleRate
         if take.count >= Self.maxTakeFrames {
@@ -411,17 +412,26 @@ public final class MicCheck: ObservableObject {
 
     // MARK: Level
 
+    /// How fast a meter falls when nothing new arrives. Shared with the
+    /// always-on input meter (§5.15) so the two never disagree about how a
+    /// pause looks — they are the same bar in two places.
+    nonisolated static let meterDecay: Double = 0.7
+
     /// RMS mapped to a 0…1 meter with a square-root lift, because speech at a
     /// comfortable level has an RMS around 0.05–0.2 and a linear meter would
     /// sit apologetically near zero. Nonisolated: pure arithmetic, and the
     /// tests exercise it without an actor hop.
+    nonisolated static func displayLevel(rms: Double) -> Double {
+        guard rms > 0 else { return 0 }
+        return min(1, sqrt(rms) * 1.6)
+    }
+
     nonisolated static func displayLevel(of samples: ArraySlice<Float>) -> Double {
         guard !samples.isEmpty else { return 0 }
         var energy: Float = 0
         for sample in samples {
             energy += sample * sample
         }
-        let rms = Double(sqrtf(energy / Float(samples.count)))
-        return min(1, sqrt(rms) * 1.6)
+        return displayLevel(rms: Double(sqrtf(energy / Float(samples.count))))
     }
 }

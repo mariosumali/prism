@@ -22,9 +22,7 @@ struct MenuBarIcon: View {
     var body: some View {
         baseImage
             .opacity(state == .idle ? 0.4 : 1.0)
-            .foregroundStyle(state == .error || state == .panicked
-                             ? AnyShapeStyle(.red)
-                             : AnyShapeStyle(.primary))
+            .foregroundStyle(tint)
             .overlay(alignment: .bottomTrailing) {
                 if let badge = badgeSymbol {
                     Image(systemName: badge)
@@ -40,8 +38,20 @@ struct MenuBarIcon: View {
         case .idle, .live:
             return false
         case .effects, .replaying, .away, .badConnection, .lagging, .frozen,
-             .muted, .panicked, .error:
+             .mutedTalking, .muted, .panicked, .error:
             return true
+        }
+    }
+
+    /// Red is reserved for "something is wrong or has been declared an
+    /// emergency". Muted-and-talking is neither — it is a nudge — so it
+    /// takes the warning colour instead of the error one (§5.15), which is
+    /// also the only thing distinguishing it from a plain mute at a glance.
+    private var tint: AnyShapeStyle {
+        switch state {
+        case .error, .panicked: return AnyShapeStyle(.red)
+        case .mutedTalking: return AnyShapeStyle(.orange)
+        default: return AnyShapeStyle(.primary)
         }
     }
 
@@ -55,7 +65,7 @@ struct MenuBarIcon: View {
     private var badgeSymbol: String? {
         switch state {
         case .frozen: return "pause.fill"
-        case .muted: return "mic.slash.fill"
+        case .muted, .mutedTalking: return "mic.slash.fill"
         case .replaying: return "backward.fill"
         case .away: return "moon.zzz.fill"
         case .badConnection: return "wifi.exclamationmark"
@@ -75,6 +85,7 @@ struct MenuBarIcon: View {
         case .badConnection: return "PRISM, bad connection simulated"
         case .lagging: return "PRISM, delay engaged"
         case .frozen: return "PRISM, frozen"
+        case .mutedTalking: return "PRISM, muted while you are talking"
         case .muted: return "PRISM, muted"
         case .panicked: return "PRISM, panic engaged"
         case .error: return "PRISM, error"

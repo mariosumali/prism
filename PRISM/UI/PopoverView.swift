@@ -57,6 +57,13 @@ struct PopoverView: View {
                 warningRow(warning)
                     .padding(.bottom, Metrics.sectionGap)
             }
+            // Its own row, below the warning: a notice is something PRISM
+            // noticed, not something that went wrong, and the two must be
+            // able to show at once (§5.15).
+            if let notice = state.notice {
+                noticeRow(notice)
+                    .padding(.bottom, Metrics.sectionGap)
+            }
             if state.draftConfig != nil {
                 draftBanner
                     .padding(.bottom, Metrics.sectionGap)
@@ -295,6 +302,25 @@ struct PopoverView: View {
             case .openSettings:
                 Button("Open Settings") { openSettingsWindow() }
                     .controlSize(.small)
+            case .none:
+                EmptyView()
+            }
+        }
+    }
+
+    private func noticeRow(_ notice: NoticeMessage) -> some View {
+        HStack(spacing: Metrics.itemGap) {
+            Image(systemName: "mic.slash.fill")
+                .foregroundStyle(.orange)
+            Text(notice.text)
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            switch notice.action {
+            case .unmute:
+                Button("Unmute") { state.toggleMute() }
+                    .controlSize(.small)
+                    .buttonStyle(.borderedProminent)
             case .none:
                 EmptyView()
             }
