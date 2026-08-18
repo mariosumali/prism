@@ -12,8 +12,11 @@ in the repo — read them before writing code:
 - `PRISM/Pipeline/StageSettings.swift` — per-stage Codable settings,
   `PipelineConfiguration`, `Preset`, `HotkeyCombo`
 - `PRISM/AppStateTypes.swift` — `CameraDeviceInfo`, `AudioDeviceInfo`,
-  `MenuBarState`, `PermissionState`, `ExtensionStatus`, `SetupStatus`,
-  `WarningMessage`, `ClipState`, `StageStatus`, `PopoverSection`
+  `CameraClient`, `MenuBarState`, `PermissionState`, `ExtensionStatus`,
+  `SetupStatus`, `WarningMessage`, `NoticeMessage`, `BlockedAttempt`,
+  `CapturePhase`, `CaptureResult`, `PresenceState`, `VideoSourceKind`,
+  `VideoSourceSelection`, `ScreenSourceInfo`, `GestureEvent`, `ClipState`,
+  `StageStatus`, `PopoverSection`
 - `PRISMKernels/KernelTypes.h` — kernel parameter structs (bridged to Swift)
 
 Language: Swift 5.9, macOS 13.0 deployment target. No Swift 6 concurrency
@@ -142,6 +145,9 @@ public final class VideoPipeline {
     /// Shared by blur, virtual background, behind-placed overlay layers and
     /// auto-framing. Driven once per frame by the pipeline (§3.3).
     public let segmenter: PersonSegmenter
+    /// Shared by eye contact, retouch and face-anchored overlay layers.
+    /// Likewise driven once per frame by the pipeline (§3.3).
+    public let faceTracker: FaceTracker
     public let replayBuffer: ReplayBuffer
     public let replayPlayer: ReplayPlayer
 
@@ -553,8 +559,9 @@ public final class DeviceMonitor {
 ```swift
 public final class CMIOSink {
     public private(set) var isConnected: Bool
-    /// Client signing IDs decoded from 'clnt', mapped to display names.
-    public var onClientsChanged: (([String]) -> Void)?       // main thread
+    /// Clients decoded from 'clnt': the signing ID the extension reported
+    /// (what app rules match on) plus the name a human is shown.
+    public var onClientsChanged: (([CameraClient]) -> Void)? // main thread
     public init()
     /// Finds the PRISM Camera device + sink stream via the CMIO C API,
     /// copies the buffer queue, starts the stream. Retries internally at
@@ -693,6 +700,10 @@ public final class OutputFitStage: EffectStage {   // id .outputFit, cost .cheap
 }
 
 public final class GazeStage: EffectStage {         // id .gaze, cost .expensive
+    /// Measures nothing itself: the shared tracker is driven once per frame
+    /// by the pipeline at this stage's chain position, and read here.
+    public init(metal: MetalContext, faceTracker: FaceTracker) throws
+    public typealias EyeMeasurement = FaceTracker.EyeMeasurement
     public var settings: GazeSettings
     public var isTracking: Bool { get }             // a face with usable eye landmarks
     public func reset()                             // clears tracking state
@@ -709,8 +720,11 @@ public final class BackgroundStage: EffectStage {   // id .background, cost .exp
                     mode: ClipFillMode) -> (scale: SIMD2<Float>, offset: SIMD2<Float>)
 }
 public final class OverlayStage: EffectStage {      // id .overlay, cost .moderate
-    public var settings: OverlaySettings            // ≤ OverlaySettings.maxLayers render
+    public init(metal: MetalContext, segmenter: PersonSegmenter,
+                faceTracker: FaceTracker) throws
+    public var settings: OverlaySettings            // caps: maxLayers total, maxVideoLayers video
     public let segmenter: PersonSegmenter
+    public let faceTracker: FaceTracker             // face-anchored layers, later
     public var needsPersonMask: Bool { get }        // true when any layer is .behind
     public func setDemandActive(_ active: Bool)
     static func placement(layer: OverlayLayer, contentSize: CGSize,
@@ -730,6 +744,37 @@ public final class PersonSegmenter {
     public var latestSubjectBox: CGRect? { get }    // thread-safe, top-left origin
     public func update(commandBuffer: MTLCommandBuffer, input: MTLTexture)
     public func invalidate()                        // demand went to zero
+}
+
+/// One face, several consumers (§3.3), same contract: the pipeline calls
+/// `update` once per frame at the first face-consuming stage's chain
+/// position — pre-geometry, the space eye contact warps in — and stages only
+/// read. Owns the 76-point landmark request, its detection texture ring, the
+/// every-other-frame cadence, the per-frame smoothing and the ramps.
+public final class FaceTracker {
+    public init(metal: MetalContext) throws
+    public struct EyeMeasurement: Equatable {       // input UV, top-left origin
+        public var lidCenter, lidRadii, irisCenter, irisRadii: SIMD2<Float>
+    }
+    public struct FaceSample: Equatable {
+        public var box: CGRect                      // normalized, top-left origin
+        public var roll: Float                      // radians, 0 when unreported
+        public var left, right: EyeMeasurement?
+        public var hasEyes: Bool { get }
+    }
+    public struct Confidence: Equatable {           // acquisition/loss ramps
+        public var face, left, right: Float
+    }
+    public var smoothing: Double                    // pushed from GazeSettings
+    public var isDemanded: Bool
+    public var latestFace: FaceSample? { get }      // thread-safe, raw
+    public var smoothedFace: FaceSample? { get }    // thread-safe, smoothed
+    public var confidence: Confidence { get }       // thread-safe
+    public var isTracking: Bool { get }             // a face at all
+    public var hasEyes: Bool { get }                // with usable eye landmarks
+    public func update(commandBuffer: MTLCommandBuffer, input: MTLTexture)
+    public func invalidate()                        // demand went to zero
+    public func reset()                             // invalidate + the ramps
 }
 
 public final class LUTStore {
@@ -764,12 +809,27 @@ public enum LoginItem {
     public static func registerIfFirstLaunch()     // default ON (§7)
 }
 
+/// Every global chord PRISM owns, as one table: the binding is data, so
+/// matching is a lookup and rebinding is possible at all.
+public enum ShortcutAction: String, Codable, CaseIterable {
+    case freeze, mute, freezeAndMute       // ⌥⌘F, ⌥⌘M, ⌥⌘⇧F
+    case replay, away, panic               // ⌥⌘R, ⌥⌘A, ⌥⌘P
+    case eyeContact, lag, badConnection    // ⌥⌘E, ⌥⌘L, ⌥⌘B
+    case voice                             // ⌃⌥⌘V (§5.13)
+    case saveClip, snapshot                // ⌥⌘S, ⌥⌘⇧S
+    case screenSource, prompter            // ⌥⌘D, ⌃⌥⌘T
+    public var defaultCombo: HotkeyCombo { get }
+    public var displayName: String { get }
+}
+
 public final class Hotkeys {
-    public var onFreeze: (() -> Void)?             // ⌥⌘F
-    public var onMute: (() -> Void)?               // ⌥⌘M
-    public var onFreezeAndMute: (() -> Void)?      // ⌥⌘⇧F
-    public var onVoice: (() -> Void)?              // ⌃⌥⌘V (§5.13)
+    public var onAction: ((ShortcutAction) -> Void)?
+    /// Releases, reported only for actions that are held rather than
+    /// toggled — today only `.lag` (§5.12), matched on the *bound* keycode.
+    public var onActionRelease: ((ShortcutAction) -> Void)?
     public var onPreset: ((UUID) -> Void)?
+    /// Actions absent from the map keep their default combo.
+    public func setBindings(_ bindings: [ShortcutAction: HotkeyCombo])
     public func setPresetBindings(_ bindings: [(UUID, HotkeyCombo)])
     public func start()   // CGEventTap listen-only; NSEvent global monitor fallback
     public func stop()
@@ -785,7 +845,9 @@ public final class Permissions: ObservableObject {
 }
 ```
 
-Key codes: F = 3, M = 46, V = 9 (ANSI).
+Key codes (ANSI): F = 3, M = 46, R = 15, A = 0, P = 35, E = 14, L = 37,
+B = 11, V = 9, S = 1, D = 2, T = 17. Matching is exact over {⌥, ⌘, ⇧, ⌃},
+so ⌥⌘F and ⌥⌘⇧F — and ⌥⌘S and ⌥⌘⇧S — are distinct chords.
 
 ### AppState (`PRISM/AppState.swift`) — written in the integration phase
 
@@ -797,7 +859,8 @@ UI codes against exactly this surface:
 public final class AppState: ObservableObject {
     // Status
     @Published public var latency: LatencyReport
-    @Published public var clientsInUse: [String]          // display names
+    @Published public var clients: [CameraClient]         // signing ID + name
+    public var clientsInUse: [String] { get }             // names, projected
     @Published public var warning: WarningMessage?
     @Published public var menuBarState: MenuBarState
     @Published public var setup: SetupStatus
@@ -815,6 +878,8 @@ public final class AppState: ObservableObject {
     @Published public var isLagging: Bool
     @Published public var isCatchingUp: Bool
     @Published public var isBadConnection: Bool        // §5.14, never persisted
+    @Published public var mutedTalking: Bool           // muted, and talking anyway
+    @Published public var isSharingScreen: Bool
     @Published public var eyeContactTracking: Bool
     // Clip
     @Published public var clipState: ClipState
@@ -827,6 +892,7 @@ public final class AppState: ObservableObject {
     @Published public var stageStatus: [StageID: StageStatus]
     @Published public var publishedFormats: [VideoFormat]
     // Devices
+    @Published public var videoSource: VideoSourceSelection   // camera by default
     @Published public var cameras: [CameraDeviceInfo]
     @Published public var microphones: [AudioDeviceInfo]
     // Presets
@@ -905,6 +971,13 @@ public final class AppState: ObservableObject {
     public func setStyleEffect(_ effect: StyleEffect)      // .normal = same intent as off
     public func raiseBudgetOneStep()                       // policy pressure action
     public func toggleSection(_ s: PopoverSection)
+    // Reached by ⌥⌘S / ⌥⌘⇧S / ⌥⌘D / ⌃⌥⌘T. Each says, in the warning row,
+    // that it is not built yet: a global chord that no-ops silently is
+    // indistinguishable from PRISM having died.
+    public func saveLastSeconds()
+    public func takeSnapshot()
+    public func toggleScreenSource()
+    public func togglePrompter()
     public func quit()
 }
 ```

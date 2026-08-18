@@ -22,7 +22,7 @@ struct MenuBarIcon: View {
     var body: some View {
         baseImage
             .opacity(state == .idle ? 0.4 : 1.0)
-            .foregroundStyle(state == .error || state == .panicked
+            .foregroundStyle(isAlerting
                              ? AnyShapeStyle(.red)
                              : AnyShapeStyle(.primary))
             .overlay(alignment: .bottomTrailing) {
@@ -39,10 +39,17 @@ struct MenuBarIcon: View {
         switch state {
         case .idle, .live:
             return false
-        case .effects, .replaying, .away, .badConnection, .lagging, .frozen,
-             .muted, .panicked, .error:
+        case .effects, .sharingScreen, .replaying, .away, .badConnection,
+             .lagging, .frozen, .muted, .mutedTalking, .panicked, .error:
             return true
         }
+    }
+
+    /// The states worth spending the red on: something is broken, or the
+    /// picture on air is not what the user thinks it is. Talking into a muted
+    /// microphone qualifies — it is the one state the user cannot notice.
+    private var isAlerting: Bool {
+        state == .error || state == .panicked || state == .mutedTalking
     }
 
     private var baseImage: Image {
@@ -55,7 +62,8 @@ struct MenuBarIcon: View {
     private var badgeSymbol: String? {
         switch state {
         case .frozen: return "pause.fill"
-        case .muted: return "mic.slash.fill"
+        case .muted, .mutedTalking: return "mic.slash.fill"
+        case .sharingScreen: return "display"
         case .replaying: return "backward.fill"
         case .away: return "moon.zzz.fill"
         case .badConnection: return "wifi.exclamationmark"
@@ -70,12 +78,14 @@ struct MenuBarIcon: View {
         case .idle: return "PRISM, not in use"
         case .live: return "PRISM, live"
         case .effects: return "PRISM, effects active"
+        case .sharingScreen: return "PRISM, sharing a screen"
         case .replaying: return "PRISM, playing a replay"
         case .away: return "PRISM, away loop on air"
         case .badConnection: return "PRISM, bad connection simulated"
         case .lagging: return "PRISM, delay engaged"
         case .frozen: return "PRISM, frozen"
         case .muted: return "PRISM, muted"
+        case .mutedTalking: return "PRISM, muted while you are talking"
         case .panicked: return "PRISM, panic engaged"
         case .error: return "PRISM, error"
         }

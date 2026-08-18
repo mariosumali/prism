@@ -300,11 +300,18 @@ public enum LayerPlacement: String, Codable, CaseIterable {
 
 public enum LayerSourceKind: String, Codable, CaseIterable {
     case image, video
+    /// Drawn from `OverlayLayer.text`, not from a file. Costs a rasterisation
+    /// when the string changes and nothing per frame after that.
+    case text
+    /// A second camera or a screen, from `OverlayLayer.liveFeed`.
+    case live
 
     public var displayName: String {
         switch self {
         case .image: return "Image"
         case .video: return "Video"
+        case .text: return "Text"
+        case .live: return "Live feed"
         }
     }
 }
@@ -330,6 +337,21 @@ public struct OverlayLayer: Codable, Equatable, Identifiable {
     public var offsetY: Double           // −1…1
     public var rotationDegrees: Double   // −180…180
     public var mirrored: Bool
+    /// Content for a `.text` layer; ignored by every other kind.
+    public var text: OverlayTextStyle
+    /// Feed for a `.live` layer. Optional because "live layer with nothing
+    /// chosen yet" is a real state the picker passes through, and it must
+    /// draw nothing rather than black (see `isRenderable`).
+    public var liveFeed: LiveLayerFeed?
+    /// Frame-relative or face-relative placement.
+    public var anchor: LayerAnchor
+    /// Which landmark a face-anchored layer hangs from; ignored when the
+    /// anchor is `.frame`.
+    public var facePoint: FaceAnchorPoint
+    /// Rotate with the head's tilt. Off by default even for face-anchored
+    /// layers: roll is the noisiest of the tracked quantities, and a prop
+    /// that jitters in rotation is more distracting than one that stays level.
+    public var followsRoll: Bool
 
     public init(id: UUID = UUID(),
                 name: String = "Layer",
@@ -349,7 +371,15 @@ public struct OverlayLayer: Codable, Equatable, Identifiable {
                 offsetX: Double = 0,
                 offsetY: Double = 0,
                 rotationDegrees: Double = 0,
-                mirrored: Bool = false) {
+                mirrored: Bool = false,
+                // Appended, defaulted: this initialiser is called positionally
+                // all over the app and its tests, and inserting a parameter in
+                // the middle would break every one of those call sites.
+                text: OverlayTextStyle = OverlayTextStyle(),
+                liveFeed: LiveLayerFeed? = nil,
+                anchor: LayerAnchor = .frame,
+                facePoint: FaceAnchorPoint = .aboveHead,
+                followsRoll: Bool = false) {
         self.id = id
         self.name = name
         self.isEnabled = isEnabled
@@ -369,6 +399,11 @@ public struct OverlayLayer: Codable, Equatable, Identifiable {
         self.offsetY = offsetY
         self.rotationDegrees = rotationDegrees
         self.mirrored = mirrored
+        self.text = text
+        self.liveFeed = liveFeed
+        self.anchor = anchor
+        self.facePoint = facePoint
+        self.followsRoll = followsRoll
     }
 
     public init(from decoder: Decoder) throws {
@@ -395,24 +430,42 @@ public struct OverlayLayer: Codable, Equatable, Identifiable {
         offsetY = c.tolerant(.offsetY, 0)
         rotationDegrees = c.tolerant(.rotationDegrees, 0)
         mirrored = c.tolerant(.mirrored, false)
+        text = c.tolerant(.text, OverlayTextStyle())
+        liveFeed = (try? c.decodeIfPresent(LiveLayerFeed.self, forKey: .liveFeed)) ?? nil
+        anchor = c.tolerant(.anchor, .frame)
+        facePoint = c.tolerant(.facePoint, .aboveHead)
+        followsRoll = c.tolerant(.followsRoll, false)
     }
 
     public var assetURL: URL? {
         assetPath.map { URL(fileURLWithPath: $0) }
     }
 
-    /// A layer with no file draws nothing rather than a black rectangle.
+    /// A layer with nothing to draw draws nothing, rather than a black
+    /// rectangle. What counts as "nothing" depends on the kind: a file for
+    /// image and video, a non-blank string for text, a chosen feed for live.
     public var isRenderable: Bool {
-        isEnabled && assetPath != nil && opacity > 0
+        guard isEnabled, opacity > 0 else { return false }
+        switch sourceKind {
+        case .image, .video: return assetPath != nil
+        case .text: return text.hasText
+        case .live: return liveFeed != nil
+        }
     }
 }
 
 public struct OverlaySettings: Codable, Equatable {
-    /// Each layer is one full-frame compute pass and (for video) its own
-    /// decoder with a small frame FIFO, so the count is capped: three 1080p
-    /// video layers already cost more resident memory than the rest of the
-    /// pipeline combined (§7, < 250 MB).
-    public static let maxLayers = 3
+    /// Total composited layers. Each one is a full-frame compute pass, which
+    /// is GPU time — the cheap half of the cost.
+    public static let maxLayers = 5
+    /// Video layers specifically. This is the cap that matters: a video layer
+    /// carries its own decoder and frame FIFO, and three 1080p decoders
+    /// already cost more resident memory than the rest of the pipeline
+    /// combined (§7, < 250 MB). Text and live layers have no decoder — text
+    /// is a rasterisation that only redraws when the string changes, and a
+    /// live feed is a capture session that already exists — which is why the
+    /// total can rise above three while this one cannot.
+    public static let maxVideoLayers = 3
 
     public var layers: [OverlayLayer] = []
     public init() {}
@@ -422,8 +475,35 @@ public struct OverlaySettings: Codable, Equatable {
         layers = c.tolerant(.layers, [])
     }
 
+    /// Admission in the user's own order, so which layers survive the caps is
+    /// a consequence of how they arranged the list rather than of how the
+    /// filter happened to be written. A flat prefix would let three video
+    /// layers at the top starve the text layer below them of a slot that
+    /// costs no decoder to give.
+    private func admitted(_ include: (OverlayLayer) -> Bool) -> [OverlayLayer] {
+        var result: [OverlayLayer] = []
+        var videoCount = 0
+        for layer in layers where include(layer) {
+            if result.count == Self.maxLayers { break }
+            if layer.sourceKind == .video {
+                guard videoCount < Self.maxVideoLayers else { continue }
+                videoCount += 1
+            }
+            result.append(layer)
+        }
+        return result
+    }
+
     public var renderableLayers: [OverlayLayer] {
-        layers.filter(\.isRenderable).prefix(Self.maxLayers).map { $0 }
+        admitted { $0.isRenderable }
+    }
+
+    /// The layers the stage keeps a media source for. Deliberately not
+    /// filtered by `isRenderable`: a layer whose opacity is momentarily at
+    /// zero, or whose file picker is open, must keep its decoder, because
+    /// releasing it would restart a running video mid-slider-drag.
+    public var mediaLayers: [OverlayLayer] {
+        admitted { _ in true }
     }
 
     /// True when any enabled layer sits behind the subject — that is what
@@ -513,13 +593,25 @@ public enum StyleEffect: String, Codable, CaseIterable, Identifiable {
 public struct StyleSettings: Codable, Equatable {
     public var effect: StyleEffect = .normal
     public var intensity: Double = 1       // 0…1
+    /// Drive the effect from the microphone level. Off by default: an effect
+    /// that pulses with your voice is a stunt, and a preset that silently
+    /// coupled the picture to the mic would be a surprise on a call.
+    public var audioReactive: Bool = false
+    /// How much of the intensity range the level controls. Below 1 so a
+    /// silent room still shows the effect — an audio-reactive style that
+    /// vanishes between sentences reads as a dropout, not as an effect.
+    public var audioDepth: Double = 0.7    // 0…1
     public init() {}
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         effect = c.tolerant(.effect, .normal)
         intensity = c.tolerant(.intensity, 1)
+        audioReactive = c.tolerant(.audioReactive, false)
+        audioDepth = c.tolerant(.audioDepth, 0.7)
     }
+
+    public var clampedAudioDepth: Double { min(max(audioDepth, 0), 1) }
 
     /// "Normal" IS the unstyled picture, so every surface treats
     /// "Style = Normal" and "Style off" as the same state (see `isInert`) —
@@ -549,6 +641,7 @@ public struct StageFlags: Codable, Equatable {
 
 public struct PipelineConfiguration: Codable, Equatable {
     public var adjust = AdjustSettings()
+    public var retouch = RetouchSettings()
     public var lut = LUTSettings()
     public var blur = BlurSettings()
     public var geometry = GeometrySettings()
@@ -558,10 +651,11 @@ public struct PipelineConfiguration: Codable, Equatable {
     public var style = StyleSettings()
 
     public var flags: [StageID: StageFlags] = [
-        .geometry: StageFlags(), .adjust: StageFlags(),
-        .lut: StageFlags(), .blur: StageFlags(),
-        .gaze: StageFlags(), .background: StageFlags(),
-        .overlay: StageFlags(), .style: StageFlags(),
+        .geometry: StageFlags(), .retouch: StageFlags(),
+        .adjust: StageFlags(), .lut: StageFlags(),
+        .blur: StageFlags(), .gaze: StageFlags(),
+        .background: StageFlags(), .overlay: StageFlags(),
+        .style: StageFlags(),
     ]
 
     public var format: VideoFormat = VideoFormat(width: 1920, height: 1080, frameRate: 30)
@@ -599,8 +693,8 @@ public struct PipelineConfiguration: Codable, Equatable {
             return overlay.renderableLayers.isEmpty
         case .style:
             return style.isNormal || style.intensity <= 0
-        case .blur, .background, .gaze, .clip, .replay, .freeze, .connection,
-             .outputFit:
+        case .blur, .background, .gaze, .retouch, .clip, .replay, .freeze,
+             .connection, .outputFit:
             // These change the picture whenever they are on (background
             // replacement falls back to its colour rather than to nothing,
             // blur waits for the mask rather than declining, and connection's
@@ -624,7 +718,7 @@ public struct PipelineConfiguration: Codable, Equatable {
         case .geometry:
             return "On, but framing is still at its default."
         case .overlay:
-            return "On, but no layer has a file."
+            return "On, but no layer has a file or any text."
         case .style:
             return style.intensity <= 0
                 ? "On, but intensity is 0."
@@ -635,7 +729,7 @@ public struct PipelineConfiguration: Codable, Equatable {
     }
 
     public enum CodingKeys: String, CodingKey {
-        case adjust, lut, blur, geometry, gaze, background, overlay, style
+        case adjust, retouch, lut, blur, geometry, gaze, background, overlay, style
         case flags, format, latencyPolicy, cameraID, microphoneID
     }
 
@@ -651,6 +745,7 @@ public struct PipelineConfiguration: Codable, Equatable {
             ((try? container.decodeIfPresent(T.self, forKey: key)) ?? nil) ?? fallback
         }
         adjust = decode(.adjust, AdjustSettings())
+        retouch = decode(.retouch, RetouchSettings())
         lut = decode(.lut, LUTSettings())
         blur = decode(.blur, BlurSettings())
         geometry = decode(.geometry, GeometrySettings())

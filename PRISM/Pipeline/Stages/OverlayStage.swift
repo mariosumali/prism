@@ -1,7 +1,7 @@
 // OverlayStage.swift
 // PRISM
 //
-// Green-screen compositing (§5.8, .moderate): up to three placed, keyed
+// Green-screen compositing (§5.8, .moderate): a handful of placed, keyed
 // layers over the finished frame. Each layer is an image or a looping video
 // with an optional chroma or luma key, placed with scale/offset/rotation/
 // mirror, and composited either in front of everything or behind the subject
@@ -11,9 +11,10 @@
 // An animated hat, a fire border, a lower third, a picture-in-picture of a
 // second feed — they are all the same operation, and the cost is one compute
 // pass per layer, so the interesting question was never "can we render it"
-// but "how many can we afford". Three, per OverlaySettings.maxLayers: each
-// video layer carries its own decoder and frame FIFO, and resident memory is
-// the binding constraint (§7), not GPU time.
+// but "how many can we afford". The answer is two caps, per OverlaySettings:
+// resident memory is the binding constraint (§7), not GPU time, and it is
+// the video layers that spend it — each one carries its own decoder and
+// frame FIFO.
 //
 // Layers composite bottom-up in array order, ping-ponging through two
 // scratch textures so the final pass always lands in `output`.
@@ -36,6 +37,12 @@ public final class OverlayStage: EffectStage {
     }
 
     public let segmenter: PersonSegmenter
+    /// Held for the face-anchored layer placement that arrives with the
+    /// feature; nothing reads it yet. Taken in the initialiser because the
+    /// tracker is constructed once by the pipeline and shared — a stage that
+    /// reached for it later would have to make one of its own, which is the
+    /// second full-frame Vision request this exists to prevent.
+    public let faceTracker: FaceTracker
 
     private let metal: MetalContext
     private let overlayPipeline: MTLComputePipelineState
@@ -68,9 +75,11 @@ public final class OverlayStage: EffectStage {
     /// follows for the same frame.
     private var pending: [(layer: OverlayLayer, texture: MTLTexture)] = []
 
-    public init(metal: MetalContext, segmenter: PersonSegmenter) throws {
+    public init(metal: MetalContext, segmenter: PersonSegmenter,
+                faceTracker: FaceTracker) throws {
         self.metal = metal
         self.segmenter = segmenter
+        self.faceTracker = faceTracker
         overlayPipeline = try metal.computePipeline(function: "prism_overlay")
         copyPipeline = try metal.computePipeline(function: "prism_copy")
     }
@@ -256,7 +265,7 @@ public final class OverlayStage: EffectStage {
     /// Adds sources for new layers, retargets changed ones, and drops sources
     /// for layers that are gone — releasing their decoders and FIFOs.
     private func reconcileSources(previous: OverlaySettings) {
-        let live = settings.layers.prefix(OverlaySettings.maxLayers)
+        let live = settings.mediaLayers
         var kept = Set<UUID>()
         var toConfigure: [(LayerSource, URL?, LayerSourceKind)] = []
 

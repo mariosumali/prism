@@ -71,8 +71,8 @@ final class FoundationTypesTests: XCTestCase {
     func testChainOrderIsFixed() {
         let ordered = StageID.allCases.sorted()
         XCTAssertEqual(ordered, [.clip, .replay, .freeze, .gaze, .geometry,
-                                 .adjust, .lut, .blur, .background, .overlay,
-                                 .style, .connection, .outputFit])
+                                 .retouch, .adjust, .lut, .blur, .background,
+                                 .overlay, .style, .connection, .outputFit])
     }
 
     /// The three substituting stages escalate: a replay overrides a clip, a
@@ -262,7 +262,11 @@ final class FoundationTypesTests: XCTestCase {
         XCTAssertEqual(MemoryLayout<PRISMCompositeParams>.size, 16)
         XCTAssertEqual(MemoryLayout<PRISMCrossfadeParams>.size, 16)
         XCTAssertEqual(MemoryLayout<PRISMSharpnessParams>.size, 16)
+        XCTAssertEqual(MemoryLayout<PRISMRetouchBlurParams>.size, 16)
+        XCTAssertEqual(MemoryLayout<PRISMRetouchParams>.size, 16)
+        XCTAssertEqual(MemoryLayout<PRISMStyleParams>.size, 32)
         // simd_float3x3 is 48 bytes (3 × float4-aligned columns).
         XCTAssertEqual(MemoryLayout<PRISMGeometryParams>.size, 64)
+        XCTAssertEqual(MemoryLayout<PRISMOverlayParams>.size, 96)
     }
 }

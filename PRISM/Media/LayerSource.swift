@@ -377,6 +377,11 @@ final class LayerSource {
             loadImage(url, expecting: url)
         case .video:
             _ = video.load(url: url)
+        case .text, .live:
+            // Not file-backed: a text layer is rasterised from its style and a
+            // live layer comes from a running capture session, so this source
+            // holds nothing for them and reports no texture.
+            break
         }
     }
 
@@ -393,7 +398,7 @@ final class LayerSource {
         switch kind {
         case .image: return texture
         case .video: return video.currentTexture(at: hostTime)
-        case nil: return nil
+        case .text, .live, nil: return nil
         }
     }
 
@@ -406,7 +411,7 @@ final class LayerSource {
         switch kind {
         case .image: return size
         case .video: return video.contentSize
-        case nil: return nil
+        case .text, .live, nil: return nil
         }
     }
 

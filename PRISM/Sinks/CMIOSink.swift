@@ -27,9 +27,10 @@ public final class CMIOSink {
     /// stream started. Cleared on `disconnect()` or when the device vanishes.
     public private(set) var isConnected: Bool = false
 
-    /// Client signing IDs decoded from 'clnt', mapped to display names.
-    /// Fired on the main thread whenever the set changes.
-    public var onClientsChanged: (([String]) -> Void)?
+    /// Streaming clients decoded from 'clnt', each carrying both the signing
+    /// ID the extension reported and the name a human is shown. Fired on the
+    /// main thread whenever the set changes.
+    public var onClientsChanged: (([CameraClient]) -> Void)?
 
     /// Frames dropped because the sink queue was full (§3.2: drop + count).
     public private(set) var droppedFrames: Int = 0
@@ -417,9 +418,12 @@ public final class CMIOSink {
 
         if let clients, clients != lastClientIDs {
             lastClientIDs = clients
-            let names = clients.map(Self.displayName(forSigningID:))
+            let resolved = clients.map {
+                CameraClient(signingID: $0,
+                             displayName: Self.displayName(forSigningID: $0))
+            }
             let callback = onClientsChanged
-            DispatchQueue.main.async { callback?(names) }
+            DispatchQueue.main.async { callback?(resolved) }
         }
     }
 

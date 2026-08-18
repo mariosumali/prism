@@ -60,7 +60,13 @@ public final class AppState: ObservableObject {
 
     // Status
     @Published public var latency = LatencyReport()
-    @Published public var clientsInUse: [String] = []
+    /// Who is streaming, with the signing IDs per-app rules match on. Two
+    /// apps can share a display name, so the name alone cannot identify a
+    /// client and cannot be the thing rules are keyed on.
+    @Published public var clients: [CameraClient] = []
+    /// The same clients as names, in the same order. A projection rather
+    /// than a second stored array, so the two can never disagree.
+    public var clientsInUse: [String] { clients.map(\.displayName) }
     @Published public var warning: WarningMessage?
     @Published public var menuBarState: MenuBarState = .idle
     @Published public var setup = SetupStatus()
@@ -131,6 +137,11 @@ public final class AppState: ObservableObject {
     @Published public var isLagging = false
     /// §5.14 — the fake bad connection is degrading the published picture.
     @Published public var isBadConnection = false
+    /// Muted, and the microphone is hearing speech anyway. Nothing else in
+    /// the app reacts to this: the whole feature is the menu bar saying so.
+    @Published public var mutedTalking = false
+    /// A screen or window is on air in place of the camera.
+    @Published public var isSharingScreen = false
     /// Playing the backlog out faster than real time after a catch-up release.
     @Published public var isCatchingUp = false
     /// Eye contact has found a face and is actually correcting. A correction
@@ -142,6 +153,10 @@ public final class AppState: ObservableObject {
     @Published public var stageStatus: [StageID: StageStatus] = [:]
     @Published public var publishedFormats: [VideoFormat] = VideoFormat.defaultSet
     // Devices
+    /// What feeds the pipeline: the camera, or a screen or window. One
+    /// question, one control (§8.7) — which is why the source sits with the
+    /// device pickers rather than in a pane of its own.
+    @Published public var videoSource = VideoSourceSelection.camera
     @Published public var cameras: [CameraDeviceInfo] = []
     @Published public var microphones: [AudioDeviceInfo] = []
     // Presets
@@ -257,6 +272,9 @@ public final class AppState: ObservableObject {
         static let sections = "PRISM.expandedSections"
         static let popoverLayout = "PRISM.popoverLayout"
         static let studio = "PRISM.studio"
+        static let videoSource = "PRISM.videoSource"
+        static let hotkeys = "PRISM.hotkeys"
+        static let externalControl = "PRISM.externalControl"
     }
 
     // MARK: - Init
@@ -504,27 +522,46 @@ public final class AppState: ObservableObject {
     }
 
     private func wireSink() {
-        cmioSink.onClientsChanged = { [weak self] names in
+        cmioSink.onClientsChanged = { [weak self] list in
             guard let self else { return }
-            self.clientsInUse = names
+            self.clients = list
             self.updateMenuBarState()
             self.reconcileCaptures()       // a first client starts capture
         }
     }
 
     private func wireHotkeys() {
-        hotkeys.onFreeze = { [weak self] in self?.toggleFreeze() }
-        hotkeys.onMute = { [weak self] in self?.toggleMute() }
-        hotkeys.onFreezeAndMute = { [weak self] in self?.freezeAndMute() }
-        hotkeys.onReplay = { [weak self] in self?.toggleReplay() }
-        hotkeys.onAway = { [weak self] in self?.toggleAway() }
-        hotkeys.onPanic = { [weak self] in self?.togglePanic() }
-        hotkeys.onEyeContact = { [weak self] in self?.toggleEyeContact() }
-        hotkeys.onVoice = { [weak self] in self?.toggleVoice() }
-        hotkeys.onLag = { [weak self] pressed in self?.handleLagKey(pressed: pressed) }
-        hotkeys.onBadConnection = { [weak self] in self?.toggleBadConnection() }
+        hotkeys.onAction = { [weak self] action in self?.perform(action) }
+        hotkeys.onActionRelease = { [weak self] action in
+            // §5.12: the lag switch is the only chord that is held rather
+            // than toggled, so it is the only release that means anything.
+            guard action == .lag else { return }
+            self?.handleLagKey(pressed: false)
+        }
         hotkeys.onPreset = { [weak self] id in self?.selectPreset(id) }
         pushPresetHotkeyBindings(presetStore.presets)
+    }
+
+    /// The one place a chord becomes an intent. Exhaustive on purpose: a
+    /// shortcut cannot be added without the compiler making someone say what
+    /// it does, which is the failure mode a table of callbacks invited.
+    private func perform(_ action: ShortcutAction) {
+        switch action {
+        case .freeze: toggleFreeze()
+        case .mute: toggleMute()
+        case .freezeAndMute: freezeAndMute()
+        case .replay: toggleReplay()
+        case .away: toggleAway()
+        case .panic: togglePanic()
+        case .eyeContact: toggleEyeContact()
+        case .lag: handleLagKey(pressed: true)
+        case .badConnection: toggleBadConnection()
+        case .voice: toggleVoice()
+        case .saveClip: saveLastSeconds()
+        case .snapshot: takeSnapshot()
+        case .screenSource: toggleScreenSource()
+        case .prompter: togglePrompter()
+        }
     }
 
     private func wireReplayPlayer() {
@@ -644,8 +681,8 @@ public final class AppState: ObservableObject {
         // that message is ever lost, a stale clientsInUse would hold
         // captureDemand true — camera on for nobody — indefinitely. 1 Hz
         // reconciliation against the connection state caps that at a second.
-        if !cmioSink.isConnected, !clientsInUse.isEmpty {
-            clientsInUse = []
+        if !cmioSink.isConnected, !clients.isEmpty {
+            clients = []
             updateMenuBarState()
             reconcileCaptures()
         }
@@ -743,7 +780,7 @@ public final class AppState: ObservableObject {
     /// agent must not hold the camera (and the OS camera indicator) around
     /// the clock.
     private var captureDemand: Bool {
-        previewActive || !clientsInUse.isEmpty
+        previewActive || !clients.isEmpty
     }
 
     /// Mirror of kAudioDevicePropertyDeviceIsRunningSomewhere on the virtual
@@ -1049,6 +1086,16 @@ public final class AppState: ObservableObject {
             return
         }
         let isVideo = PanicSettings.isVideoPath(url.path)
+        // Video carries a second, tighter cap: past three decoders the memory
+        // budget (§7) is the binding constraint, and a fourth video layer
+        // would be added to the list and then silently never composited.
+        if isVideo,
+           editingConfig.overlay.layers.filter({ $0.sourceKind == .video }).count
+               >= OverlaySettings.maxVideoLayers {
+            warning = WarningMessage(
+                text: "PRISM plays up to \(OverlaySettings.maxVideoLayers) video layers at once")
+            return
+        }
         var layer = OverlayLayer(
             name: url.deletingPathExtension().lastPathComponent,
             sourceKind: isVideo ? .video : .image,
@@ -1532,6 +1579,50 @@ public final class AppState: ObservableObject {
         return nil
     }
 
+    // The sections below are landing zones, one per feature still to be
+    // built, and empty on purpose. Nine tracks append their intents into this
+    // one file; disjoint regions are the difference between nine clean
+    // additions and nine edits to the same hunk.
+
+    // MARK: - Intents: capture
+
+    /// The two capture chords answer honestly rather than doing nothing.
+    ///
+    /// A global hotkey that silently no-ops is indistinguishable from PRISM
+    /// having died, and someone mid-call will draw the second conclusion. A
+    /// visible sentence at least teaches something true.
+    public func saveLastSeconds() {
+        warning = WarningMessage(text: "Saving the last seconds isn't built yet.")
+    }
+
+    public func takeSnapshot() {
+        warning = WarningMessage(text: "Stills aren't built yet.")
+    }
+
+    // MARK: - Intents: screen source
+
+    public func toggleScreenSource() {
+        warning = WarningMessage(text: "Sharing a screen isn't built yet.")
+    }
+
+    // MARK: - Intents: prompter
+
+    public func togglePrompter() {
+        warning = WarningMessage(text: "The prompter isn't built yet.")
+    }
+
+    // MARK: - Intents: app rules
+
+    // MARK: - Intents: presence
+
+    // MARK: - Intents: gestures
+
+    // MARK: - Intents: voice cleanup
+
+    // MARK: - Intents: mic watch
+
+    // MARK: - Intents: external control
+
     // MARK: - Replay state mirroring
 
     private func refreshReplayState() {
@@ -1990,14 +2081,26 @@ public final class AppState: ObservableObject {
     // MARK: - Derived state
 
     private func updateMenuBarState() {
-        // §8.2 precedence, extended: error > panic > away > bad connection >
-        // lagging > replaying > frozen > muted > effects > live > idle. The
-        // substitution states outrank the effect states because forgetting
-        // you are in one is the damaging failure — panic and away most of
-        // all, since both mean "the picture on air is not you right now".
-        // Bad connection outranks lagging: when the switch engaged the delay
-        // itself, the delay is a part of the stunt, and the badge should name
-        // the stunt the user engaged.
+        // §8.2 precedence, in full:
+        //
+        //   error > panicked > away > badConnection > lagging > replaying >
+        //   frozen > mutedTalking > muted > sharingScreen > effects > live >
+        //   idle
+        //
+        // The substitution states outrank the effect states because
+        // forgetting you are in one is the damaging failure — panic and away
+        // most of all, since both mean "the picture on air is not you right
+        // now". Bad connection outranks lagging: when the switch engaged the
+        // delay itself, the delay is part of the stunt, and the badge should
+        // name the stunt the user engaged. Talking while muted outranks plain
+        // muted for the same reason it exists at all: it is the state the
+        // user is provably unaware of. Sharing a screen sits below the mute
+        // states — everyone in the call can see the screen is up, so nobody
+        // is being surprised by it — but above effects, because it says what
+        // the camera is publishing rather than how.
+        //
+        // There is no recording state on purpose: writing a file changes
+        // nothing on air, and this ladder ranks what is on air.
         let newState: MenuBarState
         if case .failed = setup.cameraExtension {
             newState = .error
@@ -2013,11 +2116,15 @@ public final class AppState: ObservableObject {
             newState = .replaying
         } else if isFrozen {
             newState = .frozen
+        } else if mutedTalking {
+            newState = .mutedTalking
         } else if isMuted {
             newState = .muted
+        } else if isSharingScreen {
+            newState = .sharingScreen
         } else if hasActiveEffects {
             newState = .effects
-        } else if !clientsInUse.isEmpty {
+        } else if !clients.isEmpty {
             newState = .live
         } else {
             newState = .idle
@@ -2037,7 +2144,7 @@ public final class AppState: ObservableObject {
         // an effect is on air when the picture is untouched. Geometry was
         // always excluded this way; isInert applies the same test to the rest.
         for id: StageID in [.adjust, .lut, .style, .blur, .gaze, .background, .overlay,
-                            .geometry]
+                            .geometry, .retouch]
         where config.flags(for: id).enabled && !config.isInert(id) {
             if !(stageStatus[id]?.autoDisabled ?? false) { return true }
         }

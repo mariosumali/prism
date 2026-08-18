@@ -14,8 +14,9 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 enum MainPane: String, CaseIterable, Identifiable {
-    case studio, scene, moments, voice, framing, effects, format, devices,
-         presets, menuBar, general, about
+    case studio, scene, moments, capture, voice, framing, effects, format,
+         devices, presets, apps, menuBar, general, prompter, gestures,
+         diagnostics, about
 
     var id: String { rawValue }
 
@@ -24,14 +25,19 @@ enum MainPane: String, CaseIterable, Identifiable {
         case .studio: return "Studio"
         case .scene: return "Scene"
         case .moments: return "Moments"
+        case .capture: return "Capture"
         case .voice: return "Voice"
         case .framing: return "Framing"
         case .effects: return "Effects"
         case .format: return "Format & Latency"
         case .devices: return "Devices"
         case .presets: return "Presets"
+        case .apps: return "Apps"
         case .menuBar: return "Menu Bar"
         case .general: return "General"
+        case .prompter: return "Prompter"
+        case .gestures: return "Gestures"
+        case .diagnostics: return "Diagnostics"
         case .about: return "About"
         }
     }
@@ -41,14 +47,19 @@ enum MainPane: String, CaseIterable, Identifiable {
         case .studio: return "video"
         case .scene: return "theatermasks"
         case .moments: return "backward.end.alt.fill"
+        case .capture: return "square.and.arrow.down"
         case .voice: return "waveform.and.mic"
         case .framing: return "crop.rotate"
         case .effects: return "wand.and.stars"
         case .format: return "rectangle.on.rectangle"
         case .devices: return "camera"
         case .presets: return "square.stack"
+        case .apps: return "app.badge.checkmark"
         case .menuBar: return "menubar.arrow.up.rectangle"
         case .general: return "gearshape"
+        case .prompter: return "doc.plaintext"
+        case .gestures: return "hand.raised"
+        case .diagnostics: return "list.bullet.rectangle"
         case .about: return "info.circle"
         }
     }
@@ -94,14 +105,19 @@ struct MainWindowView: View {
         case .studio: StudioPane(navigateToFormat: { selectedPane = .format })
         case .scene: ScenePane()
         case .moments: MomentsPane()
+        case .capture: CapturePane()
         case .voice: VoicePane()
         case .framing: FramingPane()
         case .effects: EffectsPane()
         case .format: FormatPane()
         case .devices: DevicesPane()
         case .presets: PresetsPane()
+        case .apps: AppsPane()
         case .menuBar: MenuBarLayoutPane()
         case .general: GeneralPane()
+        case .prompter: PrompterPane()
+        case .gestures: GesturesPane()
+        case .diagnostics: DiagnosticsPane()
         case .about: AboutPane()
         }
     }

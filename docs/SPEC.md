@@ -202,6 +202,8 @@ Bad connection (§5.14) runs after everything the user composes, because a strug
 
 Output fit is not a user stage — it is the final scale/letterbox into the negotiated format and always runs.
 
+**One face measurement per frame.** The same rule, one model along: eye contact (§5.6), skin retouch (§5.4) and face-anchored overlay layers (§5.8) all want the same 76-point landmark constellation, so a shared `FaceTracker` owns the request and the pipeline drives it **once**, at the first face-consuming stage's position in the chain — pre-Geometry, which is the space eye contact warps in. Detection is demand-gated: no consumer, no Vision request, and the measurement is dropped when the last one goes away so a re-enabled feature never anchors to a stale face.
+
 **One segmentation per frame.** Four features need the person mask: background blur (§5.4), virtual backgrounds (§5.7), overlay layers placed behind the subject (§5.8), and auto-framing (§5.4). Segmentation is the single most expensive thing in the pipeline, so it runs **once**, driven by the pipeline at the first mask-consuming stage's position in the chain, and every consumer shares the result. Running two of these features together must cost one segmentation, not two. The mask is captured post-Geometry so it aligns with everything that samples it, and so auto-framing remains the closed-loop servo it is specified to be.
 
 ### 3.4 Latency budget and degradation
@@ -404,7 +406,7 @@ Redirects the subject's gaze toward the lens so they can read notes off-camera w
 |---|---|
 | Stage | `.gaze`, `.expensive`, before Geometry |
 | Trigger | Scene section toggle, plus global hotkey ⌥⌘E |
-| Detection | `VNDetectFaceLandmarksRequest`, `.constellation76Points` (pupils only exist in the 76-point constellation), on a serial queue every 2nd frame, request input capped at 720p |
+| Detection | The shared `FaceTracker` (§3.3): `VNDetectFaceLandmarksRequest`, `.constellation76Points` (pupils only exist in the 76-point constellation), on a serial queue every 2nd frame, request input capped at 720p |
 | Measurement | Drift of the pupil from the centre of its own eye opening |
 | Correction | A `strength` fraction of that drift, removed |
 | Clamp | `maxShift` iris radii, default 0.5 |
@@ -440,20 +442,21 @@ Blur and replacement are mutually exclusive and share one UI control (§8.7).
 
 ### 5.8 Green-screen compositing
 
-Up to **three** placed, keyed layers over the finished frame — the stage that turns PRISM from a camera filter into a stage.
+Up to **five** placed, keyed layers over the finished frame — the stage that turns PRISM from a camera filter into a stage.
 
 | Property | Specification |
 |---|---|
 | Stage | `.overlay`, `.moderate`, after virtual background |
-| Sources | image (alpha honoured) or looping video |
+| Sources | image (alpha honoured), looping video, text, or a live feed |
 | Keying | none, chroma, or luma |
 | Placement | in front of everything, or behind the subject (mask-gated) |
+| Anchor | the frame, or a face landmark (`LayerAnchor`, `FaceAnchorPoint`) |
 | Transform | scale, offset, rotation, mirror, opacity |
-| Layer cap | 3 (`OverlaySettings.maxLayers`) |
+| Layer cap | 5 total (`OverlaySettings.maxLayers`), of which 3 video (`maxVideoLayers`) |
 
 Keying is computed in YCbCr so the key colour is arbitrary rather than hard-coded green, and despill works for any hue. Despill removes what is left of the key hue from surviving pixels, so a green screen stops tinting hair and shoulders.
 
-The layer cap is a memory constraint, not a GPU one: each layer is one compute pass, but each *video* layer carries its own decoder and frame FIFO, and resident memory is the binding limit (§7). At scale 1 a layer is fitted into the frame with its own aspect preserved — a square PNG stays square.
+The layer cap is a memory constraint, not a GPU one: each layer is one compute pass, but each *video* layer carries its own decoder and frame FIFO, and resident memory is the binding limit (§7). That is why the two caps differ — a text or live layer has no decoder to pay for. Layers are admitted in the user's own order until either cap is reached. At scale 1 a layer is fitted into the frame with its own aspect preserved — a square PNG stays square.
 
 Layers composite bottom-up in array order. Dropping an image or video onto the Scene pane adds it as a layer, the same affordance as dropping a `.cube` to import a LUT.
 
@@ -732,12 +735,16 @@ enum Metrics {
 | Lagging | Filled prism with hourglass badge |
 | Frozen | Filled prism with pause bar |
 | Muted | Filled prism with slash |
+| Muted while talking | Filled prism with slash, `.red` tint |
+| Sharing a screen | Filled prism with display badge |
 | Panic engaged | Filled prism with raised-hand badge, `.red` tint |
 | Error | Filled prism, `.red` tint |
 
-Precedence: error > panic > away > bad connection > lagging > replaying > frozen > muted > effects > live > idle.
+Precedence: error > panicked > away > bad connection > lagging > replaying > frozen > muted while talking > muted > sharing a screen > effects > live > idle.
 
-The substitution states outrank the effect states because forgetting you are in one is the damaging failure this app can produce. Replay, away and panic each get their own glyph rather than folding into frozen, because *"why can nobody see me moving"* has to be answerable at a glance. Bad connection outranks lagging because when the switch engaged the delay itself, the delay is part of the stunt — the badge names what the user engaged.
+The substitution states outrank the effect states because forgetting you are in one is the damaging failure this app can produce. Replay, away and panic each get their own glyph rather than folding into frozen, because *"why can nobody see me moving"* has to be answerable at a glance. Bad connection outranks lagging because when the switch engaged the delay itself, the delay is part of the stunt — the badge names what the user engaged. Talking while muted outranks plain muted, and is the only non-error state to spend the red, because it is the one state the user is provably unaware of — they are talking. Sharing a screen sits below the mute states, since everyone in the call can already see the screen is up, but above effects, because it says *what* the camera publishes rather than how.
+
+There is deliberately no recording state: writing a file changes nothing on air, and this ladder ranks what is on air.
 
 ### 8.3 Popover layout
 

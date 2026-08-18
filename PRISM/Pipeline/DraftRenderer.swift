@@ -39,8 +39,10 @@ import Metal
 final class DraftRenderer {
     private let metal: MetalContext
     private let segmenter: PersonSegmenter
+    private let faceTracker: FaceTracker
     private let gazeStage: GazeStage
     private let geometryStage: GeometryStage
+    private let retouchStage: RetouchStage
     private let adjustStage: AdjustStage
     private let lutStage: LUTStage
     private let blurStage: BlurStage
@@ -53,6 +55,9 @@ final class DraftRenderer {
     /// Mirrors VideoPipeline.maskConsumers — the chain position where the
     /// draft's own segmentation runs.
     private static let maskConsumers: Set<StageID> = [.blur, .background, .overlay]
+
+    /// Mirrors VideoPipeline.faceConsumers, likewise.
+    private static let faceConsumers: Set<StageID> = [.gaze, .retouch, .overlay]
 
     /// The finished draft texture for the preview. Completion-thread callback.
     var onOutput: ((MTLTexture) -> Void)?
@@ -77,19 +82,23 @@ final class DraftRenderer {
         self.metal = metal
         self.outputFormat = outputFormat
         segmenter = try PersonSegmenter(metal: metal)
-        gazeStage = try GazeStage(metal: metal)
+        faceTracker = try FaceTracker(metal: metal)
+        gazeStage = try GazeStage(metal: metal, faceTracker: faceTracker)
         geometryStage = try GeometryStage(metal: metal)
+        retouchStage = try RetouchStage(metal: metal, faceTracker: faceTracker)
         adjustStage = try AdjustStage(metal: metal)
         lutStage = try LUTStage(metal: metal)
         blurStage = try BlurStage(metal: metal, segmenter: segmenter)
         backgroundStage = try BackgroundStage(metal: metal, segmenter: segmenter)
-        overlayStage = try OverlayStage(metal: metal, segmenter: segmenter)
+        overlayStage = try OverlayStage(metal: metal, segmenter: segmenter,
+                                        faceTracker: faceTracker)
         styleStage = try StyleStage(metal: metal)
         outputFitStage = try OutputFitStage(metal: metal)
         // No connection stage here: bad connection is engaged behaviour, not
         // a look — a draft previews the look it would apply (§5.14 excluded).
-        userStages = [gazeStage, geometryStage, adjustStage, lutStage,
-                      blurStage, backgroundStage, overlayStage, styleStage]
+        userStages = [gazeStage, geometryStage, retouchStage, adjustStage,
+                      lutStage, blurStage, backgroundStage, overlayStage,
+                      styleStage]
         outputFitStage.outputSize = CGSize(width: outputFormat.width,
                                            height: outputFormat.height)
     }
@@ -116,6 +125,7 @@ final class DraftRenderer {
     /// nobody reads.
     func apply(_ config: PipelineConfiguration) {
         adjustStage.settings = config.adjust
+        retouchStage.settings = config.retouch
         lutStage.settings = config.lut
         blurStage.settings = config.blur
         geometryStage.settings = config.geometry
@@ -124,8 +134,10 @@ final class DraftRenderer {
         overlayStage.settings = config.overlay
         styleStage.settings = config.style
         segmenter.quality = config.blur.quality
+        faceTracker.smoothing = config.gaze.smoothing
 
         geometryStage.isEnabled = config.flags(for: .geometry).enabled
+        retouchStage.isEnabled = config.flags(for: .retouch).enabled
         adjustStage.isEnabled = config.flags(for: .adjust).enabled
         lutStage.isEnabled = config.flags(for: .lut).enabled
         blurStage.isEnabled = config.flags(for: .blur).enabled
@@ -184,7 +196,22 @@ final class DraftRenderer {
         var current = source
         var useA = true
         var segmentationDone = false
+        var faceTrackingDone = false
         for stage in userStages {
+            // Same one-request-per-frame contract as VideoPipeline, and for
+            // the same reason the draft segments: a drafted eye contact that
+            // previewed as pass-through would be the one thing a preview must
+            // not do.
+            if !faceTrackingDone, Self.faceConsumers.contains(stage.id) {
+                faceTrackingDone = true
+                if gazeStage.wantsEncode() {
+                    faceTracker.isDemanded = true
+                    faceTracker.update(commandBuffer: commandBuffer, input: current)
+                } else if faceTracker.isDemanded {
+                    faceTracker.isDemanded = false
+                    faceTracker.invalidate()
+                }
+            }
             // Same one-segmentation-per-frame contract as VideoPipeline. The
             // draft does run its own Vision request when a mask consumer is
             // staged — without it a drafted background or blur would preview

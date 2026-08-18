@@ -11,15 +11,19 @@ import Foundation
 import Metal
 
 /// Fixed chain order (§3.3, extended):
-/// Clip → Replay → Freeze → Eye contact → Geometry → Adjust → LUT →
-/// Background blur → Virtual background → Overlay → Style → Bad connection →
-/// Output fit
+/// Clip → Replay → Freeze → Eye contact → Geometry → Skin retouch → Adjust →
+/// LUT → Background blur → Virtual background → Overlay → Style →
+/// Bad connection → Output fit
 ///
 /// The three substituting stages come first and in escalating order of
 /// authority: a clip replaces the camera, a replay overrides the clip, and a
 /// freeze overrides both — each is a more deliberate "stop showing me live"
 /// than the one before it. Eye contact runs before Geometry so it warps in
-/// the same space Vision measured the landmarks in. Virtual background and
+/// the same space Vision measured the landmarks in. Skin retouch follows
+/// Geometry and precedes every colour stage: it gates on skin chroma, and
+/// Geometry only moves pixels around, whereas an exposure or temperature edit
+/// upstream of the gate would detune it — the smoothing would drift off the
+/// face exactly when the user warms the picture. Virtual background and
 /// Overlay run after blur because both consume the same person mask and must
 /// composite over the finished look, and Overlay runs last of the two so a
 /// foreground layer sits above a replaced background. Style is the last
@@ -34,6 +38,7 @@ public enum StageID: String, Codable, CaseIterable, Hashable, Comparable {
     case freeze
     case gaze
     case geometry
+    case retouch     // §5.4 skin smoothing; gated on skin chroma, pre-colour
     case adjust
     case lut
     case blur
@@ -52,16 +57,24 @@ public enum StageID: String, Codable, CaseIterable, Hashable, Comparable {
         case .freeze: return 2
         case .gaze: return 3
         case .geometry: return 4
-        case .adjust: return 5
-        case .lut: return 6
-        case .blur: return 7
-        case .background: return 8
-        case .overlay: return 9
-        case .style: return 10
-        case .connection: return 11
-        case .outputFit: return 12
+        case .retouch: return 5
+        case .adjust: return 6
+        case .lut: return 7
+        case .blur: return 8
+        case .background: return 9
+        case .overlay: return 10
+        case .style: return 11
+        case .connection: return 12
+        case .outputFit: return 13
         }
     }
+
+    /// The stage the degradation engine gives up last. §5.7 requires every
+    /// degraded path to err toward COVERING the room the user chose to hide;
+    /// dropping the virtual background reveals it, which is worse than any
+    /// other look the chain can lose — so it goes only when nothing else is
+    /// left to give.
+    public var isLastResort: Bool { self == .background }
 
     public static func < (lhs: StageID, rhs: StageID) -> Bool {
         lhs.chainIndex < rhs.chainIndex
@@ -75,6 +88,7 @@ public enum StageID: String, Codable, CaseIterable, Hashable, Comparable {
         case .freeze: return "Freeze"
         case .gaze: return "Eye contact"
         case .geometry: return "Framing"
+        case .retouch: return "Skin retouch"
         case .adjust: return "Adjust"
         case .lut: return "LUT"
         case .blur: return "Background blur"

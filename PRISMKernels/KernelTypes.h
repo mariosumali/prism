@@ -49,6 +49,27 @@ typedef struct {
     float _pad0;
 } PRISMBlurParams;
 
+// Retouch.metal — separable edge-aware blur, one direction per pass. The
+// range sigma is what separates this from prism_blur: weighting by colour
+// distance as well as by distance keeps nostrils, lashes and the hairline
+// out of the smoothing, and those edges are exactly what a plain Gaussian
+// turns into a plastic mask.
+typedef struct {
+    simd_float2 direction;       // (1,0) horizontal pass, (0,1) vertical
+    float radius;                // pixels at full res
+    float rangeSigma;            // colour distance at which the weight collapses
+} PRISMRetouchBlurParams;
+
+// Retouch.metal — recombine the smoothed image with the texture the blur
+// removed. `detail` adds that high-frequency residue back, which is the
+// difference between a retouched face and an airbrushed one.
+typedef struct {
+    float amount;                // 0…1 blend toward the smoothed image
+    float detail;                // 0…1 fine texture restored from the source
+    float _pad0;
+    float _pad1;
+} PRISMRetouchParams;
+
 // Composite.metal — mix sharp person over blurred background by mask.
 typedef struct {
     float maskContrast;          // edge hardening, 1 = as delivered

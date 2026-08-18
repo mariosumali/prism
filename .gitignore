@@ -6,8 +6,11 @@ DerivedData/
 *.xcuserstate
 *.moved-aside
 
-# XcodeGen output is regenerable but committed for contributor convenience;
-# user-specific pieces are not.
+# XcodeGen output. project.pbxproj is generated from project.yml on every
+# build and by CI, so committing it buys nothing and costs a conflict in
+# every branch that adds a file — the diff carries no information the
+# manifest does not already have. Run `xcodegen generate` after a checkout.
+PRISM.xcodeproj/project.pbxproj
 xcuserdata/
 
 # Packaging output
