@@ -111,6 +111,50 @@ struct BiquadCoefficients {
             a1: Float((-2 * cosw) / a0),
             a2: Float((1 - alpha) / a0))
     }
+
+    /// Bell around `hz`, for corrective cuts (§5.17).
+    static func peaking(_ hz: Double, q: Double, gainDb: Double,
+                        sampleRate: Double = VoiceChanger.sampleRate) -> BiquadCoefficients {
+        let amplitude = pow(10, gainDb / 40)
+        let w0 = 2 * Double.pi * hz / sampleRate
+        let alpha = sin(w0) / (2 * q)
+        let cosw = cos(w0)
+        let a0 = 1 + alpha / amplitude
+        return BiquadCoefficients(
+            b0: Float((1 + alpha * amplitude) / a0),
+            b1: Float((-2 * cosw) / a0),
+            b2: Float((1 - alpha * amplitude) / a0),
+            a1: Float((-2 * cosw) / a0),
+            a2: Float((1 - alpha / amplitude) / a0))
+    }
+
+    /// Shelf above `hz`, slope 1 (the RBJ S = 1 case).
+    static func highShelf(_ hz: Double, gainDb: Double,
+                          sampleRate: Double = VoiceChanger.sampleRate) -> BiquadCoefficients {
+        let amplitude = pow(10, gainDb / 40)
+        let w0 = 2 * Double.pi * hz / sampleRate
+        let cosw = cos(w0)
+        let alpha = sin(w0) / 2 * sqrt(2)
+        let twoRootA = 2 * sqrt(amplitude) * alpha
+        let a0 = (amplitude + 1) - (amplitude - 1) * cosw + twoRootA
+        return BiquadCoefficients(
+            b0: Float((amplitude * ((amplitude + 1) + (amplitude - 1) * cosw + twoRootA)) / a0),
+            b1: Float((-2 * amplitude * ((amplitude - 1) + (amplitude + 1) * cosw)) / a0),
+            b2: Float((amplitude * ((amplitude + 1) + (amplitude - 1) * cosw - twoRootA)) / a0),
+            a1: Float((2 * ((amplitude - 1) - (amplitude + 1) * cosw)) / a0),
+            a2: Float(((amplitude + 1) - (amplitude - 1) * cosw - twoRootA) / a0))
+    }
+
+    /// Flush-to-zero for recursive state. Anything below −400 dB is silence,
+    /// and letting filter/envelope/echo state decay into the subnormal range
+    /// makes every multiply on it ~100× slower on the Intel slice — a cost
+    /// spike on the RT thread, paid exactly when the input goes digitally
+    /// silent. It lives here because every recursive stage in this app is
+    /// either a biquad or sits beside one.
+    @inline(__always)
+    static func flushDenormal(_ value: Float) -> Float {
+        abs(value) < 1e-20 ? 0 : value
+    }
 }
 
 enum AutotuneMode: Int32 {
@@ -348,15 +392,6 @@ public final class VoiceChanger {
         return buffer
     }
 
-    /// Flush-to-zero for recursive state. Anything below −400 dB is silence,
-    /// and letting filter/echo state decay into the subnormal range makes
-    /// every multiply on it ~100× slower on the Intel slice — a cost spike
-    /// on the RT thread, paid exactly when the input goes digitally silent.
-    @inline(__always)
-    private static func flushDenormal(_ value: Float) -> Float {
-        abs(value) < 1e-20 ? 0 : value
-    }
-
     /// Picks up a new program when the main thread has published one. A lost
     /// trylock means the setter held the lock this instant; the RT path keeps
     /// the previous program for one more slice, which is inaudible.
@@ -453,14 +488,14 @@ public final class VoiceChanger {
             // silent stretch cannot decay them into subnormals).
             if p.filter1On {
                 let y = p.filter1.b0 * x + f1z1
-                f1z1 = Self.flushDenormal(p.filter1.b1 * x - p.filter1.a1 * y + f1z2)
-                f1z2 = Self.flushDenormal(p.filter1.b2 * x - p.filter1.a2 * y)
+                f1z1 = BiquadCoefficients.flushDenormal(p.filter1.b1 * x - p.filter1.a1 * y + f1z2)
+                f1z2 = BiquadCoefficients.flushDenormal(p.filter1.b2 * x - p.filter1.a2 * y)
                 x = y
             }
             if p.filter2On {
                 let y = p.filter2.b0 * x + f2z1
-                f2z1 = Self.flushDenormal(p.filter2.b1 * x - p.filter2.a1 * y + f2z2)
-                f2z2 = Self.flushDenormal(p.filter2.b2 * x - p.filter2.a2 * y)
+                f2z1 = BiquadCoefficients.flushDenormal(p.filter2.b1 * x - p.filter2.a1 * y + f2z2)
+                f2z2 = BiquadCoefficients.flushDenormal(p.filter2.b2 * x - p.filter2.a2 * y)
                 x = y
             }
 
@@ -481,8 +516,8 @@ public final class VoiceChanger {
             // ×feedback per round trip forever, and without a floor it would
             // spend seconds circulating subnormals after the room goes quiet.
             if p.echoMix > 0 {
-                let wet = Self.flushDenormal(echoBuf[(echoWrite - echoDelay) & echoMask])
-                echoDampState = Self.flushDenormal(
+                let wet = BiquadCoefficients.flushDenormal(echoBuf[(echoWrite - echoDelay) & echoMask])
+                echoDampState = BiquadCoefficients.flushDenormal(
                     echoDampState + (wet - echoDampState) * (1 - p.echoDamp))
                 echoBuf[echoWrite & echoMask] = x + echoDampState * p.echoFeedback
                 echoWrite += 1

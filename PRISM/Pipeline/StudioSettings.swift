@@ -350,6 +350,8 @@ public struct StudioSettings: Codable, Equatable {
         panic = decode(.panic, PanicSettings())
         lag = decode(.lag, LagSettings())
         voice = decode(.voice, VoiceSettings())
+        cleanup = decode(.cleanup, VoiceCleanupSettings())
+        micWatch = decode(.micWatch, MicWatchSettings())
         connection = decode(.connection, ConnectionSettings())
         capture = decode(.capture, CaptureSettings())
         apps = decode(.apps, AppRulesSettings())

@@ -63,11 +63,11 @@ public enum MenuBarState: Equatable {
     case badConnection // filled + wifi badge: §5.14 fake bad connection on air
     case lagging       // filled + hourglass badge: deliberate delay engaged
     case frozen        // filled + pause bar
-    case muted         // filled + slash
     /// Muted, and the microphone is hearing speech anyway. Its own glyph
     /// because it is the one state the user is provably not aware of — they
     /// are talking.
     case mutedTalking  // filled + slash, red tint
+    case muted         // filled + slash
     case panicked      // filled + raised hand, red tint
     case error         // filled, red tint
 }
@@ -127,27 +127,43 @@ public struct WarningMessage: Equatable, Identifiable {
     }
 }
 
-/// Something that already happened and went right — the mirror image of
-/// WarningMessage, which is a standing "this is wrong, here is the fix".
+/// The second row under the status line (§8.3): something PRISM noticed.
+/// Deliberately a separate slot from WarningMessage, which is a standing
+/// "this is wrong, here is the fix" — there is exactly one warning, and
+/// posting through it would evict a fact (the camera is gone) in favour of
+/// a hint. Two slots, two questions, no race to be the last writer.
 ///
-/// A notice is an event, not a condition: it is worth confirming once and
-/// then forgetting, which is why it carries the moment it happened and, when
-/// the event produced a file, the file itself. Saving a still that lands
-/// somewhere the user cannot find is the same as not saving it.
+/// Most notices are events: something happened, it went right, it is worth
+/// confirming once and then forgetting. That is why one carries the moment
+/// it happened and, when the event produced a file, the file itself — a
+/// still that lands somewhere the user cannot find is a still that was not
+/// saved. A few are conditions instead ("you're muted and talking", §5.17),
+/// and those carry an `action` and are cleared by whoever posted them when
+/// the condition goes away rather than by the expiry timer.
 public struct NoticeMessage: Equatable, Identifiable {
+    /// The one button the row offers, if any.
+    public enum Action: Equatable {
+        /// §5.17 muted-and-talking. The fix is one keystroke, so offer it.
+        case unmute
+        case none
+    }
+
     public var id = UUID()
     public var text: String
     public var symbolName: String
     public var fileURL: URL?
+    public var action: Action
     public var date: Date
 
     public init(text: String,
                 symbolName: String = "checkmark.circle",
                 fileURL: URL? = nil,
+                action: Action = .none,
                 date: Date = Date()) {
         self.text = text
         self.symbolName = symbolName
         self.fileURL = fileURL
+        self.action = action
         self.date = date
     }
 }

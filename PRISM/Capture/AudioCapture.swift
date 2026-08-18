@@ -5,7 +5,8 @@
 // physical input device via kAudioUnitSubType_HALOutput (input scope enabled
 // on bus 1, output disabled on bus 0), converts to 48kHz stereo interleaved
 // float (AudioConverter when the device rate differs; mono duplicated to both
-// channels), and writes into the shared ring via AudioSink. All conversion
+// channels), runs the microphone chains (§5.17 cleanup, then §5.13 voice
+// effects), and writes into the shared ring via AudioSink. All conversion
 // buffers are preallocated in start(); the render callback performs no
 // allocation, no locking, and no logging.
 //
@@ -140,8 +141,18 @@ public final class AudioCapture {
     /// like every other.
     public var addedLatencyMs: Double {
         Double(effectiveBufferFrames) / deviceSampleRate * 1000.0 + 256.0 / 48_000.0 * 1000.0
-            + voiceChanger.reportedLatencyMs
+            + voiceChanger.reportedLatencyMs + voiceCleanup.reportedLatencyMs
     }
+
+    // MARK: Voice cleanup (§5.17)
+    //
+    // Noise suppression and levelling, ahead of the voice effects in the
+    // chain and independent of them. Costs no latency — deliberately, since
+    // the §6 audio budget has ~1.3 ms of slack over the HAL buffer and the
+    // ring, which is not enough to buy any lookahead worth having. Stored as
+    // a `let` for the same reason the voice changer is: the RT path may call
+    // methods on a constant reference without ARC traffic.
+    public let voiceCleanup = VoiceCleanup()
 
     // MARK: Voice changer (§5.13)
     //
@@ -191,6 +202,33 @@ public final class AudioCapture {
                            into buffer: UnsafeMutablePointer<Float>,
                            maxFrames: Int) -> (cursor: UInt64, frames: Int) {
         micTap.read(from: cursor, into: buffer, maxFrames: maxFrames)
+    }
+
+    // MARK: Input level (§5.17)
+    //
+    // A continuous "is the microphone hearing me" reading, published from
+    // the RT callback into a lock-free mailbox and sampled by the UI on a
+    // timer. Demand-gated: nothing is measured unless something is watching
+    // — a meter on screen, or the muted-and-talking watch, which can only
+    // fire while the microphone is already off air.
+
+    let inputLevel = InputLevelMailbox()
+    /// Same single-writer/lock-on-set-only discipline as isMuted.
+    private var _inputLevelArmed = false
+
+    /// Arms the level meter. Main thread; the RT callback observes the flag
+    /// raw, at worst one IO slice late.
+    public func setInputLevelArmed(_ armed: Bool) {
+        os_unfair_lock_lock(flagLock)
+        _inputLevelArmed = armed
+        os_unfair_lock_unlock(flagLock)
+    }
+
+    /// Newest published RMS and the counter identifying its window. A caller
+    /// that sees the counter twice knows no audio arrived in between and can
+    /// decay its meter instead of freezing it.
+    public var inputLevelReading: (rms: Double, sequence: UInt32) {
+        inputLevel.reading
     }
 
     public init() {
@@ -510,6 +548,10 @@ public final class AudioCapture {
         // post-conversion slice and clear stale effect tails. RT unit is not
         // running here, so touching its buffers is safe.
         voiceChanger.prepare(maxFrames: convertCapacityFrames)
+        // §5.17: the cleanup chain's learned noise floor describes one
+        // room through one microphone. A device swap invalidates it.
+        voiceCleanup.reset()
+        inputLevel.resetAccumulator()
         voicePathInterrupted = false
         // The tap's lap-skip margin must dominate the largest single write.
         micTap.setMaxWriteFrames(convertCapacityFrames)
@@ -575,6 +617,20 @@ public final class AudioCapture {
         let status = AudioUnitRender(unit, ioActionFlags, timeStamp,
                                      busNumber, frameCount, &abl)
         guard status == noErr else { return status }
+
+        // §5.17: the meter is taken from the raw device slice — ahead of
+        // mute, suppression, cleanup and the voice changer — because the
+        // question it answers ("is my microphone hearing me") has to keep
+        // being answerable while muted. That is the whole basis of the
+        // muted-and-talking watch, and it is also what a user checking a
+        // dead-sounding microphone actually wants to see. Off costs one
+        // comparison.
+        if _inputLevelArmed {
+            inputLevel.accumulate(renderData.assumingMemoryBound(to: Float.self),
+                                  frameCount: Int(frameCount),
+                                  channels: clientChannels)
+        }
+
         if suppressed {
             voicePathInterrupted = true
             return noErr
@@ -619,18 +675,28 @@ public final class AudioCapture {
 
         guard frames > 0 else { return noErr }
 
-        // §5.13: the voice effect processes the 48 kHz signal in place,
-        // before mono duplication and before the delay line, so everything
-        // downstream — the deliberate delay included — carries the processed
-        // voice. Off costs one trylock and one comparison.
+        // §5.13/§5.17: both microphone chains process the 48 kHz signal in
+        // place, before mono duplication and before the delay line, so
+        // everything downstream — the deliberate delay included — carries
+        // the processed voice. Each costs one trylock and one comparison
+        // when off.
+        //
+        // Cleanup runs first, and the order is load-bearing: it exists to
+        // hand the effects a clean signal (the autotune detector and the
+        // grain shifter both degrade on a noisy one), and gating a
+        // deliberately ring-modulated or echoed signal afterwards would chew
+        // the effect's own tail.
         if voicePathInterrupted {
             voicePathInterrupted = false
             // RT-safe: bounded memsets of preallocated buffers.
+            voiceCleanup.clearDSPState()
             voiceChanger.clearDSPState()
         }
         if clientChannels == 1 {
+            voiceCleanup.processMono(samples, frameCount: frames)
             voiceChanger.processMono(samples, frameCount: frames)
         } else {
+            voiceCleanup.processStereoInterleaved(samples, frameCount: frames)
             voiceChanger.processStereoInterleaved(samples, frameCount: frames)
         }
 

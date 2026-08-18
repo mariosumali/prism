@@ -1,8 +1,9 @@
 // VoicePane.swift
 // PRISM
 //
-// The main window's Voice pane (§5.13): the roomier surface over the same
-// voice-changer intents the popover uses. Behaviour rather than look, so it
+// The main window's Voice pane (§5.13, §5.17): the roomier surface over the
+// same microphone intents the popover uses — level meter, cleanup, effects,
+// mic check. Behaviour rather than look, so it
 // edits AppState.studio directly and never touches the draft — the same
 // rule as MomentsPane, and the same reason: a preset switch must not change
 // what you sound like.
@@ -16,11 +17,61 @@ struct VoicePane: View {
 
     var body: some View {
         Form {
+            levelSection
+            cleanupSection
             voiceSection
             micCheckSection
             castSection
         }
         .formStyle(.grouped)
+    }
+
+    // MARK: - Input level and the muted-and-talking watch (§5.17)
+
+    /// First, because "is my microphone working" outranks every other
+    /// question on this pane.
+    private var levelSection: some View {
+        Section("Microphone") {
+            InputLevelMeter(level: state.inputLevel,
+                            muted: state.isMuted,
+                            showsCaption: true)
+            Toggle("Warn me when I talk while muted",
+                   isOn: micWatchBinding)
+            Text("PRISM notices sustained speech into a muted microphone and marks the menu bar either way. This adds a banner in the dropdown. It fires once per mute — a cough won't set it off, and it won't keep asking if you're talking over the mute on purpose.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Cleanup (§5.17)
+
+    private var cleanupSection: some View {
+        Section("Cleanup") {
+            Picker("Cleanup", selection: cleanupBinding) {
+                ForEach(VoiceCleanupMode.allCases) { mode in
+                    Text(mode.displayName).tag(mode)
+                }
+            }
+            // Same split the voice changer uses one section down: the
+            // picker is what kind of tidying, the slider is how hard the
+            // room gets pushed under. Disabled rather than hidden while
+            // off, so the control does not appear out of nowhere.
+            PrismSliderRow(label: "Strength",
+                           value: cleanupAmountBinding,
+                           range: 0.2...1,
+                           defaultValue: 0.7,
+                           fractionDigits: 2)
+                .disabled(!state.isVoiceCleanupActive)
+            Text(state.studio.cleanup.mode.blurb)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("Noise gate, denoise, gentle compression and — in Studio — a light corrective EQ, in that order, ahead of any voice effect. Independent of the effects: you can clean up a chipmunk.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("Nothing here looks ahead, so it costs no latency at all. That is why there is no spectral denoiser: buying one would need a window of delay, and the audio budget has no room for it.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
     }
 
     // MARK: - Mic check (§5.13)
@@ -124,5 +175,23 @@ struct VoicePane: View {
         Binding(
             get: { state.studio.voice.amount },
             set: { state.setVoiceAmount($0) })
+    }
+
+    private var cleanupBinding: Binding<VoiceCleanupMode> {
+        Binding(
+            get: { state.studio.cleanup.mode },
+            set: { state.setVoiceCleanupMode($0) })
+    }
+
+    private var cleanupAmountBinding: Binding<Double> {
+        Binding(
+            get: { state.studio.cleanup.amount },
+            set: { state.setVoiceCleanupAmount($0) })
+    }
+
+    private var micWatchBinding: Binding<Bool> {
+        Binding(
+            get: { state.studio.micWatch.isEnabled },
+            set: { state.setMicWatchEnabled($0) })
     }
 }

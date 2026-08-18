@@ -2,9 +2,13 @@
 // PRISM
 //
 // Microphone cleanup — noise suppression and room tone — and the
-// muted-but-talking detector. Both sit beside the voice changer (§5.13) in
-// StudioSettings for the same reason it does: how you sound is behaviour, and
-// a preset switch must never silently change it.
+// muted-but-talking detector (§5.17). Both hang off StudioSettings rather
+// than a preset for the same reason the voice changer (§5.13) does: how you
+// sound is behaviour, and switching from Meeting to Studio must never
+// quietly start gating your room.
+//
+// The DSP that these settings describe is in PRISM/Capture/VoiceCleanup.swift
+// and PRISM/Capture/InputLevel.swift; nothing here knows about samples.
 //
 // Licensed under the Apache License, Version 2.0.
 
@@ -14,10 +18,11 @@ import Foundation
 /// slider because the honest description of the middle setting is "removes
 /// the fan" and of the last one is "removes the room" — a percentage would
 /// suggest a continuum the processing does not actually have.
-public enum VoiceCleanupMode: String, Codable, CaseIterable {
+public enum VoiceCleanupMode: String, Codable, CaseIterable, Identifiable {
     /// Honest pass-through, and the default: cleanup is signal processing on
     /// every buffer, and a resident agent must cost nothing for a feature
-    /// nobody switched on.
+    /// nobody switched on. `.off` is bit-exact — VoiceCleanup returns before
+    /// touching a sample — which is asserted by test.
     case off
     /// Steady broadband noise only — fans, air conditioning, hiss.
     case cleanUp
@@ -26,11 +31,22 @@ public enum VoiceCleanupMode: String, Codable, CaseIterable {
     /// deliberate choice rather than the default.
     case studio
 
+    public var id: String { rawValue }
+
     public var displayName: String {
         switch self {
         case .off: return "Off"
         case .cleanUp: return "Clean up"
         case .studio: return "Studio"
+        }
+    }
+
+    /// One line of what it does, in §8.4 voice.
+    public var blurb: String {
+        switch self {
+        case .off: return "Your microphone, exactly as it arrives."
+        case .cleanUp: return "Rumble and room noise out, levels evened up. Still sounds like you."
+        case .studio: return "Harder on the room, with a little presence added. Radio voice."
         }
     }
 }

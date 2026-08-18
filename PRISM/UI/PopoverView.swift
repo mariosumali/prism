@@ -57,6 +57,9 @@ struct PopoverView: View {
                 warningRow(warning)
                     .padding(.bottom, Metrics.sectionGap)
             }
+            // Its own row, below the warning: a notice is something PRISM
+            // noticed, not something that went wrong, and the two must be
+            // able to show at once (§5.17).
             if let notice = state.notice {
                 noticeRow(notice)
                     .padding(.bottom, Metrics.sectionGap)
@@ -332,10 +335,14 @@ struct PopoverView: View {
     /// The mirror of the warning row: something that went right, and — when
     /// it produced a file — the one button that answers "where did it go?".
     /// A saved file the user cannot find is a file that was not saved.
+    ///
+    /// A notice carrying an action is not a confirmation, it is a standing
+    /// condition asking to be fixed (§5.17), so it drops the green and takes
+    /// the orange — still not the red, which §8.2 reserves for wrong.
     private func noticeRow(_ notice: NoticeMessage) -> some View {
         HStack(spacing: Metrics.itemGap) {
             Image(systemName: notice.symbolName)
-                .foregroundStyle(.green)
+                .foregroundStyle(notice.action == .none ? Color.green : Color.orange)
             Text(notice.text)
                 .font(.caption)
                 .fixedSize(horizontal: false, vertical: true)
@@ -346,6 +353,14 @@ struct PopoverView: View {
                     state.dismissNotice()
                 }
                 .controlSize(.small)
+            }
+            switch notice.action {
+            case .unmute:
+                Button("Unmute") { state.toggleMute() }
+                    .controlSize(.small)
+                    .buttonStyle(.borderedProminent)
+            case .none:
+                EmptyView()
             }
         }
     }
