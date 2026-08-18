@@ -92,6 +92,7 @@ texture format, not the shader). Include `KernelTypes.h` for param structs.
 | `prism_gaze` | Gaze.metal | src t0, dst t1, `constant PRISMGazeParams&` b0 — per-eye inverse warp: rigid across the iris disc, pinned at the lid ellipse, sclera stretches between. Eyes with `valid == 0` contribute nothing; outside both lid ellipses the output is an exact copy |
 | `prism_background_replace` | Layers.metal | src t0, bg t1, mask t2, dst t3, `constant PRISMBackgroundParams&` b0 — mask hardened by `maskContrast` and feathered by `edgeSoftness`; `lightWrap` bleeds background into the rim (peaks at mask 0.5); `useTexture == 0` uses `flatColor` |
 | `prism_overlay` | Layers.metal | base t0, layer t1, mask t2, dst t3, `constant PRISMOverlayParams&` b0 — `uvTransform` maps output UV → layer UV (bottom row 0 0 1); outside [0,1] writes base unchanged; chroma/luma key in YCbCr with hue-agnostic despill; `placement == 1` multiplies alpha by `1 − mask` |
+| `prism_style_<case>` | Style.metal | one kernel per `StyleEffect` case (23: every case except `normal`), named from the case's raw value. Stateless effects: src t0, dst t1, `constant PRISMStyleParams&` b0. Motion effects (`isTemporal`): src t0, history t1, dst t2, b0 — history holds the previous styled output (the stage blits dst → history each frame); `hasHistory == 0` means undefined history and the output must equal the source exactly (seeds the feedback). Shared contract: intensity 0 reproduces the source exactly (color looks `mix`, warps scale displacement, discrete remaps crossfade, motion effects scale trails); `time` animates VHS/Wave/Underwater/Glitch/Strobe; `aspect` keeps radial and horizontal motion true on screen |
 
 ---
 
@@ -134,6 +135,8 @@ public final class VideoPipeline {
     public let blurStage: BlurStage
     public let backgroundStage: BackgroundStage
     public let overlayStage: OverlayStage
+    public let styleStage: StyleStage
+    public let connectionStage: ConnectionStage
     public let outputFitStage: OutputFitStage
 
     /// Shared by blur, virtual background, behind-placed overlay layers and
@@ -279,6 +282,12 @@ public final class ReplayPlayer {
     /// §5.12. Holds the current live frame for `delaySeconds`, then resumes
     /// at 1× permanently that far behind — a delay line, not a rewind.
     @discardableResult public func startLag(delaySeconds: Double) -> Bool
+    /// §5.12. Retargets an engaged delay live: deepening holds the current
+    /// frame until the difference is absorbed (never rewinds); shortening
+    /// drops exactly the difference in backlog. No-op during a catch-up and
+    /// for changes under 10 ms. The rebase arithmetic is the pure static
+    /// `retarget(base:elapsed:newest:target:)`, exposed for tests.
+    public func adjustLag(toSeconds target: Double)
     /// Consumes the lag backlog at `rate` until it reaches live, then fires
     /// `onReplayFinished`. `stop()` is the snap-back path.
     public func beginCatchUp(rate: Double)
@@ -426,6 +435,17 @@ public final class AudioCapture {
     public var isSuppressed: Bool { get set }      // atomic flag
     public private(set) var effectiveBufferFrames: Int   // 256 requested (§4.4)
     public var addedLatencyMs: Double { get }      // buffer/48k*1000 + ring estimate
+                                                   // + voiceChanger.reportedLatencyMs
+    /// §5.13 voice changer: parameters from the main thread via apply();
+    /// processing on the RT callback between conversion and the ring write.
+    public let voiceChanger: VoiceChanger
+    /// §5.13 mic check tap: a passive, armed-on-demand copy of the
+    /// post-effect mono signal. Arm from the main thread; read at leisure.
+    public func setMicTapArmed(_ armed: Bool)
+    public var micTapCursor: UInt64 { get }
+    public func readMicTap(from cursor: UInt64,
+                           into buffer: UnsafeMutablePointer<Float>,
+                           maxFrames: Int) -> (cursor: UInt64, frames: Int)
     public init()
     public func start(deviceUID: String?)          // nil = default input
     public func stop()
@@ -434,9 +454,77 @@ public final class AudioCapture {
 ```
 
 Render callback: pull from HALOutput input scope, convert to 48kHz stereo
-float interleaved (AudioConverter when needed, mono duplicated), then
-`sink.write(...)`. **The callback body must be free of ObjC/Swift
-allocation; preallocate all conversion buffers in `start`.**
+float interleaved (AudioConverter when needed), process through the voice
+changer (§5.13, mono duplicated after), then `sink.write(...)`. **The
+callback body must be free of ObjC/Swift allocation; preallocate all
+conversion buffers in `start`.**
+
+### VoiceChanger (`PRISM/Capture/VoiceChanger.swift`)
+
+```swift
+public enum VoiceEffect: String, Codable, CaseIterable, Identifiable {
+    case off, chipmunk, helium, deep, giant, alien, robot, autotune,
+         telephone, cave, underwater
+    public var displayName: String { get }
+    public var blurb: String { get }               // one line, §8.4 voice
+}
+
+public final class VoiceChanger {
+    public init()
+    /// Main thread. Builds the DSP program for the settings and publishes it
+    /// to the RT path through a trylock mailbox; never blocks the RT thread.
+    public func apply(_ settings: VoiceSettings)
+    /// ~21 ms while a pitched effect is engaged, else 0 (§5.13). Folded into
+    /// AudioCapture.addedLatencyMs.
+    public private(set) var reportedLatencyMs: Double
+    /// Capture setup path only, RT unit stopped: sizes the mixdown scratch
+    /// and clears all DSP state.
+    public func prepare(maxFrames: Int)
+    public func reset()
+    // RT-only, in-place 48 kHz processing (internal):
+    // processMono(_:frameCount:), processStereoInterleaved(_:frameCount:)
+    // clearDSPState() — RT-safe state clear (bounded memsets); the RT path
+    // runs it on resume from mute/suppression and on off→on transitions so
+    // a delay line never replays audio from before the interruption.
+}
+```
+
+`VoiceSettings` lives in `StudioSettings` (behaviour, not look — a preset
+switch must not change what you sound like). Pure, testable pieces:
+`detectFrequency` (normalised autocorrelation over a caller-supplied
+scratch), `chromaticTarget`, and the static `program(for:amount:)` table.
+
+### MicCheck (`PRISM/Capture/MicCheck.swift`)
+
+```swift
+@MainActor
+public final class MicCheck: ObservableObject {          // §5.13 mic check
+    public enum Phase: Equatable { case idle, recording, playing }
+    @Published public private(set) var phase: Phase
+    @Published public private(set) var level: Double          // 0…1 meter
+    @Published public private(set) var recordedSeconds: Double
+    @Published public private(set) var heardNothing: Bool     // silent take
+    public var hasTake: Bool { get }
+    public static let maxSeconds: Double                      // 5
+    public func toggle()      // idle → record; recording → stop-and-play; playing → stop
+    public func replay()
+    public func cancel()      // hard stop, used on quit
+}
+```
+
+Internals kept testable: `MicTapRing` (SPSC tap ring — the RT writer
+release-stores its head through the `PRISMAtomicU64StoreRelease` shim in
+RingBuffer.h, the main-thread reader acquire-loads it, so a head snapshot
+at arm time is an exact start-of-take marker), the `MicCheckPlaying`
+playback seam (AVAudioEngine in production, fakes in tests), and the static
+`displayLevel(of:)` meter scaling. Recording ends on the frame cap or a
+wall-clock deadline, whichever first — a starved tap can never strand the
+phase. Owned by AppState as a directly observable sub-object (`public let
+micCheck`), alongside `AppState.micCheckInhibition: String?` — the reason
+recording is refused (muted / no mic permission / clip owns the ring), nil
+when it may run. AppState cancels an in-flight recording when an inhibition
+appears mid-take (mute, clip audio, capture demand dropping), so a take the
+app itself silenced is never misdiagnosed as a dead microphone.
 
 ### DeviceMonitor (`PRISM/Capture/DeviceMonitor.swift`)
 
@@ -446,6 +534,12 @@ public final class DeviceMonitor {
     public var onMicrophonesChanged: (([AudioDeviceInfo]) -> Void)?   // main thread
     /// Fired when the *selected* device vanished; name for the warning row.
     public var onWake: (() -> Void)?                                  // §7
+    /// Some process is recording from "PRISM Microphone"
+    /// (kAudioDevicePropertyDeviceIsRunningSomewhere on the virtual device).
+    /// Audio-only capture demand: keeps the mic ring fed with every window
+    /// closed, without turning the camera on. Primed on start(); re-resolved
+    /// on device-list changes (coreaudiod restart = new AudioObjectID).
+    public var onVirtualMicInUseChanged: ((Bool) -> Void)?            // main thread
     public init()
     public func start()
     public func stop()
@@ -563,6 +657,36 @@ public final class BlurStage: EffectStage {        // id .blur, cost .expensive
     /// Segmentation runs when blur enabled OR auto-frame needs it:
     public var maskOnlyMode: Bool { get set }
 }
+public final class StyleStage: EffectStage {       // id .style, cost .moderate
+    /// Setting a new effect compiles (and caches) its pipeline off the
+    /// frame path; declines to encode at Normal or zero intensity. Motion
+    /// effects (StyleEffect.isTemporal) feed on a stage-owned history
+    /// texture (previous styled output, refreshed by a dst → history blit
+    /// in the same command buffer). Stale ghosts never replay: history is
+    /// dropped (texture released) on effect change, disable, zero
+    /// intensity, and size change, and ages out across any encoding gap
+    /// > 0.5s. Pipeline/texture-layout/history change together under one
+    /// lock — encode() snapshots them once and re-validates before
+    /// publishing history, so a mid-encode switch can never pair one
+    /// effect's kernel with another's texture bindings.
+    public var settings: StyleSettings { get set }
+}
+public final class ConnectionStage: EffectStage {  // id .connection, cost .cheap
+    public var settings: ConnectionSettings        // pushed by applyStudio
+    /// Engage/release (§5.14 intent, like freeze — never preset-driven).
+    /// Releasing drops the held frame and throttle anchor.
+    public func setEngaged(_ engaged: Bool)
+}
+/// ConnectionStage's frame-rate throttle, pure and Metal-free for tests:
+/// first call refreshes, a backwards clock re-anchors, reset() re-opens.
+/// Intervals are jittered around the mean (0.35–1.05× nominal, ~10% stalls
+/// of 3–7×) from a seeded xorshift — deterministic per seed, `fps` is the
+/// honest mean of the cadence.
+public struct ConnectionFrameGate {
+    public init(seed: UInt64 = ...)                // default fixed seed
+    public mutating func shouldRefresh(at now: Double, fps: Double) -> Bool
+    public mutating func reset()
+}
 public final class OutputFitStage: EffectStage {   // id .outputFit, cost .cheap, always enabled
     public var outputSize: CGSize
     public var contentMode: ClipFillMode           // letterbox default
@@ -644,6 +768,7 @@ public final class Hotkeys {
     public var onFreeze: (() -> Void)?             // ⌥⌘F
     public var onMute: (() -> Void)?               // ⌥⌘M
     public var onFreezeAndMute: (() -> Void)?      // ⌥⌘⇧F
+    public var onVoice: (() -> Void)?              // ⌃⌥⌘V (§5.13)
     public var onPreset: ((UUID) -> Void)?
     public func setPresetBindings(_ bindings: [(UUID, HotkeyCombo)])
     public func start()   // CGEventTap listen-only; NSEvent global monitor fallback
@@ -660,7 +785,7 @@ public final class Permissions: ObservableObject {
 }
 ```
 
-Key codes: F = 3, M = 46 (ANSI).
+Key codes: F = 3, M = 46, V = 9 (ANSI).
 
 ### AppState (`PRISM/AppState.swift`) — written in the integration phase
 
@@ -689,6 +814,7 @@ public final class AppState: ObservableObject {
     @Published public var isPanicked: Bool
     @Published public var isLagging: Bool
     @Published public var isCatchingUp: Bool
+    @Published public var isBadConnection: Bool        // §5.14, never persisted
     @Published public var eyeContactTracking: Bool
     // Clip
     @Published public var clipState: ClipState
@@ -748,6 +874,11 @@ public final class AppState: ObservableObject {
     public func toggleAway()
     public func togglePanic()
     public func toggleEyeContact()
+    // Voice changer (§5.13)
+    public var isVoiceActive: Bool { get }
+    public func setVoiceEffect(_ effect: VoiceEffect)  // .off = same intent as off
+    public func setVoiceAmount(_ amount: Double)
+    public func toggleVoice()                          // ⌃⌥⌘V, recalls last effect
     // Lag switch (§5.12)
     public func engageLag()
     public func releaseLag()
@@ -755,6 +886,13 @@ public final class AppState: ObservableObject {
     /// Hotkey edge: `true` on keyDown, `false` on keyUp. A press while
     /// already lagging releases, so a missed key release cannot strand it on.
     public func handleLagKey(pressed: Bool)
+    // Bad connection (§5.14): visual degrade always engages; the delay half
+    // rides the §5.12 transport and is skipped (with a warning) when the
+    // rolling buffer cannot carry it. Release snaps a self-engaged delay
+    // back to live and never touches one the user engaged separately.
+    public func engageBadConnection()
+    public func releaseBadConnection()
+    public func toggleBadConnection()                  // ⌥⌘B
     public func updateConfig(_ mutate: (inout PipelineConfiguration) -> Void)
     public func setActiveFormat(_ format: VideoFormat)     // free within published set
     public func requestPublishedFormatsChange(_ formats: [VideoFormat])  // reconnect confirm if clients live
@@ -764,6 +902,7 @@ public final class AppState: ObservableObject {
     public func selectPreset(_ id: UUID)                   // 200ms crossfade, §5.5
     public func saveCurrentAsPreset(named: String)
     public func importLUT(from url: URL)
+    public func setStyleEffect(_ effect: StyleEffect)      // .normal = same intent as off
     public func raiseBudgetOneStep()                       // policy pressure action
     public func toggleSection(_ s: PopoverSection)
     public func quit()
@@ -785,7 +924,8 @@ public final class AppState: ObservableObject {
 - `LatencyMeter.swift` — §8.6 exactly (4pt bar, thresholds, 1s smoothing,
   hover breakdown popover, click → expand Format section, a11y variants).
 - `PresetBar.swift`, `EffectsSection.swift`, `FormatSection.swift`,
-  `FramingSection.swift`, `OnboardingView.swift` (three-step state machine
+  `FramingSection.swift`, `VoiceSection.swift` (§5.13 effect picker + on-air
+  honesty caption), `OnboardingView.swift` (three-step state machine
   §9 + persistent setup banner), `SettingsView.swift` (deeper controls:
   pan, crop aspect, orientation, per-adjustment sliders, published format
   set editor, hotkey list, login item toggle, LUT management).
@@ -841,19 +981,27 @@ AudioServerPlugInDriverInterface vtable, plug-in object properties),
 
 Object IDs: plug-in 1, device 2, input stream 3. Device per §4.2 exactly:
 UID "horse.prism.PRISM.audio.device", name "PRISM Microphone", 48k only,
-2ch float32 **non-interleaved** (two AudioBuffers in the ABL), safety
+2ch float32 **interleaved** (8 bytes per frame — `ioMainBuffer` is a raw
+sample block, never an `AudioBufferList`; see SPEC §4.2), safety
 offset 512, ZTS period 4096, `kAudioDeviceTransportTypeVirtual`, input
 only, no controls. `Initialize` maps the ring via
 `PRISMRingBufferOpenConsumer` (never fails hard — device still publishes
 and emits silence if mapping fails). IO:
 
-- `StartIO` → anchor timestamps (`mach_absolute_time`), rate-scalar 1.0.
+- `StartIO` → anchor timestamps (`mach_absolute_time`), rate-scalar 1.0,
+  and anchor device sample time 0 to the ring's write index.
 - `GetZeroTimeStamp` → advance every 4096 frames.
-- `DoIOOperation(kAudioServerPlugInIOOperationReadInput)` → read
-  interleaved from ring via `PRISMRingBufferRead` into a preallocated
-  scratch, de-interleave into the two ABL buffers; silence when
-  `PRISMRingBufferProducerIsAlive` is false. No locks/allocation/logging
-  on the IO path (a static scratch sized for 4096 frames is fine).
+- `DoIOOperation(kAudioServerPlugInIOOperationReadInput)` → idempotent
+  sample-time-indexed read straight out of the mapped ring (no cursor, no
+  scratch): the cycle's input time maps to ring positions via the StartIO
+  anchor, so N simultaneous clients get the same audio. The anchor
+  **self-heals**: when a requested window ends ahead of the write head
+  (producer started after StartIO, app restarted) or more than
+  `kPRISM_MaxCushionFrames` behind it (clock drift), it slides so the
+  window lands `kPRISM_ReanchorCushionFrames` (1024, ~21ms) behind the
+  write head — one splice instead of permanent silence. De-interleave into
+  the two ABL buffers; silence when `PRISMRingBufferProducerIsAlive` is
+  false. No locks/allocation/logging on the IO path.
 - `WillDoIOOperation` → true only for ReadInput.
 
 ---
@@ -867,6 +1015,18 @@ and emits silence if mapping fails). IO:
   system/com.apple.audio.coreaudiod`).
 - `Tools/notarize.sh` — `xcrun notarytool submit --keychain-profile
   "PRISM_NOTARY" --wait` + staple, for both artifacts.
+- `Tools/driver_smoke/` — `main.cpp` + `run.sh`: links the driver sources
+  directly and asserts §4.2 properties plus IO against the real SHM ring,
+  including anchor self-healing. Calls the driver's entry points itself, so
+  it can only prove the driver agrees with the *test's* model of the HAL
+  contract — pair it with `mic_probe` before believing the device works.
+- `Tools/mic_probe/` — `main.c` + `run.sh`: records from the installed
+  "PRISM Microphone" through the real HAL and fails on silence, printing
+  ring counters beside the delivered audio so a failure is attributable to
+  the driver (ring advancing, output silent) or the app (ring frozen).
+  `--control` records the built-in mic to prove the probe holds microphone
+  permission. This is the only test that catches a driver which satisfies
+  `driver_smoke` yet publishes silence to every client.
 - `Tools/latency_harness/` — `harness.swift` + `run.sh`: builds a CLI that
   measures (a) ring-buffer traversal latency self-test, (b) virtual camera
   glass-to-glass estimate by timestamping a generated test pattern pushed

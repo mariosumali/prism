@@ -133,6 +133,12 @@ Default behavior is transparent pass-through. On top of that, PRISM adds:
   The delay is always stated outright — the latency meter keeps measuring
   what PRISM costs you involuntarily, and the status line gains `+3.0 s lag`
   next to it.
+- **Bad connection** (⌥⌘B) — one switch that makes the feed look like a
+  struggling network: macroblock pixelation, starved colour, a collapsed
+  frame rate, and (by default) a short fall behind live riding the lag
+  switch's transport. One severity knob drives all of it, because "my
+  connection is struggling" is one story, not three settings. The full chain
+  keeps running clean underneath, so recovery is instant.
 
 The rolling buffer behind instant replay and the away loop is **off by
 default** and records only while something is actually using PRISM. An armed

@@ -49,7 +49,7 @@ PRISM/
 │   ├── Pipeline/
 │   │   ├── VideoPipeline.swift     # frame graph orchestration
 │   │   ├── EffectStage.swift       # protocol
-│   │   ├── Stages/                 # Geometry, Adjust, LUT, Blur, Freeze, Clip
+│   │   ├── Stages/                 # Geometry, Adjust, LUT, Style, Blur, Freeze, Clip
 │   │   ├── FrameRing.swift         # 500ms sharpest-frame buffer
 │   │   ├── FormatManager.swift     # advertised format set, negotiation
 │   │   ├── PresetStore.swift       # named user configurations
@@ -186,7 +186,8 @@ Stage order is fixed:
 
 ```
 Clip → Replay → Freeze → Eye contact → Geometry → Adjust → LUT →
-Background blur → Virtual background → Overlay → Output fit → Push
+Background blur → Virtual background → Overlay → Style → Bad connection →
+Output fit → Push
 ```
 
 The three substituting stages come first because they replace the source; everything downstream applies to whatever the source ends up being. They are ordered by escalating authority: a replay overrides a playing clip, and a freeze overrides a replay — each is a more deliberate "stop showing me live" than the one before it. Since every substituting stage writes the whole frame, chain position *is* precedence.
@@ -194,6 +195,10 @@ The three substituting stages come first because they replace the source; everyt
 Eye contact precedes Geometry so the warp happens in the same space Vision measured its landmarks in; putting it after zoom and rotation would mean transforming every landmark through the geometry matrix just to stay aligned. Geometry precedes color so that crop and zoom do not change how a LUT reads.
 
 Background blur, Virtual background and Overlay all consume the same person mask and composite over the finished look, so they run last. Blur and Virtual background are mutually exclusive — they answer the same question — and the UI presents them as one control (§8.7). Overlay follows Virtual background so a foreground layer sits above a replaced background.
+
+Style (§5.4) is the last composing stage: a preset look applies to the finished scene — backdrop and overlays included — exactly as Photo Booth styles a finished photo, not the raw camera under it.
+
+Bad connection (§5.14) runs after everything the user composes, because a struggling network degrades the finished picture — backdrop, overlays, effects and styled look included. A crisp overlay on a pixelated face would give the game away instantly. Like the substituting stages it is engaged by intent, never by a preset.
 
 Output fit is not a user stage — it is the final scale/letterbox into the negotiated format and always runs.
 
@@ -244,11 +249,13 @@ Consequences to accept: the plug-in installs to `/Library/Audio/Plug-Ins/HAL/`, 
 ```
 Sample rate:       48000 Hz (only)
 Channels:          2 (stereo)
-Format:            32-bit float, non-interleaved
+Format:            32-bit float, interleaved (8 bytes per frame)
 Transport type:    kAudioDeviceTransportTypeVirtual
 Safety offset:     512 frames
 Zero timestamp period: 4096 frames
 ```
+
+**Interleaved, not planar.** `DoIOOperation`'s `ioMainBuffer` is one raw block of sample data — `AudioServerPlugIn.h` calls it "the primary buffer for the data for the operation", and `NullAudio` copies frames straight into it. It is *not* an `AudioBufferList`, so a stream has nowhere to put a second per-channel plane. Publishing a non-interleaved format (as v1 did) and reading the buffer as an ABL makes the first sample masquerade as `mNumberBuffers`; against a HAL-zeroed buffer that reads 0, the driver writes nothing, and the device emits silence to every client while the ring underneath carries perfectly good audio. The ring is interleaved too, so ReadInput is a straight copy.
 
 Mono physical sources are duplicated to both channels in PRISM.app before the ring write.
 
@@ -290,7 +297,7 @@ Capacity of 32768 frames is ~683ms at 48kHz — roughly 4× the largest realisti
 
 `AudioCapture` uses an HAL input `AudioUnit` (`kAudioUnitSubType_HALOutput`, input scope enabled, output scope disabled) bound to the selected physical device. Requested IO buffer size: **256 frames**. If the device rejects 256, accept the nearest supported value and surface the resulting latency in the UI.
 
-Sample-rate conversion to 48kHz, when required, uses `AudioConverterRef` in the capture callback. v1 audio processing is pass-through plus mute only — no noise suppression, no gain, no EQ.
+Sample-rate conversion to 48kHz, when required, uses `AudioConverterRef` in the capture callback. Audio processing is pass-through plus mute, the deliberate delay line (§5.12), and the voice changer (§5.13) — no noise suppression, no automatic gain, no EQ. Everything runs inside the capture callback under the §4.3 rules.
 
 ---
 
@@ -362,6 +369,18 @@ Sampling is bilinear below 2× zoom and Lanczos at or above it. Zoom, pan, and r
 **Mirror deserves an explicit note:** most video apps mirror your self-view but send an unmirrored image to everyone else. PRISM sits upstream of that, so a mirror applied here flips what *others* see. Label the control `Flip output` and add the caption `Others will see this flipped` so nobody discovers it mid-interview.
 
 **Auto-framing** is a v1 control, not a separate stage: reuse the `VNGeneratePersonSegmentationRequest` mask already computed for blur to derive a subject bounding box, and drive Geometry's zoom and pan toward keeping it centered. Motion is critically damped with a 1.5s time constant — a camera that snaps is worse than one that doesn't move. Auto-framing requires the segmentation request, so enabling it without blur incurs blur's cost; state that in the UI. Disabled by default.
+
+**Style** (`Style.metal`, `.moderate`) — one preset visual effect over the finished, composed scene: pick an effect from a catalogue, one intensity slider, nothing else to configure. Each effect is its own single-pass compute kernel, selected by name (`prism_style_<case>`), so the catalogue grows by adding a kernel and an enum case. The catalogue is curated toward what plays on a live call — warps, glitches and motion trails, plus a few gadget-camera looks — not color filters. 23 effects in three groups:
+
+| Distortions | Motion | Looks |
+|---|---|---|
+| Bulge, Dent, Twirl, Squeeze, Fish Eye, Stretch, Mirror, Light Tunnel, Kaleidoscope, Wave (animated), Underwater (animated), Glitch (animated), Tiny Planet, RGB Split | Afterimage, Echo, Long Exposure, Strobe | Thermal Camera, X-Ray, Night Vision, VHS (animated), Pixelate |
+
+`Normal` is the unstyled picture — the LUT/Neutral rule applied to a second catalogue: picking `Normal` is the same intent as switching the stage off, every surface treats the two states as one, and the stage declines to encode for it. The kernel contract is that intensity 0 reproduces the source exactly: color looks mix toward the styled picture, warps scale their displacement to zero, discrete remaps (Mirror, Kaleidoscope, Tiny Planet) crossfade, and motion effects scale their trails away.
+
+**Motion effects are the one stateful family.** They feed on their own output: the stage keeps a history texture holding the previous styled frame and blits each frame's result into it inside the same command buffer (one extra blit — no second command buffer, §3.3). The first frame after any seed loss outputs the source untouched and seeds the feedback. Ghosts recorded before a gap never replay: the history (texture included) is dropped on effect change, stage disable, zero intensity, and size change, and — because flag-based invalidation cannot see every gap class (degradation disables, app naps) — trails additionally age out across any encoding gap longer than half a second, measured on the frame path. Undefined history contents must never reach the picture — `hasHistory` gates every read.
+
+Style runs after Overlay and before Bad connection (§3.3): the effect applies to everything the user composed, and a simulated bad connection degrades the styled picture rather than being painted over by it.
 
 Each stage is individually bypassable and individually pinnable (§3.4). Chain order is fixed as specified in §3.3.
 
@@ -509,6 +528,10 @@ Deliberate added latency — the exact inverse of everything else in this docume
 
 **Engaging holds, it does not rewind.** Jumping the output back three seconds would replay the last three seconds — viewers would watch the user say the same thing twice. Instead the output holds the frame it was on for the full delay, and only then resumes at 1×, permanently that far behind. That is what a transport hiccup does and it is what "add latency" means. Audio behaves identically: the delay line emits silence until it has filled.
 
+**The delay is set in exact milliseconds.** The delay row's numeric field is the primary control, not a readout: type `1500`, `1500 ms` or `1500ms` and press Return. Dragging steps in 50 ms so an ordinary gesture lands on round numbers, ⌥-drag is continuous, and double-click resets to 3000 ms. The field is sized to the widest value its range can produce and shows figures ungrouped (`3000 ms`, not `3,000 ms`), because a field you type precise values into must be able to display them. The slider's upper bound is the *lesser* of the rolling buffer's capacity and the 10 s settings clamp, so the control can never offer a figure that would be silently reduced in use.
+
+**The delay is adjustable while engaged.** Changing it mid-lag retargets live (`ReplayPlayer.adjustLag`): deepening rebases onto the frame currently on air and holds it until the extra delay is absorbed — the same stall as engaging, never a rewind — and shortening jumps forward, dropping exactly the difference in backlog: a partial snap-back. Changes under 10 ms are ignored as float noise — deliberately below one slider step and far below anything typed, so every figure the user states is actually applied. A catch-up in flight owns the clock (the control waits), and the mic's delay line follows in one step, since audio has no honest gradual path. When the bad connection (§5.14) owns the delay, its own delay field is the one that retargets live.
+
 **The two paths are delayed by completely different mechanisms, because their costs are nothing alike.** Ten seconds of 48 kHz stereo float is under 4 MB, so the microphone gets a plain preallocated circular buffer on the RT path. Ten seconds of 1080p is gigabytes, so video is delayed by trailing the compressed rolling buffer instead. This is also why the delay cannot exceed the buffer length, and why delayed video passes through the buffer's encoder.
 
 **Release.** *Snap back* cuts to live and never sends the backlog — what a recovering connection does. *Catch up* plays the backlog out at 1.25–4× until it reaches live, so nothing said while lagging is lost. Audio always snaps back regardless: speeding up an audio delay line means resampling or dropping samples, and both sound worse than the skew. Say so in the UI rather than pretending otherwise.
@@ -516,6 +539,63 @@ Deliberate added latency — the exact inverse of everything else in this docume
 **Hold, don't toggle.** The hotkey is momentary by default — a switch you hold is what the name describes, and it cannot be left on by accident. It is the only combo whose key *release* is observed. Releases are matched on the keycode alone: nobody releases ⌥, ⌘ and L in a defined order, and requiring the full combo on the way up would routinely miss the release and strand the switch on. As a second failsafe, a press while already lagging releases.
 
 **Reporting (§6).** The delay is reported in `LatencyReport.deliberateDelayMs`, **separate from** `totalAddedMs`. The latency meter's entire job is showing what PRISM costs you against a budget; folding three seconds of requested delay into it would peg it permanently and destroy the one number this app exists to keep honest. So the meter keeps measuring the involuntary cost, the status line gains `· +3.0 s lag`, and `endToEndMs` is the field that combines them. Never hide a deliberate delay.
+
+### 5.13 Voice changer
+
+Goofy, deliberate voice effects on the microphone path — the audio sibling of the LUT rack.
+
+| Property | Specification |
+|---|---|
+| Trigger | Voice module picker, plus global hotkey ⌃⌥⌘V (toggles the last used effect; ⌥⌘V is Finder's "Move Item Here" and ⌥⇧⌘V is the system Paste and Match Style, so the voice chord takes ⌃) |
+| Effects | Chipmunk, Helium, Deep, Giant, Alien, Robot, Autotune, Telephone, Cave, Underwater |
+| Strength | 0.25…1, default 1 — scales pitch offsets geometrically and mixes linearly |
+| Scope | Live microphone only; clip audio (§5.3) is never processed |
+| Cost | Well under the §6 processing budget per IO slice; pitched effects add ~21 ms of audio latency, reported via `addedLatencyMs` |
+| Mic check | Record ≤ 5 s of the processed microphone, play it back through the default output — a passive tap; the on-air path is untouched |
+
+Everything runs inside the existing RT capture callback (§4.4), between format conversion and the ring write — so the deliberate delay line (§5.12) and the ring both carry the processed voice — and under the same rules: no allocation, no locks (a trylock parameter mailbox that falls back to the previous program), no logging. The chain is time-domain DSP — a dual-grain delay-line pitch shifter, ring modulation, biquad filters, soft-clip drive, tremolo, and a damped feedback echo — and every stage is skipped when its parameters are identity, so `.off` costs one comparison. Stereo microphones are mixed to mono first: a voice is mono, and every effect here deliberately is.
+
+**Autotune is honest pitch quantisation, not synthesis.** An autocorrelation detector (on a ×4-decimated 12 kHz window, ~10 ms hop, with an octave-error guard and parabolic lag refinement) finds the voice's fundamental, snaps it to the nearest semitone — or drags it toward one fixed note, which is what Robot is — and drives the pitch shifter's ratio with a fast glide. The hard snap is the sound people mean by "autotune", so the glide is fast by default. Unvoiced stretches glide back to the base ratio rather than holding the last correction into the next phrase.
+
+**The pitch shifter buys its shift with latency.** The grain window is 2048 frames; the two crossfaded read taps average half a window behind the write head, so a pitched effect adds ~21 ms to the audio path. That exceeds the §6 involuntary budget — which is fine, because it is not involuntary: it is folded into `addedLatencyMs`, shows in the meter's audio figure and the A/V skew readout, and disappears the moment the effect is off. Never hide it.
+
+**The user cannot hear themselves.** PRISM publishes a microphone; it does not monitor one. The main window's Voice pane therefore carries the §8.4 honesty line — everyone else hears the effect, you hear yourself unchanged — the popover's collapsed Voice label names the effect on air, and the menu bar treats an active voice as an active effect (filled prism): forgetting your voice is an alien is the same class of failure as forgetting a freeze.
+
+**The mic check is how you hear yourself anyway.** The honesty line can say what is on air, but only a playback can let you *hear* it — so the Voice surfaces carry a record-then-play-back check, the exact shape of Zoom's mic test: press it, say something (up to 5 s, live level meter), and PRISM plays the take back through the default output. The recording is tapped **after** the voice changer, so the playback is sample-for-sample what the ring — and the call — receives; with the effect off it is a plain mic test. The tap is passive and armed only while recording: the on-air path is never rerouted, never interrupted, and the mic stays live throughout, which the pane says plainly (playing back through speakers near a hot mic is the user's call to make). A take that contains only silence is not played — it is diagnosed: `PRISM didn't hear anything. Check the microphone picker.` The check refuses to record while muted or while clip audio owns the ring, stating why, because recording guaranteed silence and then reporting it would be a lie about the microphone.
+
+**Mute is an acoustic boundary in both directions.** While muted (or while clip audio owns the ring, §5.3) the voice chain does not run, so its delay lines would otherwise freeze holding pre-mute audio — and an unmute would open by replaying the echo tail of the last thing said before the mute. The RT path therefore clears the chain's state on resume from any interruption, and whenever an effect switches from off to on. A mute never leaks sound into the gap, and never replays sound out of it.
+
+Voice settings persist in `StudioSettings`, not in presets: a preset captures a look, and switching from Meeting to Studio must not silently change what you sound like. The ⌃⌥⌘V toggle remembers the last effect used, so a quick unmask does not lose it.
+
+### 5.14 Bad connection
+
+One switch that makes the published feed look like a struggling network: the picture goes blocky and colour-starved, the frame rate collapses, and — by default — the whole feed falls behind live.
+
+| Property | Specification |
+|---|---|
+| Trigger | Moments tile ("Glitch"), plus global hotkey ⌥⌘B (toggle — the stunt runs for minutes, nobody holds a chord through a meeting) |
+| Severity | One knob, 0.1–1, default 0.6, driving block size (4–48 px at 1080p, quadratic), colour steps (34–12 per channel), mean refresh rate (18–6 fps) and per-refresh block-update fraction (0.9–0.4) together |
+| Picture | `ConnectionStage`, one `prism_connection` pass: macroblock pixelation, posterisation, per-block shimmer, and partial refresh against the previous degraded frame; held-frame throttle on a jittered cadence with stalls; effective severity wanders ±30% |
+| Delay | Optional (on by default), 200 ms–10 s, default 1.2 s, riding the §5.12 transport; microphone delayed to match |
+| Release | Instant clean picture; a delay this switch engaged snaps back to live |
+
+**One knob, because "my connection is struggling" is one story.** A real network never pixelates without dropping frames, or drops frames without falling behind; independent sliders would let you dial in a failure mode no network produces, and a stunt you configure mid-call has to be one gesture. Severity maps to all three degradations in one place (`ConnectionSettings`), the settings pane shows what the mapping buys ("19 px blocks · 16 colour steps · 11 fps"), and the severity floor exists because a severity of zero would be an on-switch that changes nothing (§8.7).
+
+**The stage degrades the finished frame, not the camera.** It is the last user stage in the chain (§3.3): backdrop, overlays and effects pixelate together, exactly as an encoder starved of bits would treat them. Underneath, PRISM keeps running the full chain at full rate — the degradation is one cheap pass plus a held texture — so releasing the switch restores a clean picture instantly and costs nothing.
+
+**Uniformity is the tell, so nothing here is uniform.** A whole-frame mosaic at a metronomic frame rate reads as a deliberate filter; three mechanisms break that:
+
+- *Irregular cadence.* The frame gate draws each refresh interval from a jittered distribution around the mean rate — usually a little under it, roughly one draw in ten a stall of 3–7 intervals, the shape of a packet-loss burst. Deterministic per seed, so a cadence can be replayed in tests.
+- *Partial refresh.* Each pass, a per-block lottery updates only `updateFraction` of the blocks; the rest copy last frame's degraded pixels. A moving subject therefore leaves stale blocks behind — the packet-loss smear that is the single most recognisable artifact of real degraded video.
+- *Quality breathing.* The effective severity wanders ±30% around the knob (random-target smoothing, stepped per refresh), the way adaptive bitrate collapses and part-recovers. The knob stays the honest centre of the wander, and every derived value stays inside its documented bounds.
+
+The per-block shimmer is reseeded on every refresh so held frames "boil" between refreshes rather than freezing their noise, and the shimmer is applied before posterisation so blocks flicker between adjacent colour bands — codec artifact, not film grain.
+
+**The delay is the §5.12 lag switch's transport, not a second mechanism.** Same rolling-buffer bound, same hold-then-trail engage, same audio delay line — with the connection's own, shorter default (1.2 s: a struggling connection is behind, not absent). The microphone is always delayed to match, for the §5.12 reason: picture behind live audio reads as broken software. Releasing a delay this switch engaged itself always snaps back — a recovering connection drops its backlog — while a delay the user engaged separately with the lag switch is left alone (`connectionEngagedLag`). If the rolling buffer is off, the visual half still engages and a warning offers to arm the buffer, because a switch that does nothing is worse than a switch that does half and says so.
+
+**Reporting.** Engaged, the menu bar shows the wifi badge (§8.2, outranking the hourglass — the badge names the stunt the user engaged, and the delay is part of it), the Moments caption states the degradation in the settings' own terms ("19 px blocks · ≈11 fps · 1.2 s behind live" — ≈ because the rate is a mean of an irregular cadence), and any delay reports through `LatencyReport.deliberateDelayMs` exactly as §5.12 — never folded into the involuntary meter.
+
+Connection settings persist in `StudioSettings`, not in presets: switching from Meeting to Studio must not silently fake a network problem. Engagement itself is never persisted — PRISM always launches with a clean feed.
 
 ---
 
@@ -613,6 +693,7 @@ enum Metrics {
     static let popoverWidth: CGFloat  = 320
     static let gutter: CGFloat        = 16   // popover horizontal inset
     static let sectionGap: CGFloat    = 16
+    static let metaGap: CGFloat       = 6    // between preview/status/meter/in-use
     static let itemGap: CGFloat       = 8
     static let cardRadius: CGFloat    = 10
     static let tileRadius: CGFloat    = 10
@@ -647,15 +728,16 @@ enum Metrics {
 | Effects active | Filled prism |
 | Replaying | Filled prism with rewind badge |
 | Away | Filled prism with moon badge |
+| Bad connection | Filled prism with wifi badge |
 | Lagging | Filled prism with hourglass badge |
 | Frozen | Filled prism with pause bar |
 | Muted | Filled prism with slash |
 | Panic engaged | Filled prism with raised-hand badge, `.red` tint |
 | Error | Filled prism, `.red` tint |
 
-Precedence: error > panic > away > lagging > replaying > frozen > muted > effects > live > idle.
+Precedence: error > panic > away > bad connection > lagging > replaying > frozen > muted > effects > live > idle.
 
-The four substitution states outrank the effect states because forgetting you are in one is the damaging failure this app can produce. Replay, away and panic each get their own glyph rather than folding into frozen, because *"why can nobody see me moving"* has to be answerable at a glance.
+The substitution states outrank the effect states because forgetting you are in one is the damaging failure this app can produce. Replay, away and panic each get their own glyph rather than folding into frozen, because *"why can nobody see me moving"* has to be answerable at a glance. Bad connection outranks lagging because when the switch engaged the delay itself, the delay is part of the stunt — the badge names what the user engaged.
 
 ### 8.3 Popover layout
 
@@ -666,13 +748,15 @@ The four substitution states outrank the effect states because forgetting you ar
 │  ╔══════════════════════════════╗  │  Preview, 288×162 (16:9)
 │  ║   live output preview        ║  │  10pt corner radius
 │  ╚══════════════════════════════╝  │
-│  1080p · 30 fps · +7.2 ms          │  .caption, monospacedDigit
-│  ▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░  7.2/13.3    │  latency meter, §8.6
+│  1080p · 30 fps  ▓▓▓▓░░░  7.2/13.3 │  status + meter share a row, §8.6
 │  In use by Zoom, FaceTime          │  .caption, .secondary
 │                                    │
 │  ┌────────┐ ┌────────┐ ┌────────┐  │  Control tiles, 64pt tall
 │  │ Freeze │ │  Mute  │ │  Clip  │  │  equal width, 8pt gaps
 │  └────────┘ └────────┘ └────────┘  │
+│  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐   │  Moments tiles, one full row
+│  │Replay││Away ││Panic││ Lag │     │  never a part-filled row
+│  └─────┘ └─────┘ └─────┘ └─────┘   │
 │                                    │
 │  ● Natural  Meeting  Studio  ＋     │  preset bar, horizontal scroll
 │                                    │
@@ -680,9 +764,9 @@ The four substitution states outrank the effect states because forgetting you ar
 │  ┌──────────────────────────────┐  │
 │  │ Zoom      ──●──────    1.4×  │  │
 │  │ Rotate    ────●────      0°  │  │
-│  │ Flip output          ○       │  │
-│  │   Others will see this       │  │  .caption2, .secondary
-│  │   flipped                    │  │
+│  │ Flip output          ●       │  │
+│  │   Others will see this       │  │  .caption2, .secondary — only
+│  │   flipped                    │  │  while the switch is on
 │  │ Auto-frame           ○       │  │
 │  └──────────────────────────────┘  │
 │                                    │
@@ -690,6 +774,7 @@ The four substitution states outrank the effect states because forgetting you ar
 │  ┌──────────────────────────────┐  │
 │  │ Adjust              ● 0.4ms  │  │  per-stage cost, .caption2
 │  │ LUT          Warm ⌄ ● 0.9ms  │  │
+│  │ Style       Twirl ⌄ ● 1.1ms  │  │
 │  │ Blur      Balanced ⌄ ○ 5.8ms │  │
 │  └──────────────────────────────┘  │
 │                                    │
@@ -706,6 +791,25 @@ The four substitution states outrank the effect states because forgetting you ar
 │  ⚙︎                            ✕   │  Settings, Quit
 └────────────────────────────────────┘
 ```
+
+**Density rules.** The preview, status line, latency meter and in-use line
+are metadata about one output, so they are separated by `metaGap`, not
+`sectionGap` — four caption rows floating 16pt apart read as four sections
+that happen to be short. The status line and the meter share a row whenever
+they are adjacent, and the status line prints added latency only when the
+meter is hidden: the same number twice, one line apart, is clutter rather
+than reassurance. A lag callout (§5.12) takes the status line back to a full
+row of its own.
+
+Tile rows are always full. Three tiles across at 320pt, or four when a module
+has four — never a row with one tile and two empty slots.
+
+Explanatory captions appear when the thing they explain is on. "Others will
+see this flipped" under an off switch is noise on every open; as a tooltip
+on the switch it is still discoverable before the fact.
+
+Height fits content up to the visible screen height, then scrolls. A dropdown
+whose bottom is off the display is worse than one that scrolls.
 
 **Progressive disclosure is what keeps this from reading as a control panel.** Default state on first launch: preview, status, tiles, and presets expanded; Framing, Effects, and Format collapsed. A user who only wants freeze and mute never sees a slider. A user who wants to rebuild their camera has everything one disclosure away. Deeper controls — pan, crop aspect, orientation, per-adjustment sliders, published format set editing, hotkey bindings — live in Settings, not the popover.
 
@@ -746,7 +850,13 @@ Sentence case throughout. Active voice. Name things by what the user controls, n
 | Lag absorbing the delay | `Holding — 1.2s of 3.0s absorbed` |
 | Lag engaged | `3.0s behind live` |
 | Lag catching up | `Catching up at 2×…` |
-| Status line while lagging | `1080p · 30 fps · +7.2 ms · +3.0 s lag` |
+| Status line | `1080p · 30 fps` (`· +7.2 ms` only when the meter is hidden) |
+| Status line while lagging | `1080p · 30 fps · +3.0 s lag` |
+| Voice effect on air | `Everyone else hears it — you hear yourself unchanged.` |
+| Mic check recording | `Say something…` |
+| Mic check playing | `This is what everyone else hears.` |
+| Mic check heard silence | `PRISM didn't hear anything. Check the microphone picker.` |
+| Mic check while muted | `Unmute to test your voice` |
 
 Errors state what happened and what to do. They do not apologize and are never vague.
 
@@ -762,9 +872,9 @@ Non-optional, part of the quality floor:
 
 ### 8.6 Latency meter
 
-The meter sits directly under the status line and is always visible — it is the primary feedback loop for every customization decision the user makes.
+The meter sits on the status line — same row when both are shown, otherwise directly beneath it — and is always visible: it is the primary feedback loop for every customization decision the user makes.
 
-- Horizontal bar, 4pt tall, 6pt radius, full popover content width.
+- Horizontal bar, 4pt tall, 6pt radius, taking whatever content width the status line leaves.
 - Fill represents `totalAddedMs / budgetMs`.
 - Fill color: `.green` below 70% of budget, `.yellow` from 70–100%, `.red` above. These are the one justified exception to accent-color-only, because the meter encodes a threshold rather than a brand.
 - Track is `.quaternary`.
@@ -781,7 +891,7 @@ Per-stage cost appears inline in the Effects list at `.caption2` `.secondary`. W
 
 Background blur (§5.4) and virtual backgrounds (§5.7) are separate stages with separate costs, but they answer the same question and cannot both be true — blurring a background you have already replaced is nonsense. They are therefore presented as **one** control with modes: `Off / Blur / Colour / Image / Video`. Two independent switches would let a user construct exactly the nonsense case, and the underlying stage flags are kept consistent for them.
 
-The same reasoning governs where things live. `Effects` holds per-pixel colour work (Adjust, LUT). `Scene` holds everything that changes what is in frame besides you (Background, Overlay, Eye contact). `Moments` holds everything that changes what is on air in *time* rather than space (Replay, Away, Panic).
+The same reasoning governs where things live. `Effects` holds per-pixel colour work (Adjust, LUT, Style). `Scene` holds everything that changes what is in frame besides you (Background, Overlay, Eye contact). `Moments` holds everything that changes what is on air in *time* rather than space (Replay, Away, Panic).
 
 **Replay, away and panic settings are not part of a preset.** A preset captures a look. "How many seconds do you keep in memory" and "what does the panic key do" are not looks, and switching from Meeting to Studio must not silently rearm a hardware encoder or repoint a panic backdrop. They persist separately as `StudioSettings`.
 

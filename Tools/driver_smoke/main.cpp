@@ -15,8 +15,11 @@
 //      hardcoded here on purpose — independent of the driver's constants —
 //      so drift in the driver is caught.
 //   4. A full IO cycle against the real SHM ring: producer writes a known
-//      ramp, StartIO → GetZeroTimeStamp → Begin/Do/EndIOOperation into a
-//      two-buffer non-interleaved ABL, then de-interleave verification.
+//      ramp, StartIO → GetZeroTimeStamp → Begin/Do/EndIOOperation into the
+//      raw interleaved IO buffer coreaudiod actually passes, then sample
+//      verification. The buffer is deliberately NOT an AudioBufferList —
+//      that is the whole point of the check.
+//   4b. Anchor self-healing when the producer starts after StartIO.
 //   5. Silence-when-dead: producerAlive = 0 must yield all zeros.
 //   6. StopIO + final Release with refcount-underflow checks. (The
 //      AudioServerPlugInDriverInterface has no Deinitialize entry point;
@@ -409,10 +412,12 @@ int main()
     // Stream virtual format: 48 kHz, 2 ch, float32, non-interleaved, packed,
     // native-endian — the exact ASBD of SPEC §4.2.
     {
+        // Interleaved: an AudioServerPlugIn's IO buffer is one raw block of
+        // sample data, so a non-interleaved stream format has nowhere to put
+        // its second plane.
         const UInt32 expectedFlags = kAudioFormatFlagIsFloat
                                    | kAudioFormatFlagsNativeEndian
-                                   | kAudioFormatFlagIsPacked
-                                   | kAudioFormatFlagIsNonInterleaved;
+                                   | kAudioFormatFlagIsPacked;
         AudioStreamBasicDescription asbd;
         std::memset(&asbd, 0, sizeof(asbd));
         st = getProp(driver, streamID, addr(kAudioStreamPropertyVirtualFormat),
@@ -427,7 +432,7 @@ int main()
               static_cast<char>(asbd.mFormatID >> 8),
               static_cast<char>(asbd.mFormatID));
         check(asbd.mFormatFlags == expectedFlags,
-              "virtual format flags == Float|NativeEndian|Packed|NonInterleaved "
+              "virtual format flags == Float|NativeEndian|Packed, interleaved "
               "(expected 0x%x, got 0x%x)",
               static_cast<unsigned>(expectedFlags),
               static_cast<unsigned>(asbd.mFormatFlags));
@@ -439,12 +444,12 @@ int main()
         check(asbd.mBitsPerChannel == 32,
               "virtual format bits per channel == 32 (got %u)",
               static_cast<unsigned>(asbd.mBitsPerChannel));
-        // Non-interleaved: per-channel buffers of 4-byte frames.
-        check(asbd.mBytesPerFrame == sizeof(Float32)
-                  && asbd.mBytesPerPacket == sizeof(Float32)
+        // Interleaved: one 8-byte frame carries both channels.
+        check(asbd.mBytesPerFrame == kExpectedChannels * sizeof(Float32)
+                  && asbd.mBytesPerPacket == kExpectedChannels * sizeof(Float32)
                   && asbd.mFramesPerPacket == 1,
-              "virtual format packing: 4 bytes/frame/channel, 1 frame/packet "
-              "(got bpf=%u bpp=%u fpp=%u)",
+              "virtual format packing: 8 bytes/frame (interleaved stereo), "
+              "1 frame/packet (got bpf=%u bpp=%u fpp=%u)",
               static_cast<unsigned>(asbd.mBytesPerFrame),
               static_cast<unsigned>(asbd.mBytesPerPacket),
               static_cast<unsigned>(asbd.mFramesPerPacket));
@@ -531,25 +536,24 @@ int main()
               static_cast<int>(st), willDo);
     }
 
-    // Two-buffer non-interleaved ABL of kIOFrames frames, sentinel-filled so
-    // untouched output is detectable.
-    float left[kIOFrames], right[kIOFrames];
-    alignas(AudioBufferList) unsigned char
-        ablStorage[offsetof(AudioBufferList, mBuffers) + 2 * sizeof(AudioBuffer)];
-    AudioBufferList* abl = reinterpret_cast<AudioBufferList*>(ablStorage);
+    // The IO buffer exactly as coreaudiod passes it: ONE raw block of
+    // interleaved sample data in the stream's physical format — never an
+    // AudioBufferList. Building an ABL here (as this test did originally)
+    // hides the defect it exists to catch: a driver that reads ioMainBuffer
+    // as an ABL finds mNumberBuffers = 0 in a HAL-zeroed buffer, writes
+    // nothing, and ships silence to every real client while passing here.
+    //
+    // Sentinel-filled before each cycle so untouched output is detectable;
+    // `left`/`right` are read back through the interleave.
+    float ioBuffer[kIOFrames * kExpectedChannels];
+    auto left  = [&](UInt32 f) { return ioBuffer[f * kExpectedChannels]; };
+    auto right = [&](UInt32 f) { return ioBuffer[f * kExpectedChannels + 1]; };
+    void* const abl = ioBuffer;      // what DoIOOperation receives
 
     auto resetABL = [&](float sentinel) {
-        for (UInt32 i = 0; i < kIOFrames; ++i) {
-            left[i] = sentinel;
-            right[i] = sentinel;
+        for (UInt32 i = 0; i < kIOFrames * kExpectedChannels; ++i) {
+            ioBuffer[i] = sentinel;
         }
-        abl->mNumberBuffers = 2;
-        abl->mBuffers[0].mNumberChannels = 1;
-        abl->mBuffers[0].mDataByteSize = kIOFrames * sizeof(float);
-        abl->mBuffers[0].mData = left;
-        abl->mBuffers[1].mNumberChannels = 1;
-        abl->mBuffers[1].mDataByteSize = kIOFrames * sizeof(float);
-        abl->mBuffers[1].mData = right;
     };
 
     AudioServerPlugInIOCycleInfo cycle;
@@ -582,11 +586,11 @@ int main()
         for (UInt32 f = 0; f < kIOFrames; ++f) {
             const float expectL = static_cast<float>(2 * f);
             const float expectR = static_cast<float>(2 * f + 1);
-            if (left[f] != expectL) {
+            if (left(f) != expectL) {
                 ++badL;
                 if (firstBad == kIOFrames) firstBad = f;
             }
-            if (right[f] != expectR) {
+            if (right(f) != expectR) {
                 ++badR;
                 if (firstBad == kIOFrames) firstBad = f;
             }
@@ -600,13 +604,125 @@ int main()
                          "first bad frame %u (L=%.1f R=%.1f, expected L=%.1f R=%.1f)",
                   static_cast<unsigned>(badL), static_cast<unsigned>(badR),
                   static_cast<unsigned>(firstBad),
-                  left[firstBad < kIOFrames ? firstBad : 0],
-                  right[firstBad < kIOFrames ? firstBad : 0],
+                  left(firstBad < kIOFrames ? firstBad : 0),
+                  right(firstBad < kIOFrames ? firstBad : 0),
                   static_cast<float>(2 * (firstBad < kIOFrames ? firstBad : 0)),
                   static_cast<float>(2 * (firstBad < kIOFrames ? firstBad : 0) + 1));
         }
         check(PRISMRingBufferUnderrunCount(ring) == 0,
               "no underrun reading exactly what was written (count=%u)",
+              PRISMRingBufferUnderrunCount(ring));
+    }
+
+    // -----------------------------------------------------------------------
+    // 4b. Anchor self-healing — producer behind the device clock
+    // -----------------------------------------------------------------------
+    //
+    // Regression for the flow that ships silence forever: a client StartIOs
+    // (anchoring sample time 0 at the then-current write index) while the
+    // producer is not yet streaming, so every window the device clock asks
+    // for sits ahead of the write head. The driver must slide its anchor to
+    // land kPRISM_ReanchorCushionFrames behind the write head, deliver real
+    // frames in that very cycle, and keep the healed mapping stable across
+    // the next contiguous cycle.
+
+    std::printf("--- 4b. Anchor self-healing (late producer) ---\n");
+
+    {
+        const UInt32 kPatternFrames = 4096;
+        const float  kPatternBase   = 100000.0f;
+        static float pattern[kPatternFrames * kExpectedChannels];
+        for (UInt32 i = 0; i < kPatternFrames * kExpectedChannels; ++i) {
+            pattern[i] = kPatternBase + static_cast<float>(i);
+        }
+        PRISMRingBufferWrite(ring, pattern, kPatternFrames);
+        // Ring timeline: [0, 512) ramp, [512, 4608) pattern; write head 4608.
+
+        const UInt32 underrunsBefore = PRISMRingBufferUnderrunCount(ring);
+
+        // A cycle whose sample time is far past anything the producer has
+        // written — the device clock ran while the producer did not.
+        const Float64 kLateSampleTime = 50000.0;
+        AudioServerPlugInIOCycleInfo lateCycle;
+        std::memset(&lateCycle, 0, sizeof(lateCycle));
+        lateCycle.mIOCycleCounter = 2;
+        lateCycle.mNominalIOBufferFrameSize = kIOFrames;
+        lateCycle.mInputTime.mSampleTime = kLateSampleTime;
+
+        resetABL(424242.0f);
+        (*driver)->BeginIOOperation(driver, deviceID, 0,
+                                    kAudioServerPlugInIOOperationReadInput,
+                                    kIOFrames, &lateCycle);
+        st = (*driver)->DoIOOperation(driver, deviceID, streamID, 0,
+                                      kAudioServerPlugInIOOperationReadInput,
+                                      kIOFrames, &lateCycle, abl, nullptr);
+        (*driver)->EndIOOperation(driver, deviceID, 0,
+                                  kAudioServerPlugInIOOperationReadInput,
+                                  kIOFrames, &lateCycle);
+
+        // Healed mapping: window end = writeHead − cushion = 4608 − 1024 =
+        // 3584, so the window is ring positions [3072, 3584) — pattern
+        // frames 2560…3071.
+        UInt32 bad = 0;
+        UInt32 firstBad = kIOFrames;
+        for (UInt32 f = 0; f < kIOFrames; ++f) {
+            const UInt32 patternFrame = 3072 + f - 512;
+            const float expectL = kPatternBase + static_cast<float>(2 * patternFrame);
+            const float expectR = expectL + 1.0f;
+            if (left(f) != expectL || right(f) != expectR) {
+                ++bad;
+                if (firstBad == kIOFrames) firstBad = f;
+            }
+        }
+        check(st == noErr && bad == 0,
+              "late-producer cycle heals the anchor and delivers audio "
+              "(status=%d, %u bad frames, first bad %u: L=%.1f expected %.1f)",
+              static_cast<int>(st), static_cast<unsigned>(bad),
+              static_cast<unsigned>(firstBad),
+              firstBad < kIOFrames ? left(firstBad) : -1.0f,
+              kPatternBase + static_cast<float>(2 * (3072 + (firstBad < kIOFrames ? firstBad : 0) - 512)));
+
+        // The healed read must not have been billed as an underrun.
+        check(PRISMRingBufferUnderrunCount(ring) == underrunsBefore,
+              "healed cycle counts no underrun (before=%u, after=%u)",
+              static_cast<unsigned>(underrunsBefore),
+              PRISMRingBufferUnderrunCount(ring));
+
+        // The next contiguous cycle must reuse the healed anchor: same
+        // mapping, no second slide, seamless continuation at [3584, 4096).
+        lateCycle.mIOCycleCounter = 3;
+        lateCycle.mInputTime.mSampleTime = kLateSampleTime + kIOFrames;
+
+        resetABL(424242.0f);
+        (*driver)->BeginIOOperation(driver, deviceID, 0,
+                                    kAudioServerPlugInIOOperationReadInput,
+                                    kIOFrames, &lateCycle);
+        st = (*driver)->DoIOOperation(driver, deviceID, streamID, 0,
+                                      kAudioServerPlugInIOOperationReadInput,
+                                      kIOFrames, &lateCycle, abl, nullptr);
+        (*driver)->EndIOOperation(driver, deviceID, 0,
+                                  kAudioServerPlugInIOOperationReadInput,
+                                  kIOFrames, &lateCycle);
+
+        bad = 0;
+        firstBad = kIOFrames;
+        for (UInt32 f = 0; f < kIOFrames; ++f) {
+            const UInt32 patternFrame = 3584 + f - 512;
+            const float expectL = kPatternBase + static_cast<float>(2 * patternFrame);
+            const float expectR = expectL + 1.0f;
+            if (left(f) != expectL || right(f) != expectR) {
+                ++bad;
+                if (firstBad == kIOFrames) firstBad = f;
+            }
+        }
+        check(st == noErr && bad == 0,
+              "following cycle continues seamlessly on the healed anchor "
+              "(status=%d, %u bad frames, first bad %u)",
+              static_cast<int>(st), static_cast<unsigned>(bad),
+              static_cast<unsigned>(firstBad));
+        check(PRISMRingBufferUnderrunCount(ring) == underrunsBefore,
+              "contiguous healed cycle counts no underrun (before=%u, after=%u)",
+              static_cast<unsigned>(underrunsBefore),
               PRISMRingBufferUnderrunCount(ring));
     }
 
@@ -634,8 +750,8 @@ int main()
     {
         UInt32 nonZero = 0;
         for (UInt32 f = 0; f < kIOFrames; ++f) {
-            if (left[f] != 0.0f) ++nonZero;
-            if (right[f] != 0.0f) ++nonZero;
+            if (left(f) != 0.0f) ++nonZero;
+            if (right(f) != 0.0f) ++nonZero;
         }
         check(st == noErr && nonZero == 0,
               "producerAlive=0 → DoIOOperation outputs pure silence "
