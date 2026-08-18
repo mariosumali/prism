@@ -18,10 +18,10 @@ public final class Hotkeys {
 
     // MARK: Fixed combos
     //
-    // §5.2 originals plus the studio chords (§5.6, §5.9–§5.11). All share the
-    // ⌥⌘ prefix so they read as one family and none collide with an app
-    // shortcut a user is likely to have muscle memory for. ANSI keycodes:
-    // F = 3, M = 46, R = 15, A = 0, P = 35, E = 14.
+    // §5.2 originals plus the studio chords (§5.6, §5.9–§5.14). All share the
+    // ⌥⌘ prefix so they read as one family — except the voice changer, which
+    // adds ⌃ because ⌥⌘V belongs to Finder (see voiceCombo). ANSI keycodes:
+    // F = 3, M = 46, R = 15, A = 0, P = 35, E = 14, V = 9, B = 11.
 
     public static let freezeCombo = HotkeyCombo(keyCode: 3, option: true, command: true)
     public static let muteCombo = HotkeyCombo(keyCode: 46, option: true, command: true)
@@ -34,6 +34,16 @@ public final class Hotkeys {
     /// §5.12. The only combo that also reports its key release, so it can be
     /// held rather than toggled — which is what "switch" means.
     public static let lagCombo = HotkeyCombo(keyCode: 37, option: true, command: true)
+    /// §5.14: B for bad connection. A toggle, not a hold — the stunt runs for
+    /// minutes, and nobody holds a chord through a meeting.
+    public static let badConnectionCombo = HotkeyCombo(keyCode: 11, option: true, command: true)
+    /// §5.13: voice changer on/off, recalling the last used effect. The one
+    /// chord that adds ⌃ to the family prefix: ⌥⌘V is Finder's "Move Item
+    /// Here" (and Xcode's paste-preserving-formatting), so the plain combo
+    /// would put a chipmunk on air every time someone moved files mid-call —
+    /// and ⌥⇧⌘V is the system-wide Paste and Match Style, so ⌃ it is.
+    public static let voiceCombo = HotkeyCombo(keyCode: 9, option: true,
+                                               command: true, control: true)
 
     // MARK: Callbacks (invoked on the main thread)
 
@@ -47,6 +57,8 @@ public final class Hotkeys {
     /// ⌥⌘L press and release. `true` on keyDown, `false` on keyUp, so the
     /// receiver can implement either hold-to-lag or a toggle (§5.12).
     public var onLag: ((Bool) -> Void)?
+    public var onBadConnection: (() -> Void)?      // ⌥⌘B
+    public var onVoice: (() -> Void)?              // ⌃⌥⌘V
     public var onPreset: ((UUID) -> Void)?
 
     // MARK: State
@@ -218,6 +230,10 @@ public final class Hotkeys {
             fire { $0.onPanic?() }
         } else if matches(Self.eyeContactCombo) {
             fire { $0.onEyeContact?() }
+        } else if matches(Self.voiceCombo) {
+            fire { $0.onVoice?() }
+        } else if matches(Self.badConnectionCombo) {
+            fire { $0.onBadConnection?() }
         } else if matches(Self.lagCombo) {
             fire { $0.onLag?(true) }
         } else if let (id, _) = presetBindings.first(where: { matches($0.1) }) {

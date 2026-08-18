@@ -120,14 +120,14 @@ public final class GazeStage: EffectStage {
 
     // MARK: - EffectStage
 
+    /// Enabled is the whole condition, deliberately: detection is scheduled
+    /// from inside `encode()`, so gating this on "are we tracking?" would
+    /// mean the pass that acquires tracking never runs and the correction
+    /// could never start — the stage would sit at "looking for your eyes…"
+    /// forever. While no eye is valid `encode()` takes the copy path, which
+    /// costs one blit and keeps the search alive.
     public func wantsEncode() -> Bool {
-        guard isEnabled, settings.strength > 0 else { return false }
-        // Keep encoding while confidence is still fading out, so the warp
-        // eases away instead of cutting.
-        stateLock.lock()
-        let tracked = measurement != nil
-        stateLock.unlock()
-        return tracked || confidenceLeft > 0.001 || confidenceRight > 0.001
+        isEnabled && settings.strength > 0
     }
 
     public func encode(commandBuffer: MTLCommandBuffer,

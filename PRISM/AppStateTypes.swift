@@ -38,6 +38,7 @@ public enum MenuBarState: Equatable {
     case effects       // filled
     case replaying     // filled + rewind badge: clients are seeing the past
     case away          // filled + moon badge: the idle loop is on air
+    case badConnection // filled + wifi badge: §5.14 fake bad connection on air
     case lagging       // filled + hourglass badge: deliberate delay engaged
     case frozen        // filled + pause bar
     case muted         // filled + slash
@@ -107,7 +108,7 @@ public struct StageStatus: Equatable {
 
 /// Popover disclosure groups remember their state (§8.3).
 public enum PopoverSection: String, CaseIterable {
-    case framing, effects, format, scene, moments
+    case framing, effects, format, scene, moments, voice
 }
 
 /// What is behind you, as one choice (§5.4, §5.7).
@@ -159,6 +160,7 @@ public enum PopoverModule: String, Codable, CaseIterable, Identifiable {
     case moments       // Replay / Away / Panic tiles plus the replay transport
     case presets
     case scene         // background mode + eye contact
+    case voice         // §5.13 microphone voice effects
     case framing
     case effects
     case format
@@ -176,6 +178,7 @@ public enum PopoverModule: String, Codable, CaseIterable, Identifiable {
         case .moments: return "Replay / Away / Panic"
         case .presets: return "Presets"
         case .scene: return "Scene"
+        case .voice: return "Voice"
         case .framing: return "Framing"
         case .effects: return "Effects"
         case .format: return "Format"
@@ -193,6 +196,7 @@ public enum PopoverModule: String, Codable, CaseIterable, Identifiable {
         case .moments: return "backward.end.alt.fill"
         case .presets: return "square.stack"
         case .scene: return "theatermasks"
+        case .voice: return "waveform.and.mic"
         case .framing: return "crop.rotate"
         case .effects: return "wand.and.stars"
         case .format: return "rectangle.on.rectangle"

@@ -96,6 +96,26 @@ public final class AppState: ObservableObject {
         didSet {
             guard studio != oldValue else { return }
             pipeline?.applyStudio(studio)
+            if studio.voice != oldValue.voice {
+                // §5.13: the voice changer lives on the audio capture path;
+                // the menu bar treats an active voice as an active effect.
+                audioCapture.voiceChanger.apply(studio.voice)
+                updateMenuBarState()
+            }
+            // §5.12: dragging the delay while engaged retargets it live —
+            // whichever knob owns the current delay. During a catch-up the
+            // rate is the control, so the slider waits its turn.
+            if isLagging, !isCatchingUp {
+                if connectionEngagedLag {
+                    if studio.connection.lagMs != oldValue.connection.lagMs {
+                        retargetLagDepth(seconds: studio.connection.lagSeconds,
+                                         delaysAudio: true)
+                    }
+                } else if studio.lag.delayMs != oldValue.lag.delayMs {
+                    retargetLagDepth(seconds: studio.lag.delaySeconds,
+                                     delaysAudio: studio.lag.delaysAudio)
+                }
+            }
             persistStudio()
         }
     }
@@ -109,6 +129,8 @@ public final class AppState: ObservableObject {
     @Published public var isPanicked = false
     /// §5.12 — the deliberate delay is engaged.
     @Published public var isLagging = false
+    /// §5.14 — the fake bad connection is degrading the published picture.
+    @Published public var isBadConnection = false
     /// Playing the backlog out faster than real time after a catch-up release.
     @Published public var isCatchingUp = false
     /// Eye contact has found a face and is actually correcting. A correction
@@ -172,6 +194,9 @@ public final class AppState: ObservableObject {
     public let permissions = Permissions()
     public let extensionInstaller = ExtensionInstaller()
     public let presetStore = PresetStore()
+    /// §5.13 mic check — record a few seconds of the processed microphone
+    /// and play it back, the only way to hear your own voice effect.
+    public let micCheck: MicCheck
 
     // MARK: - Components
 
@@ -220,6 +245,10 @@ public final class AppState: ObservableObject {
     /// user's own mute rather than blanket-unmuting.
     private var panicMutedByUs = false
     private var awayMutedByUs = false
+    /// Whether the bad connection engaged the §5.12 delay itself (§5.14), so
+    /// releasing it releases only the delay it engaged — never one the user
+    /// asked for separately with the lag switch.
+    private var connectionEngagedLag = false
 
     private enum DefaultsKey {
         static let configuration = "PRISM.configuration"
@@ -233,6 +262,7 @@ public final class AppState: ObservableObject {
     // MARK: - Init
 
     public init() {
+        micCheck = MicCheck(capture: audioCapture)
         // Metal is required for everything downstream; a Mac without Metal
         // cannot run the pipeline at all, so surface that as the error state.
         do {
@@ -454,14 +484,21 @@ public final class AppState: ObservableObject {
             self.handleSelectedDeviceRemoval(cameraList: nil, micList: list)
             self.reconcileCaptures()
         }
+        deviceMonitor.onVirtualMicInUseChanged = { [weak self] inUse in
+            guard let self, self.virtualMicInUse != inUse else { return }
+            self.virtualMicInUse = inUse
+            self.reconcileCaptures()
+        }
         deviceMonitor.onWake = { [weak self] in
             guard let self else { return }
             // §7: both capture paths reestablish after wake; each class
             // runs the 0.5/1/2/4s retry ladder internally. Only while
             // something is consuming frames — a wake with the popover closed
             // and no clients must not turn the camera on.
-            guard self.captureDemand else { return }
-            self.cameraCapture.restart()
+            guard self.audioCaptureDemand else { return }
+            if self.captureDemand {
+                self.cameraCapture.restart()
+            }
             self.audioCapture.restart()
         }
     }
@@ -483,7 +520,9 @@ public final class AppState: ObservableObject {
         hotkeys.onAway = { [weak self] in self?.toggleAway() }
         hotkeys.onPanic = { [weak self] in self?.togglePanic() }
         hotkeys.onEyeContact = { [weak self] in self?.toggleEyeContact() }
+        hotkeys.onVoice = { [weak self] in self?.toggleVoice() }
         hotkeys.onLag = { [weak self] pressed in self?.handleLagKey(pressed: pressed) }
+        hotkeys.onBadConnection = { [weak self] in self?.toggleBadConnection() }
         hotkeys.onPreset = { [weak self] id in self?.selectPreset(id) }
         pushPresetHotkeyBindings(presetStore.presets)
     }
@@ -707,6 +746,20 @@ public final class AppState: ObservableObject {
         previewActive || !clientsInUse.isEmpty
     }
 
+    /// Mirror of kAudioDevicePropertyDeviceIsRunningSomewhere on the virtual
+    /// microphone, fed by DeviceMonitor. Main thread.
+    private var virtualMicInUse = false
+
+    /// §4.4: an app recording from "PRISM Microphone" is microphone demand
+    /// all by itself — the popover can be closed and no video client
+    /// attached, and the ring must still carry live audio (before this, the
+    /// virtual mic went silent exactly when someone listened to it). It
+    /// widens audio demand only: an audio-only client must not turn the
+    /// camera on.
+    private var audioCaptureDemand: Bool {
+        captureDemand || virtualMicInUse
+    }
+
     /// Shared didSet body for `popoverOpen` and `mainWindowOpen`: the preview
     /// path runs while either surface shows it, and tears down fully (§8.3:
     /// zero retained textures) only when both are closed.
@@ -741,16 +794,18 @@ public final class AppState: ObservableObject {
             if !cameraCapture.isRunning, permissions.camera == .granted {
                 startCamera()
             }
-            if !audioCapture.isCapturing, permissions.microphone == .granted {
-                startAudio()
-            }
             clipPlayer?.setDemandActive(true)
             // Background and overlay videos are media clocks too (§5.7, §5.8).
             pipeline?.setDemandActive(true)
             restartNoCameraTimer()
         } else {
+            // §5.13: no preview surface means nobody is looking at the mic
+            // check — and the capture that feeds it may be about to stop. End
+            // a recording or playback rather than strand either invisibly.
+            if micCheck.phase != .idle {
+                micCheck.cancel()
+            }
             cameraCapture.stop()
-            audioCapture.stop()
             // Suspend the clip clock too: otherwise an idle PRISM keeps
             // decoding, and the next demand fast-forwards through the gap.
             clipPlayer?.setDemandActive(false)
@@ -758,6 +813,15 @@ public final class AppState: ObservableObject {
             // No consumers → nothing to tick placeholder frames for.
             noCameraTimer?.invalidate()
             noCameraTimer = nil
+        }
+        // Audio demand is wider than video demand: an app recording from the
+        // virtual microphone keeps capture alive with every window closed.
+        if audioCaptureDemand {
+            if !audioCapture.isCapturing, permissions.microphone == .granted {
+                startAudio()
+            }
+        } else {
+            audioCapture.stop()
         }
     }
 
@@ -779,6 +843,11 @@ public final class AppState: ObservableObject {
     private func updateAudioRouting() {
         let clipOwnsAudio = (clipState == .playing) && clipUsesClipAudio
         audioCapture.isSuppressed = clipOwnsAudio
+        // §5.13: while clip audio owns the ring the mic-check tap starves;
+        // an in-flight recording can only stall, so end it cleanly.
+        if clipOwnsAudio, micCheck.phase == .recording {
+            micCheck.cancel()
+        }
     }
 
     private func handleSelectedDeviceRemoval(cameraList: [CameraDeviceInfo]?,
@@ -814,7 +883,7 @@ public final class AppState: ObservableObject {
                 let text = "Microphone disconnected. Using default microphone."
                 warning = WarningMessage(text: text)
                 postNotification(body: text)
-            } else if captureDemand, audioCapture.isCapturing,
+            } else if audioCaptureDemand, audioCapture.isCapturing,
                       let bound = audioCapture.currentDeviceUID,
                       !micList.contains(where: { $0.id == bound }) {
                 // Default mic unplugged: the HAL unit stays silently bound to
@@ -840,6 +909,12 @@ public final class AppState: ObservableObject {
     public func toggleMute() {
         isMuted.toggle()
         audioCapture.isMuted = isMuted
+        // §5.13: muting silences the mic-check tap too, so an in-flight
+        // recording can only ever produce silence — cancel it rather than
+        // let it stall and then misdiagnose the microphone.
+        if isMuted, micCheck.phase == .recording {
+            micCheck.cancel()
+        }
         updateMenuBarState()
     }
 
@@ -1041,6 +1116,7 @@ public final class AppState: ObservableObject {
         if isLagging || isCatchingUp {
             isLagging = false
             isCatchingUp = false
+            connectionEngagedLag = false
             audioCapture.delaySeconds = 0
         }
 
@@ -1119,6 +1195,7 @@ public final class AppState: ObservableObject {
         if isLagging || isCatchingUp {
             isLagging = false
             isCatchingUp = false
+            connectionEngagedLag = false
             audioCapture.delaySeconds = 0
         }
         guard pipeline.replayPlayer.startAway(
@@ -1204,6 +1281,9 @@ public final class AppState: ObservableObject {
     public func releaseLag() {
         guard let pipeline, isLagging else { return }
         isLagging = false
+        // Releasing via the lag switch also settles a connection-engaged
+        // delay; the visual degrade (if any) stays until its own release.
+        connectionEngagedLag = false
         // Audio has no honest catch-up: speeding up a delay line means
         // resampling or dropping samples, and both sound worse than the skew.
         // The microphone therefore always snaps back (§5.12).
@@ -1224,6 +1304,23 @@ public final class AppState: ObservableObject {
         updateMenuBarState()
     }
 
+    /// §5.12 — retargets an engaged delay without releasing it. Deepening
+    /// holds the picture until the extra delay is absorbed; shortening drops
+    /// exactly that much backlog. The audio delay line follows in one step —
+    /// it has no honest gradual path (§5.12), and the skew during the video's
+    /// absorb/skip is brief.
+    private func retargetLagDepth(seconds requested: Double, delaysAudio: Bool) {
+        guard let pipeline, isLagging else { return }
+        // Same buffer bound as engaging: the delay lives in the ring.
+        let available = min(requested, studio.replay.clampedBufferSeconds - 0.5)
+        guard available > 0.1 else { return }
+        pipeline.replayPlayer.adjustLag(toSeconds: available)
+        if delaysAudio {
+            audioCapture.delaySeconds = available
+        }
+        refreshReplayState()
+    }
+
     /// Hotkey edge. A press while already lagging releases, so a missed key
     /// release (focus change, revoked input monitoring) can never strand the
     /// switch on.
@@ -1241,6 +1338,74 @@ public final class AppState: ObservableObject {
 
     public func toggleLag() {
         if isLagging { releaseLag() } else { engageLag() }
+    }
+
+    // MARK: - Intents: bad connection (§5.14)
+
+    /// Degrades the published picture — macroblocks, starved colour, a choppy
+    /// frame rate — and, when configured, falls behind live on the §5.12
+    /// transport. One switch, because "my connection is struggling" is one
+    /// story, not three settings to remember mid-call.
+    public func engageBadConnection() {
+        guard let pipeline, !isBadConnection else { return }
+        pipeline.connectionStage.settings = studio.connection
+        pipeline.connectionStage.setEngaged(true)
+        isBadConnection = true
+
+        // The delay half rides the lag switch's transport with the
+        // connection's own, shorter delay. It needs the rolling buffer
+        // exactly like §5.12 — but the visual half must not fail with it:
+        // degrade what can be degraded, and say what could not.
+        if studio.connection.addsLag, !isLagging, !isCatchingUp,
+           replayMode != .replay {
+            if !studio.replay.isArmed {
+                warning = WarningMessage(
+                    text: "Degrading the picture. Turn on the rolling buffer to fall behind live too",
+                    action: .armBuffer)
+            } else {
+                let available = min(studio.connection.lagSeconds,
+                                    studio.replay.clampedBufferSeconds - 0.5)
+                if available > 0.1,
+                   pipeline.replayPlayer.startLag(delaySeconds: available) {
+                    isLagging = true
+                    connectionEngagedLag = true
+                    // A real network delays both paths together; picture
+                    // behind live audio reads as broken software (§5.12).
+                    audioCapture.delaySeconds = available
+                } else {
+                    warning = WarningMessage(
+                        text: "Degrading the picture. Nothing buffered yet to fall behind live")
+                }
+            }
+        }
+        refreshReplayState()
+        updateMenuBarState()
+    }
+
+    /// Restores the clean picture, instantly — recovery costs nothing because
+    /// the full chain kept running underneath. A delay this switch engaged
+    /// itself snaps back to live (a recovering connection drops its backlog);
+    /// a delay the user engaged separately with the lag switch is left alone.
+    public func releaseBadConnection() {
+        guard let pipeline, isBadConnection else { return }
+        isBadConnection = false
+        pipeline.connectionStage.setEngaged(false)
+        if connectionEngagedLag, isLagging {
+            isLagging = false
+            audioCapture.delaySeconds = 0
+            if isFrozen {
+                pipeline.refreezeFromCurrentOutput()
+            }
+            pipeline.replayPlayer.stop()
+            pipeline.beginCrossfade(durationMs: 200)
+            refreshReplayState()
+        }
+        connectionEngagedLag = false
+        updateMenuBarState()
+    }
+
+    public func toggleBadConnection() {
+        if isBadConnection { releaseBadConnection() } else { engageBadConnection() }
     }
 
     /// Called when a catch-up reaches the live edge.
@@ -1322,6 +1487,51 @@ public final class AppState: ObservableObject {
         setStageEnabled(.gaze, !enabled)
     }
 
+    // MARK: - Intents: voice changer (§5.13)
+
+    /// A voice effect is on air. Everyone else hears it; the user does not —
+    /// PRISM publishes a microphone, it does not monitor one — which is why
+    /// this state feeds the menu bar's effects glyph.
+    public var isVoiceActive: Bool { studio.voice.isActive }
+
+    /// Picking an effect is the same intent as switching the voice on, and
+    /// picking Off is the same intent as switching it off — one question,
+    /// one control (§8.7). A real effect is also remembered for the toggle.
+    public func setVoiceEffect(_ effect: VoiceEffect) {
+        var voice = studio.voice
+        voice.effect = effect
+        if effect != .off {
+            voice.lastUsedEffect = effect
+        }
+        studio.voice = voice        // one mutation → one didSet → one persist
+    }
+
+    public func setVoiceAmount(_ amount: Double) {
+        studio.voice.amount = amount
+    }
+
+    /// ⌃⌥⌘V: off ↔ the last voice used, so a quick unmask before saying
+    /// something serious does not lose the alien you spent a meeting on.
+    public func toggleVoice() {
+        setVoiceEffect(isVoiceActive ? .off : studio.voice.recallEffect)
+    }
+
+    /// Why the mic check cannot run right now, or nil when it can. The check
+    /// taps the same path the ring hears, so anything silencing that path
+    /// would only record silence — better to say why than to play nothing.
+    public var micCheckInhibition: String? {
+        if permissions.microphone != .granted {
+            return "Allow microphone access to test your voice"
+        }
+        if isMuted {
+            return "Unmute to test your voice"
+        }
+        if clipState == .playing, clipUsesClipAudio {
+            return "Clip audio owns the microphone right now"
+        }
+        return nil
+    }
+
     // MARK: - Replay state mirroring
 
     private func refreshReplayState() {
@@ -1342,6 +1552,7 @@ public final class AppState: ObservableObject {
             if isAway { isAway = false }
             if isLagging { isLagging = false }
             if isCatchingUp { isCatchingUp = false }
+            connectionEngagedLag = false
         }
         // The deliberate delay is reported to the monitor, and therefore to
         // the user, for as long as it is being applied (§6).
@@ -1362,13 +1573,20 @@ public final class AppState: ObservableObject {
             cfg.flags[id] = flags
             // Turning a stage on whose parameters are all at identity flips a
             // switch and changes nothing (PipelineConfiguration.isInert). LUT
-            // is the one case with an unambiguous remedy: it is inert only
-            // because "Neutral" IS the identity LUT, so switching it on picks
-            // the first real look. Adjust has no equivalent — there is no
-            // "some exposure" to guess at — so its surfaces say so instead.
+            // and Style have the one unambiguous remedy: when the identity
+            // entry ("Neutral", "Normal") is selected, switching on picks the
+            // first real look. A zero strength/intensity is deliberately left
+            // alone — like Adjust, there is no value to guess at, so the
+            // surfaces caption it and point at the slider instead.
             if enabled, id == .lut, cfg.lut.isNeutral,
                let firstLook = LUTStore.shared.firstNonNeutralLUT {
                 cfg.lut.lutName = firstLook
+            }
+            if enabled, id == .style, cfg.style.isNormal,
+               let firstEffect = StyleEffect.distortions.first {
+                // The catalogue's first tile after Normal (grids lead with
+                // the distortions).
+                cfg.style.effect = firstEffect
             }
         }
         // Clearing a manual LIVE toggle also clears any auto-disable latch;
@@ -1396,6 +1614,25 @@ public final class AppState: ObservableObject {
             var status = stageStatus[.lut] ?? StageStatus()
             status.autoDisabled = false
             stageStatus[.lut] = status
+        }
+    }
+
+    /// Picking a style is the same intent as switching the stage on, and
+    /// picking Normal is the same intent as switching it off — Normal is
+    /// the unstyled picture, so any other pairing puts the picker and the
+    /// switch in visible disagreement about whether a look is applied (the
+    /// LUT / Neutral rule applied to the style catalogue).
+    public func setStyleEffect(_ effect: StyleEffect) {
+        updateEditing { cfg in
+            cfg.style.effect = effect
+            var flags = cfg.flags(for: .style)
+            flags.enabled = effect != .normal
+            cfg.flags[.style] = flags
+        }
+        if draftConfig == nil {
+            var status = stageStatus[.style] ?? StageStatus()
+            status.autoDisabled = false
+            stageStatus[.style] = status
         }
     }
 
@@ -1620,7 +1857,7 @@ public final class AppState: ObservableObject {
 
     public func selectMicrophone(_ id: String?) {
         selectedMicrophoneID = id
-        if captureDemand, permissions.microphone == .granted {
+        if audioCaptureDemand, permissions.microphone == .granted {
             startAudio()                   // start() supersedes internally
         }
         config.microphoneID = id
@@ -1739,6 +1976,7 @@ public final class AppState: ObservableObject {
     }
 
     public func quit() {
+        micCheck.cancel()
         audioCapture.stop()
         clipPlayer?.stop()
         pipeline?.replayPlayer.stop()
@@ -1752,11 +1990,14 @@ public final class AppState: ObservableObject {
     // MARK: - Derived state
 
     private func updateMenuBarState() {
-        // §8.2 precedence, extended: error > panic > away > replaying >
-        // frozen > muted > effects > live > idle. The four substitution
-        // states outrank the effect states because forgetting you are in one
-        // is the damaging failure — panic and away most of all, since both
-        // mean "the picture on air is not you right now".
+        // §8.2 precedence, extended: error > panic > away > bad connection >
+        // lagging > replaying > frozen > muted > effects > live > idle. The
+        // substitution states outrank the effect states because forgetting
+        // you are in one is the damaging failure — panic and away most of
+        // all, since both mean "the picture on air is not you right now".
+        // Bad connection outranks lagging: when the switch engaged the delay
+        // itself, the delay is a part of the stunt, and the badge should name
+        // the stunt the user engaged.
         let newState: MenuBarState
         if case .failed = setup.cameraExtension {
             newState = .error
@@ -1764,6 +2005,8 @@ public final class AppState: ObservableObject {
             newState = .panicked
         } else if isAway {
             newState = .away
+        } else if isBadConnection {
+            newState = .badConnection
         } else if isLagging || isCatchingUp {
             newState = .lagging
         } else if replayMode == .replay {
@@ -1786,11 +2029,15 @@ public final class AppState: ObservableObject {
 
     private var hasActiveEffects: Bool {
         if clipState != .none { return true }
+        // §5.13: an active voice effect is on air exactly like a visual one,
+        // and forgetting it is the same class of failure.
+        if isVoiceActive { return true }
         // Enabled is not the same as doing something: a stage the pipeline
         // skips (isInert) changes no pixels, and the menu bar must not claim
         // an effect is on air when the picture is untouched. Geometry was
         // always excluded this way; isInert applies the same test to the rest.
-        for id: StageID in [.adjust, .lut, .blur, .gaze, .background, .overlay, .geometry]
+        for id: StageID in [.adjust, .lut, .style, .blur, .gaze, .background, .overlay,
+                            .geometry]
         where config.flags(for: id).enabled && !config.isInert(id) {
             if !(stageStatus[id]?.autoDisabled ?? false) { return true }
         }

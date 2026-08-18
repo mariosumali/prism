@@ -155,6 +155,65 @@ public final class ReplayPlayer {
         return true
     }
 
+    /// Retargets the delay while lag is engaged (§5.12), without releasing.
+    ///
+    /// Deepening rebases the clock onto the frame currently on air and holds
+    /// it there until the extra delay has been absorbed — the same stall as
+    /// engaging, never a rewind, because a rewind would replay what was
+    /// already sent. Shortening jumps the base forward by the difference,
+    /// dropping exactly that much backlog: a partial snap-back, which is
+    /// what a connection does when it recovers a little.
+    ///
+    /// A no-op while a catch-up owns the clock (its rate is the control
+    /// then), and for changes under 10 ms — float noise, not intent. The
+    /// threshold is deliberately below the 50 ms the delay slider steps in
+    /// and well below anything a person types, so every deliberate change
+    /// lands: a control that reports a figure it did not apply is a lie
+    /// about what is on air.
+    public func adjustLag(toSeconds target: Double) {
+        let now = CMClockGetTime(CMClockGetHostTimeClock())
+        lock.lock()
+        guard modeStorage == .lag, playbackRate == 1,
+              let newest = buffer.span?.end else {
+            lock.unlock()
+            return
+        }
+        let elapsed = elapsedLocked(atHost: now)
+        guard let rebased = Self.retarget(base: baseSeconds, elapsed: elapsed,
+                                          newest: newest, target: target) else {
+            lock.unlock()
+            return
+        }
+        baseSeconds = rebased.base
+        lagSeconds = rebased.lag
+        elapsedAtPause = 0
+        playStart = now
+        lock.unlock()
+        // No decoder surgery on shorten: the delivery loop discards frames
+        // behind the new base as they decode, and H.264 decodes far faster
+        // than real time, so the jump completes within a few frames.
+    }
+
+    /// The clock rebase for a live retarget, pure for tests. Returns the new
+    /// (base, lag) pair, or nil when the change is too small to act on. The
+    /// new base is always the absolute time of the frame that should be on
+    /// air immediately after the change — position is continuous on deepen,
+    /// and jumps forward by exactly the dropped backlog on shorten.
+    static func retarget(base: Double, elapsed: Double,
+                         newest: Double, target: Double)
+        -> (base: Double, lag: Double)? {
+        let current = max(0, newest - (base + elapsed))
+        let clamped = max(0, target)
+        let delta = clamped - current
+        guard abs(delta) > 0.01 else { return nil }
+        if delta > 0 {
+            // Hold the current frame until the extra delay is absorbed.
+            return (base: base + elapsed, lag: delta)
+        }
+        // Skip -delta seconds of backlog; nothing left to absorb.
+        return (base: base + elapsed - delta, lag: 0)
+    }
+
     /// Consumes the accumulated backlog at `rate` until the output reaches
     /// live, then fires `onReplayFinished`. `stop()` remains the snap-back
     /// path — cut straight to live and never send the backlog at all.

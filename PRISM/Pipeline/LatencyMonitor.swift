@@ -99,12 +99,14 @@ public final class LatencyMonitor: ObservableObject {
     /// camera back on air behind the user's back, which is the one failure
     /// this app must never produce — and outputFit is structural.
     ///
-    /// Eye contact, virtual background and overlay ARE candidates: they are
-    /// looks, and a look is exactly what §3.4 says to sacrifice before a
-    /// dropped frame. Virtual background degrading means the real room comes
-    /// back, so it is weighted expensive and loses before cheaper stages.
+    /// Eye contact, virtual background, overlay and style ARE candidates:
+    /// they are looks, and a look is exactly what §3.4 says to sacrifice
+    /// before a dropped frame. Virtual background degrading means the real
+    /// room comes back, so it is weighted expensive and loses before cheaper
+    /// stages. Bad connection is excluded with the substituting stages: it is
+    /// engaged by intent (§5.14), not a preset look.
     private static let disableCandidates: Set<StageID> = [
-        .geometry, .adjust, .lut, .blur, .gaze, .background, .overlay,
+        .geometry, .adjust, .lut, .style, .blur, .gaze, .background, .overlay,
     ]
 
     // MARK: Lifecycle
