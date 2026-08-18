@@ -173,6 +173,9 @@ public final class VideoPipeline {
     /// Rolling buffer behind instant replay and the away loop (§5.9, §5.10).
     public let replayBuffer: ReplayBuffer
     public let replayPlayer: ReplayPlayer
+    /// A fifth of a second of finished frames, scored, so a still can be the
+    /// sharpest of them (§5.16). Disarmed — and empty — by default.
+    public let stillRing: StillRing
 
     /// Post-effects output: IOSurface-backed buffer ready for the sink, plus
     /// the final texture for the preview. Invoked from the command buffer's
@@ -314,6 +317,7 @@ public final class VideoPipeline {
         stages = userStages + [outputFitStage]
 
         frameRing = try FrameRing(metal: metal, width: 1920, height: 1080)
+        stillRing = try StillRing(metal: metal)
         sharpnessPipeline = try metal.computePipeline(function: "prism_sharpness")
         crossfadePipeline = try metal.computePipeline(function: "prism_crossfade")
         replayStage.player = replayPlayer
@@ -487,6 +491,26 @@ public final class VideoPipeline {
         // Severity edits apply live while engaged; engagement itself is an
         // AppState intent (§5.14), exactly like freeze.
         connectionStage.settings = settings.connection
+        // §5.16: holding finished frames is the cost of the "sharpest frame"
+        // setting, so it is paid only while that setting is on.
+        stillRing.setArmed(settings.capture.prefersSharp)
+    }
+
+    /// The frame a still should be written from (§5.16): the sharpest of the
+    /// last fifth of a second when the ring is armed, otherwise simply the
+    /// last frame that reached the sink — which is the honest answer to
+    /// "save what I am looking at".
+    ///
+    /// Either way this is the finished picture, post-effects, and it is a
+    /// pool buffer: the caller must copy the pixels out rather than hold it.
+    public func stillFrame() -> CVPixelBuffer? {
+        if let pick = stillRing.sharpest(now: CACurrentMediaTime(),
+                                         windowSeconds: 0.5) {
+            return pick
+        }
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return lastOutput?.buffer
     }
 
     /// Forwards the pipeline's demand gate to every stage that owns a media
@@ -607,7 +631,8 @@ public final class VideoPipeline {
         if let cameraBuffer {
             ringSlot = frameRing.record(cameraBuffer, at: time, encoder: commandBuffer)
             if ringSlot >= 0 {
-                encodeSharpness(into: commandBuffer, source: source, slot: ringSlot)
+                encodeSharpness(into: commandBuffer, source: source, slot: ringSlot,
+                                result: frameRing.sharpnessBuffer)
             }
         }
 
@@ -725,6 +750,16 @@ public final class VideoPipeline {
         }
         encoded.append(.outputFit)
 
+        // §5.16: the still ring takes a reference to the finished frame — no
+        // copy, no extra pass — and one threadgroup scores it. The slot is
+        // published from the completed handler, because the pixels this
+        // scores are not final until the GPU says so.
+        let stillSlot = stillRing.record(outBuffer, at: CACurrentMediaTime())
+        if stillSlot >= 0 {
+            encodeSharpness(into: commandBuffer, source: outTexture, slot: stillSlot,
+                            result: stillRing.sharpnessBuffer)
+        }
+
         let semaphore = inFlight
         let captureMs = captureToTextureMs
         let replayRecord = pendingReplay
@@ -739,6 +774,9 @@ public final class VideoPipeline {
             }
             if let replayRecord {
                 self.replayBuffer.commit(replayRecord)
+            }
+            if stillSlot >= 0 {
+                self.stillRing.publish(slot: stillSlot)
             }
             let gpuMs = max(0, (finished.gpuEndTime - finished.gpuStartTime) * 1000)
             let stageMs = Self.attribute(totalGpuMs: gpuMs, to: encoded)
@@ -760,12 +798,17 @@ public final class VideoPipeline {
 
     // MARK: Encoding helpers
 
+    /// Laplacian-variance score for one ring slot. Two rings use it: the
+    /// camera-side FrameRing behind freeze (§5.2) and the output-side
+    /// StillRing behind stills (§5.16), which is why the destination buffer
+    /// is a parameter rather than a constant.
     private func encodeSharpness(into commandBuffer: MTLCommandBuffer,
-                                 source: MTLTexture, slot: Int) {
+                                 source: MTLTexture, slot: Int,
+                                 result: MTLBuffer) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(sharpnessPipeline)
         encoder.setTexture(source, index: 0)
-        encoder.setBuffer(frameRing.sharpnessBuffer, offset: 0, index: 0)
+        encoder.setBuffer(result, offset: 0, index: 0)
         var params = PRISMSharpnessParams()
         params.slot = UInt32(slot)
         encoder.setBytes(&params, length: MemoryLayout<PRISMSharpnessParams>.stride, index: 1)

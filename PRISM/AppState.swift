@@ -68,6 +68,12 @@ public final class AppState: ObservableObject {
     /// than a second stored array, so the two can never disagree.
     public var clientsInUse: [String] { clients.map(\.displayName) }
     @Published public var warning: WarningMessage?
+    /// The mirror image of `warning`: something that already happened and
+    /// went right. Set by the capture features (§5.15, §5.16) and cleared on
+    /// a timer, because a "Saved …" line that outlives its moment is clutter.
+    @Published public var notice: NoticeMessage?
+    /// §5.16 — where a still is between the key press and the file.
+    @Published public var capturePhase: CapturePhase = .idle
     @Published public var menuBarState: MenuBarState = .idle
     @Published public var setup = SetupStatus()
     // Controls
@@ -240,6 +246,9 @@ public final class AppState: ObservableObject {
     private var autoFrameTimer: Timer?
     private var noCameraTimer: Timer?
     private var replayTimer: Timer?
+    /// §5.16 shutter delay, and the expiry of the "Saved …" line.
+    private var countdownTimer: Timer?
+    private var noticeTimer: Timer?
     private var lastCameraFrameAt = Date.distantPast
     private let lastFrameLock = NSLock()
     private var formatsPublishedToExtension = false
@@ -1579,25 +1588,223 @@ public final class AppState: ObservableObject {
         return nil
     }
 
+    // MARK: - Intents: capture (§5.15, §5.16)
+
+    /// Effects on air that a saved clip would strip away, exposing what they
+    /// hide. Empty when nothing is being concealed. Read by both surfaces so
+    /// the standing caption and the confirmation cannot disagree.
+    public var clipConcealments: [String] {
+        ClipDisclosure.concealments(in: config, isPanicked: isPanicked)
+    }
+
+    /// ⌥⌘S — write the rolling buffer to a .mov (§5.15).
+    ///
+    /// The buffer records the camera upstream of every effect, so a save is
+    /// a remux of frames the call never saw in that form. When something on
+    /// air exists to hide the room, the write does not happen until the user
+    /// has read a sentence saying so and said yes.
+    public func saveLastSeconds() {
+        guard let pipeline else { return }
+        let samples = pipeline.replayBuffer.snapshot()
+        guard let format = pipeline.replayBuffer.sampleFormatDescription,
+              samples.count > 1 else {
+            warning = studio.replay.isArmed
+                ? WarningMessage(text: "Nothing buffered to save yet")
+                : WarningMessage(text: "Turn the rolling buffer on to save the last seconds",
+                                 action: .armBuffer)
+            return
+        }
+        guard capturePhase == .idle else { return }
+
+        let concealed = clipConcealments
+        guard concealed.isEmpty || confirmRawCameraSave(hiding: concealed) else { return }
+        guard let url = prepareCaptureURL(kind: .clip, fileExtension: "mov") else { return }
+
+        capturePhase = .writing
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result: CaptureResult
+            var summary: String?
+            do {
+                let plan = try ClipExporter.write(samples: samples,
+                                                  formatDescription: format, to: url)
+                result = .saved(url)
+                // The clip's real length, not the length that was asked for:
+                // the buffer is trimmed to a keyframe, so a 10 s window is
+                // routinely a 9 s file and saying otherwise invites a bug
+                // report.
+                summary = String(format: "Saved %.0f s of raw camera",
+                                 plan.durationSeconds.rounded())
+            } catch {
+                result = .failed((error as? CaptureError)?.errorDescription
+                                 ?? error.localizedDescription)
+            }
+            let text = summary
+            DispatchQueue.main.async { self?.finishCapture(result, summary: text) }
+        }
+    }
+
+    /// ⌥⌘⇧S — write one finished frame (§5.16). Pressed during a countdown
+    /// it cancels it: the second press of a shutter key is a change of mind
+    /// far more often than a second photo.
+    public func takeSnapshot() {
+        if case .countdown = capturePhase {
+            cancelCountdown()
+            return
+        }
+        guard capturePhase == .idle else { return }
+        let seconds = studio.capture.clampedCountdownSeconds
+        guard seconds > 0 else {
+            writeStill()
+            return
+        }
+        capturePhase = .countdown(remaining: seconds)
+        countdownTimer?.invalidate()
+        // .common mode: the countdown has to keep counting while a menu is
+        // tracking or a panel is up, which is exactly when someone uses it.
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.tickCountdown() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        countdownTimer = timer
+    }
+
+    private func tickCountdown() {
+        guard case .countdown(let remaining) = capturePhase else {
+            cancelCountdown()
+            return
+        }
+        guard remaining <= 1 else {
+            capturePhase = .countdown(remaining: remaining - 1)
+            return
+        }
+        countdownTimer?.invalidate()
+        countdownTimer = nil
+        writeStill()
+    }
+
+    public func cancelCountdown() {
+        countdownTimer?.invalidate()
+        countdownTimer = nil
+        if case .countdown = capturePhase { capturePhase = .idle }
+    }
+
+    /// nil restores ~/Movies/PRISM.
+    public func setCaptureFolder(_ url: URL?) {
+        studio.capture.folderPath = url?.path
+        if warning?.action == .chooseCaptureFolder {
+            warning = nil
+        }
+    }
+
+    public func dismissNotice() {
+        noticeTimer?.invalidate()
+        noticeTimer = nil
+        notice = nil
+    }
+
+    private func writeStill() {
+        guard let pipeline, let frame = pipeline.stillFrame() else {
+            capturePhase = .idle
+            warning = WarningMessage(text: CaptureError.noPicture.errorDescription ?? "")
+            return
+        }
+        let format = studio.capture.format
+        guard let url = prepareCaptureURL(kind: .still,
+                                          fileExtension: format.fileExtension) else {
+            capturePhase = .idle
+            return
+        }
+        capturePhase = .writing
+        // The frame is a pool buffer; holding it here keeps its IOSurface out
+        // of the free list until the encoder has copied the pixels out, which
+        // is the whole reason it is passed rather than the texture.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result: CaptureResult
+            do {
+                try StillExporter.write(frame, format: format, to: url)
+                result = .saved(url)
+            } catch {
+                result = .failed((error as? CaptureError)?.errorDescription
+                                 ?? error.localizedDescription)
+            }
+            DispatchQueue.main.async { self?.finishCapture(result, summary: nil) }
+        }
+    }
+
+    /// Resolves and proves the destination *before* anything is encoded — a
+    /// capture that fails after the work is done has already cost the user
+    /// the moment it was trying to keep.
+    private func prepareCaptureURL(kind: CaptureDestination.Kind,
+                                   fileExtension: String) -> URL? {
+        do {
+            let folder = try CaptureDestination.prepare(studio.capture.folderURL)
+            let name = CaptureDestination.fileName(kind: kind, date: Date(),
+                                                   fileExtension: fileExtension)
+            return CaptureDestination.uniqueURL(in: folder, fileName: name)
+        } catch {
+            warning = WarningMessage(
+                text: (error as? CaptureError)?.errorDescription ?? error.localizedDescription,
+                action: .chooseCaptureFolder)
+            return nil
+        }
+    }
+
+    /// A saved file the user cannot find is a file that was not saved, so
+    /// every success carries the URL. Successes expire on their own; the
+    /// warning row, which describes a standing problem, does not.
+    private func finishCapture(_ result: CaptureResult, summary: String?) {
+        capturePhase = .idle
+        switch result {
+        case .saved(let url):
+            notice = NoticeMessage(text: summary ?? "Saved \(url.lastPathComponent)",
+                                   symbolName: "checkmark.circle",
+                                   fileURL: url)
+            noticeTimer?.invalidate()
+            let timer = Timer(timeInterval: 12, repeats: false) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.notice = nil }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            noticeTimer = timer
+            // The chords work with every PRISM surface closed, so the only
+            // place a hotkey capture can be acknowledged is Notification
+            // Centre.
+            if !popoverOpen {
+                postNotification(body: "Saved \(url.lastPathComponent)")
+            }
+        case .failed(let reason):
+            warning = WarningMessage(text: reason)
+        }
+    }
+
+    /// The one confirmation in PRISM that is deliberately modal (§5.15).
+    ///
+    /// Everything else this app does is undoable or on air where the user can
+    /// see it. This writes a file of the room somebody chose to hide, and it
+    /// is triggered by a global chord that works with every window closed —
+    /// there is no surface a passive warning could appear on. Cancel is the
+    /// default button: a return key pressed out of habit must not disclose
+    /// anything.
+    private func confirmRawCameraSave(hiding names: [String]) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "This clip will show the room behind you."
+        alert.informativeText = """
+            PRISM records the camera before effects, so the saved file has no \
+            \(ClipDisclosure.phrase(names)) — and no sound. Nobody in your call sees \
+            this file, but whoever you send it to sees everything the camera did.
+            """
+        alert.addButton(withTitle: "Save the raw camera")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons[0].keyEquivalent = ""
+        alert.buttons[1].keyEquivalent = "\r"
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
     // The sections below are landing zones, one per feature still to be
     // built, and empty on purpose. Nine tracks append their intents into this
     // one file; disjoint regions are the difference between nine clean
     // additions and nine edits to the same hunk.
-
-    // MARK: - Intents: capture
-
-    /// The two capture chords answer honestly rather than doing nothing.
-    ///
-    /// A global hotkey that silently no-ops is indistinguishable from PRISM
-    /// having died, and someone mid-call will draw the second conclusion. A
-    /// visible sentence at least teaches something true.
-    public func saveLastSeconds() {
-        warning = WarningMessage(text: "Saving the last seconds isn't built yet.")
-    }
-
-    public func takeSnapshot() {
-        warning = WarningMessage(text: "Stills aren't built yet.")
-    }
 
     // MARK: - Intents: screen source
 

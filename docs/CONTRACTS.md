@@ -150,6 +150,10 @@ public final class VideoPipeline {
     public let faceTracker: FaceTracker
     public let replayBuffer: ReplayBuffer
     public let replayPlayer: ReplayPlayer
+    /// A few finished frames, scored, so a still can be the sharpest of
+    /// them (§5.16). Armed by `applyStudio` from `capture.prefersSharp`;
+    /// disarmed it holds nothing.
+    public let stillRing: StillRing
 
     /// Post-effects output: IOSurface-backed buffer ready for the sink,
     /// plus the final texture for the preview. Called on the capture queue.
@@ -175,6 +179,11 @@ public final class VideoPipeline {
     public func setDemandActive(_ active: Bool)
     /// 200ms output crossfade (preset switch, clip → live return).
     public func beginCrossfade(durationMs: Double)
+    /// §5.16 — the frame a still is written from: the sharpest of the last
+    /// 0.5 s when the still ring is armed, otherwise the last frame that
+    /// reached the sink. Post-effects either way, and a pool buffer, so the
+    /// caller copies the pixels out rather than holding it.
+    public func stillFrame() -> CVPixelBuffer?
     /// Preview texture retention: false tears the preview path down (§8.3).
     public var previewEnabled: Bool { get set }
 }
@@ -212,6 +221,95 @@ public final class FrameRing {
     /// windowMs 300, skipMs 0). Reads sharpnessBuffer CPU-side.
     public func sharpestFrame(nowTime: CMTime, windowMs: Double) -> CVPixelBuffer?
     public func reconfigure(width: Int, height: Int) throws
+}
+```
+
+### StillRing (`PRISM/Pipeline/StillRing.swift`)
+
+The output-side counterpart of FrameRing (§5.16): FrameRing holds the
+camera, which is what freeze needs and the wrong picture entirely for a
+still. Takes references to the pipeline's own pool buffers rather than
+copying, so the per-frame cost is one `prism_sharpness` threadgroup inside
+the frame's existing command buffer.
+
+```swift
+public final class StillRing {
+    public static let capacity = 6                // ~50 MB at 1080p, §7
+    public let sharpnessBuffer: MTLBuffer         // capacity × Float
+    public init(metal: MetalContext) throws
+    public var isArmed: Bool { get }
+    /// Disarming releases every held frame immediately.
+    public func setArmed(_ armed: Bool)
+    /// Retains the finished frame; returns the slot to score, or -1.
+    public func record(_ buffer: CVPixelBuffer, at hostSeconds: Double) -> Int
+    /// Called from the frame's completed handler — the pixels are not final
+    /// and the score is not written until the GPU says so.
+    public func publish(slot: Int)
+    public func sharpest(now: Double, windowSeconds: Double) -> CVPixelBuffer?
+}
+```
+
+### Export (`PRISM/Export/*.swift`)
+
+Frames onto disk (§5.15, §5.16). One destination layer serves both
+features; neither touches the GPU or the frame path.
+
+```swift
+public enum CaptureError: LocalizedError, Equatable {
+    case folderUnavailable(String), nothingBuffered, noPicture
+    case encodingFailed(String)
+    // errorDescription is a whole line of UI copy, not an error code (§8.4).
+}
+
+public enum CaptureDestination {
+    public enum Kind { case still, clip }         // "PRISM" / "PRISM Clip"
+    public static func fileName(kind: Kind, date: Date,
+                                fileExtension: String) -> String
+    public static func uniqueURL(in folder: URL, fileName: String,
+                                 exists: (URL) -> Bool) -> URL
+    /// Creates and proves writable BEFORE anything is encoded.
+    public static func prepare(_ folder: URL) throws -> URL
+}
+
+/// The pure half of §5.15: trim to the first keyframe, rebase to zero, and
+/// synthesise per-sample durations the ring's `.invalid` ones cannot supply.
+public struct ClipPlan: Equatable {
+    public struct Frame: Equatable {
+        public let index: Int
+        public let presentationSeconds: Double
+        public let durationSeconds: Double
+    }
+    public let frames: [ClipPlan.Frame]
+    public var durationSeconds: Double { get }
+}
+
+public enum ClipPlanner {
+    public static func plan(times: [Double], keyframes: [Bool]) -> ClipPlan?
+}
+
+public enum ClipExporter {
+    /// AVAssetWriter with `outputSettings: nil` — a remux, never a
+    /// re-encode. Cancels and deletes the partial file on any failure.
+    /// Blocking; call on a background queue.
+    @discardableResult
+    public static func write(samples: [ReplayBuffer.RecordedFrame],
+                             formatDescription: CMFormatDescription,
+                             to url: URL) throws -> ClipPlan
+}
+
+/// What a saved clip would reveal that the call does not (§5.15).
+public enum ClipDisclosure {
+    public static func concealments(in config: PipelineConfiguration,
+                                    isPanicked: Bool) -> [String]
+    public static func phrase(_ names: [String]) -> String
+    public static let alwaysTrue: String
+}
+
+public enum StillExporter {
+    /// CGImageDestination, never CIContext. Copies the pixels out first —
+    /// the pipeline reuses that pool buffer. Blocking; background queue.
+    public static func write(_ pixelBuffer: CVPixelBuffer,
+                             format: StillFormat, to url: URL) throws
 }
 ```
 
@@ -862,6 +960,8 @@ public final class AppState: ObservableObject {
     @Published public var clients: [CameraClient]         // signing ID + name
     public var clientsInUse: [String] { get }             // names, projected
     @Published public var warning: WarningMessage?
+    @Published public var notice: NoticeMessage?          // succeeded, expires
+    @Published public var capturePhase: CapturePhase      // §5.16 shutter
     @Published public var menuBarState: MenuBarState
     @Published public var setup: SetupStatus
     // Controls
@@ -971,11 +1071,21 @@ public final class AppState: ObservableObject {
     public func setStyleEffect(_ effect: StyleEffect)      // .normal = same intent as off
     public func raiseBudgetOneStep()                       // policy pressure action
     public func toggleSection(_ s: PopoverSection)
-    // Reached by ⌥⌘S / ⌥⌘⇧S / ⌥⌘D / ⌃⌥⌘T. Each says, in the warning row,
-    // that it is not built yet: a global chord that no-ops silently is
-    // indistinguishable from PRISM having died.
+    // Capture (§5.15, §5.16)
+    /// Effects on air a saved clip would strip away, exposing what they
+    /// hide. Both surfaces read this, so the standing caption and the
+    /// confirmation cannot disagree.
+    public var clipConcealments: [String] { get }
+    /// ⌥⌘S. Modal confirmation first whenever `clipConcealments` is
+    /// non-empty — the buffer is the raw camera, and this writes it.
     public func saveLastSeconds()
-    public func takeSnapshot()
+    public func takeSnapshot()                             // ⌥⌘⇧S; press again cancels
+    public func cancelCountdown()
+    public func setCaptureFolder(_ url: URL?)              // nil = ~/Movies/PRISM
+    public func dismissNotice()
+    // Reached by ⌥⌘D / ⌃⌥⌘T. Each says, in the warning row, that it is not
+    // built yet: a global chord that no-ops silently is indistinguishable
+    // from PRISM having died.
     public func toggleScreenSource()
     public func togglePrompter()
     public func quit()
@@ -988,7 +1098,12 @@ public final class AppState: ObservableObject {
   modifiers (`prismCard()`), animation constants gated on reduce-motion.
 - `PopoverView.swift` — full layout §8.3; `@EnvironmentObject var state:
   AppState`. Drag-and-drop of `.cube` onto the popover calls
-  `state.importLUT`. Bottom bar: gear opens Settings window, ✕ quits.
+  `state.importLUT`. Bottom bar: gear opens Settings window, ✕ quits. The
+  notice row sits under the warning row and carries `Show` when the event
+  produced a file — a saved file the user cannot find was not saved.
+- `CaptureSection.swift` / `MainWindow/CapturePane.swift` — §5.15/§5.16
+  tiles and settings. The "raw camera, no effects, no sound" caption is
+  standing rather than conditional; see §8.3.
 - `PreviewView.swift` — `NSViewRepresentable` MTKView; draws
   `state.previewTextureProvider()`; `isPaused = true` + released textures
   whenever `state.popoverOpen == false`. 288×162, `cardRadius`.
