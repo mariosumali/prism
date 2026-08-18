@@ -39,7 +39,9 @@ struct MomentsPane: View {
                 }
                 .disabled(!state.studio.replay.isArmed && !state.isLagging)
                 Spacer()
-                Text(state.studio.lag.holdToLag ? "hold ⌥⌘L" : "⌥⌘L")
+                Text(state.studio.lag.holdToLag
+                     ? "hold \(state.shortcutLabel(.lag))"
+                     : state.shortcutLabel(.lag))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -112,7 +114,7 @@ struct MomentsPane: View {
                     state.toggleBadConnection()
                 }
                 Spacer()
-                Text("⌥⌘B")
+                Text(state.shortcutLabel(.badConnection))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -199,7 +201,7 @@ struct MomentsPane: View {
                 }
                 .disabled(!state.studio.replay.isArmed && state.replayMode != .replay)
                 Spacer()
-                Text("⌥⌘R")
+                Text(state.shortcutLabel(.replay))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -227,7 +229,7 @@ struct MomentsPane: View {
                     state.toggleAway()
                 }
                 Spacer()
-                Text("⌥⌘A")
+                Text(state.shortcutLabel(.away))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -263,7 +265,7 @@ struct MomentsPane: View {
                     state.togglePanic()
                 }
                 Spacer()
-                Text("⌥⌘P")
+                Text(state.shortcutLabel(.panic))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

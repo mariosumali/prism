@@ -103,14 +103,14 @@ struct StudioPane: View {
 
     private var tiles: some View {
         HStack(alignment: .top, spacing: Metrics.itemGap) {
-            tileWithHint(hint: "⌥⌘F") {
+            tileWithHint(hint: state.shortcutLabel(.freeze)) {
                 ControlTile(title: "Freeze",
                             symbol: "pause.fill",
                             isActive: state.isFrozen) {
                     state.toggleFreeze()
                 }
             }
-            tileWithHint(hint: "⌥⌘M") {
+            tileWithHint(hint: state.shortcutLabel(.mute)) {
                 ControlTile(title: "Mute",
                             symbol: "mic.slash.fill",
                             isActive: state.isMuted) {

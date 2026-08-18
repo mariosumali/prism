@@ -2,10 +2,10 @@
 // PRISM
 //
 // Full preset management (§5.5): apply, reorder, rename, duplicate, delete,
-// JSON export/import, and hotkey assignment (⌥⌘1–9, the digits the Hotkeys
-// tap matches). Built-ins can be applied, reordered, duplicated, and given
-// hotkeys, but never renamed, edited, or deleted — PresetStore enforces the
-// same rules, so this UI just mirrors them.
+// JSON export/import, and hotkey assignment via the §5.15 recorder. Built-ins
+// can be applied, reordered, duplicated, and given hotkeys, but never
+// renamed, edited, or deleted — PresetStore enforces the same rules, so this
+// UI just mirrors them.
 //
 // Licensed under the Apache License, Version 2.0.
 
@@ -20,12 +20,6 @@ struct PresetsPane: View {
     @State private var newPresetName = ""
     @State private var renameTarget: Preset?
     @State private var renameText = ""
-
-    /// ANSI keycodes for the digit row, 1 through 9 (KeyCodeNames order).
-    private static let digitKeyCodes: [(label: String, keyCode: UInt16)] = [
-        ("1", 18), ("2", 19), ("3", 20), ("4", 21), ("5", 23),
-        ("6", 22), ("7", 26), ("8", 28), ("9", 25),
-    ]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -73,7 +67,7 @@ struct PresetsPane: View {
                 }
             }
             Spacer()
-            hotkeyMenu(for: preset)
+            hotkeyRecorder(for: preset)
             // Never disabled: activePresetID is not cleared when the live
             // configuration diverges from the preset, so "active" only means
             // "last applied" — re-applying must stay available (the popover's
@@ -104,25 +98,14 @@ struct PresetsPane: View {
         }
     }
 
-    private func hotkeyMenu(for preset: Preset) -> some View {
-        Menu(preset.hotkey?.displayString ?? "No hotkey") {
-            Button("None") {
-                state.presetStore.setHotkey(preset.id, hotkey: nil)
-            }
-            Divider()
-            ForEach(Self.digitKeyCodes, id: \.keyCode) { digit in
-                Button("⌥⌘\(digit.label)") {
-                    state.presetStore.setHotkey(
-                        preset.id,
-                        hotkey: HotkeyCombo(keyCode: digit.keyCode,
-                                            option: true, command: true))
-                }
-            }
+    /// The same recorder the built-in shortcuts use, so preset chords are
+    /// not limited to the nine digits a menu could list — and so they go
+    /// through the same conflict check, which a menu of ⌥⌘1–9 never did.
+    private func hotkeyRecorder(for preset: Preset) -> some View {
+        HotkeyRecorderField(combo: preset.hotkey,
+                            label: "Shortcut for \(preset.name)") { combo in
+            state.setPresetShortcut(combo, for: preset.id)
         }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-        .accessibilityLabel("Hotkey for \(preset.name)")
-        .accessibilityValue(preset.hotkey?.displayString ?? "none")
     }
 
     // MARK: - Sheets

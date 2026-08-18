@@ -44,6 +44,24 @@ public enum MenuBarState: Equatable {
     case muted         // filled + slash
     case panicked      // filled + raised hand, red tint
     case error         // filled, red tint
+
+    /// How this state reads in the session log (§5.17), in the past tense a
+    /// history wants rather than the label a live badge wants.
+    public var sessionDescription: String {
+        switch self {
+        case .idle: return "No app is using PRISM Camera"
+        case .live: return "Passing the camera through"
+        case .effects: return "Effects on air"
+        case .replaying: return "Replay on air"
+        case .away: return "Away loop on air"
+        case .badConnection: return "Bad connection on air"
+        case .lagging: return "Deliberate delay engaged"
+        case .frozen: return "Output frozen"
+        case .muted: return "Microphone muted"
+        case .panicked: return "Panic engaged"
+        case .error: return "PRISM stopped working"
+        }
+    }
 }
 
 public enum PermissionState: Equatable {

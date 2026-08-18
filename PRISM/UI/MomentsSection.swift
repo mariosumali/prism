@@ -45,7 +45,7 @@ struct MomentsSection: View {
                     accessibilityValue: replayAccessibilityValue) {
             state.toggleReplay()
         }
-        .help("Rewind the last \(Int(state.studio.replay.clampedBufferSeconds)) seconds · ⌥⌘R")
+        .help("Rewind the last \(Int(state.studio.replay.clampedBufferSeconds)) seconds\(state.shortcutSuffix(.replay))")
     }
 
     private var awayTile: some View {
@@ -55,7 +55,7 @@ struct MomentsSection: View {
                     accessibilityValue: state.isAway ? "idle loop on air" : "off") {
             state.toggleAway()
         }
-        .help("Loop a still-here idle clip while you step away · ⌥⌘A")
+        .help("Loop a still-here idle clip while you step away\(state.shortcutSuffix(.away))")
     }
 
     private var panicTile: some View {
@@ -74,7 +74,7 @@ struct MomentsSection: View {
         if state.studio.panic.mutes { parts.append("mute") }
         if state.studio.panic.swapsBackdrop { parts.append("backdrop") }
         let actions = parts.isEmpty ? "nothing yet — configure it" : parts.joined(separator: " + ")
-        return "\(actions) · ⌥⌘P"
+        return actions + state.shortcutSuffix(.panic)
     }
 
     private var lagTile: some View {
@@ -90,7 +90,8 @@ struct MomentsSection: View {
     private var lagHelp: String {
         let seconds = state.studio.lag.delaySeconds
         let audio = state.studio.lag.delaysAudio ? "picture and sound" : "picture only"
-        return String(format: "Fall %.1fs behind live (%@) · hold ⌥⌘L", seconds, audio)
+        let held = state.shortcut(for: .lag).map { " · hold \($0.displayString)" } ?? ""
+        return String(format: "Fall %.1fs behind live (%@)", seconds, audio) + held
     }
 
     /// §5.14 — tile copy is "Glitch" because "Bad connection" cannot fit a
@@ -111,7 +112,8 @@ struct MomentsSection: View {
             ? String(format: " and %.1f s behind live",
                      state.studio.connection.lagSeconds)
             : ""
-        return "Look like a bad connection — pixelated, choppy\(lag) · ⌥⌘B"
+        return "Look like a bad connection — pixelated, choppy\(lag)"
+            + state.shortcutSuffix(.badConnection)
     }
 
     /// Same honesty rule as the lag line: while the picture on air is

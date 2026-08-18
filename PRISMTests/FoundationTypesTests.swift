@@ -150,7 +150,14 @@ final class FoundationTypesTests: XCTestCase {
         let data = try JSONEncoder().encode(preset)
         let decoded = try JSONDecoder().decode(Preset.self, from: data)
         XCTAssertEqual(decoded, preset)
-        XCTAssertEqual(decoded.hotkey?.displayString, "⌥⌘1")
+        // displayString renders the key through the active keyboard layout
+        // (§5.15), so keycode 18 is only "1" on layouts where it is: on a
+        // French layout that key types "&" and is named "1", on Dvorak it is
+        // "1" again, and asserting the literal here would fail on a machine
+        // that is behaving correctly. What the round trip owes us is the
+        // modifier prefix and its order.
+        XCTAssertEqual(decoded.hotkey?.displayString, "⌥⌘" + KeyCodeNames.name(for: 18))
+        XCTAssertTrue(decoded.hotkey?.displayString.hasPrefix("⌥⌘") == true)
     }
 
     func testVideoFormatJSONKeysMatchExtensionContract() throws {
