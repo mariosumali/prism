@@ -10,15 +10,37 @@
 import Foundation
 import Metal
 
-/// Fixed chain order (§3.3):
-/// Clip substitution → Freeze → Geometry → Adjust → LUT → Background blur → Output fit
+/// Fixed chain order (§3.3, extended):
+/// Clip → Replay → Freeze → Eye contact → Geometry → Adjust → LUT →
+/// Background blur → Virtual background → Overlay → Style → Bad connection →
+/// Output fit
+///
+/// The three substituting stages come first and in escalating order of
+/// authority: a clip replaces the camera, a replay overrides the clip, and a
+/// freeze overrides both — each is a more deliberate "stop showing me live"
+/// than the one before it. Eye contact runs before Geometry so it warps in
+/// the same space Vision measured the landmarks in. Virtual background and
+/// Overlay run after blur because both consume the same person mask and must
+/// composite over the finished look, and Overlay runs last of the two so a
+/// foreground layer sits above a replaced background. Style is the last
+/// composing stage: a preset look applies to the finished scene — backdrop
+/// and overlays included — exactly as Photo Booth styles a finished photo.
+/// Bad connection sits after everything the user composes: a struggling
+/// network degrades the finished picture, styled look included — a crisp
+/// overlay on a pixelated face would give the game away instantly.
 public enum StageID: String, Codable, CaseIterable, Hashable, Comparable {
     case clip
+    case replay
     case freeze
+    case gaze
     case geometry
     case adjust
     case lut
     case blur
+    case background
+    case overlay
+    case style       // §5.4 preset visual effects (Photo Booth-style looks)
+    case connection  // §5.14 simulated bad connection; engaged, not preset
     case outputFit   // always-on final fit; not user-visible as a stage
 
     /// Position in the chain; also the degradation tie-breaker (§3.4:
@@ -26,12 +48,18 @@ public enum StageID: String, Codable, CaseIterable, Hashable, Comparable {
     public var chainIndex: Int {
         switch self {
         case .clip: return 0
-        case .freeze: return 1
-        case .geometry: return 2
-        case .adjust: return 3
-        case .lut: return 4
-        case .blur: return 5
-        case .outputFit: return 6
+        case .replay: return 1
+        case .freeze: return 2
+        case .gaze: return 3
+        case .geometry: return 4
+        case .adjust: return 5
+        case .lut: return 6
+        case .blur: return 7
+        case .background: return 8
+        case .overlay: return 9
+        case .style: return 10
+        case .connection: return 11
+        case .outputFit: return 12
         }
     }
 
@@ -43,11 +71,17 @@ public enum StageID: String, Codable, CaseIterable, Hashable, Comparable {
     public var displayName: String {
         switch self {
         case .clip: return "Clip"
+        case .replay: return "Replay"
         case .freeze: return "Freeze"
+        case .gaze: return "Eye contact"
         case .geometry: return "Framing"
         case .adjust: return "Adjust"
         case .lut: return "LUT"
         case .blur: return "Background blur"
+        case .background: return "Virtual background"
+        case .overlay: return "Overlay"
+        case .style: return "Style"
+        case .connection: return "Bad connection"
         case .outputFit: return "Output fit"
         }
     }
@@ -126,6 +160,17 @@ public struct LatencyReport: Equatable {
     public var audioAddedMs: Double
     public var syncSkewMs: Double            // video − audio
 
+    /// Latency the user asked for (§5.12 lag switch), reported separately
+    /// from `totalAddedMs` rather than folded into it.
+    ///
+    /// Both choices are defensible and this one is deliberate. The meter's
+    /// whole job is showing what PRISM costs you against a budget; three
+    /// seconds of requested delay would peg it permanently and destroy the
+    /// one number the app exists to keep honest. So the meter keeps
+    /// measuring the involuntary cost, and the deliberate delay is shown
+    /// beside it in full — never hidden, never averaged in.
+    public var deliberateDelayMs: Double
+
     public init(captureMs: Double = 0,
                 stages: [StageID: Double] = [:],
                 handoffMs: Double = 0,
@@ -134,7 +179,8 @@ public struct LatencyReport: Equatable {
                 frameIntervalMs: Double = 33.3,
                 droppedFrames: Int = 0,
                 audioAddedMs: Double = 0,
-                syncSkewMs: Double = 0) {
+                syncSkewMs: Double = 0,
+                deliberateDelayMs: Double = 0) {
         self.captureMs = captureMs
         self.stages = stages
         self.handoffMs = handoffMs
@@ -144,5 +190,10 @@ public struct LatencyReport: Equatable {
         self.droppedFrames = droppedFrames
         self.audioAddedMs = audioAddedMs
         self.syncSkewMs = syncSkewMs
+        self.deliberateDelayMs = deliberateDelayMs
     }
+
+    /// Everything between the lens and the client app, deliberate delay
+    /// included. This is the number that answers "how far behind am I?"
+    public var endToEndMs: Double { totalAddedMs + deliberateDelayMs }
 }

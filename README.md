@@ -100,6 +100,50 @@ Default behavior is transparent pass-through. On top of that, PRISM adds:
 - **GPU effects chain** — framing (zoom/pan/rotate/flip), color adjust,
   LUTs, background blur, auto-framing — all Metal, all measured, all
   governed by a visible latency budget.
+- **Eye contact** (⌥⌘E) — reads notes off-camera while appearing to look at
+  the lens. Vision's face-landmark model measures how far your pupils have
+  drifted from the centre of your own eyes, and a Metal warp pulls part of
+  that back — so it works out where your camera is by itself. It moves the
+  eyes you have rather than synthesizing new ones, and clamps at about half
+  an iris width, because a subtly-wrong eye beats an uncanny one.
+- **Virtual backgrounds** — full replacement with a still, a looping video,
+  or a flat color, sharing one person-segmentation pass with background blur
+  rather than paying for a second. If the file is still opening, you get the
+  color: this never falls back to showing your actual room.
+- **Green-screen compositing** — drop in up to three keyed layers (chroma or
+  luma, any key color) and place them in front of you or behind you. An
+  animated hat, a fire border, a lower third, a picture-in-picture of a
+  second feed. Same operation each time; PRISM becomes a stage.
+- **Instant replay** (⌥⌘R) — rewind and scrub the last 4–30 seconds instead
+  of an awkward redo, played back fast enough to catch up to live. Frames go
+  through the hardware H.264 encoder, so ten seconds costs ~10 MB rather
+  than the ~2.5 GB it would cost raw.
+- **Away loop** (⌥⌘A) — an auto-generated "still here" idle loop instead of
+  a static freeze. PRISM searches the buffer for the stillest stretch whose
+  first and last frames match, so the cut is as close to invisible as the
+  recording allows, then crossfades the seam.
+- **Panic** (⌥⌘P) — one chord: freeze + mute + swap to a "back in a bit"
+  backdrop, each part switchable. Pressing it again restores exactly what
+  you had, including a freeze or mute you'd engaged yourself.
+- **Lag switch** (hold ⌥⌘L) — deliberate added latency, the exact inverse of
+  everything else here. Engaging holds the picture where it is and only then
+  resumes, up to 10 seconds behind: a stall, not a rewind, because jumping
+  back would make you say the same thing twice. Audio follows by default.
+  Release snaps back to live, or catches up by playing the backlog out fast.
+  The delay is always stated outright — the latency meter keeps measuring
+  what PRISM costs you involuntarily, and the status line gains `+3.0 s lag`
+  next to it.
+- **Bad connection** (⌥⌘B) — one switch that makes the feed look like a
+  struggling network: macroblock pixelation, starved colour, a collapsed
+  frame rate, and (by default) a short fall behind live riding the lag
+  switch's transport. One severity knob drives all of it, because "my
+  connection is struggling" is one story, not three settings. The full chain
+  keeps running clean underneath, so recovery is instant.
+
+The rolling buffer behind instant replay and the away loop is **off by
+default** and records only while something is actually using PRISM. An armed
+buffer runs a hardware encoder on every frame, and a resident agent should
+cost nothing for a feature you aren't using.
 
 PRISM shows in both the Dock and the menu bar; clicking the Dock icon (or
 the window button in the popover) opens the main PRISM window — a full

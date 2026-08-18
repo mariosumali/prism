@@ -21,6 +21,9 @@ struct PresetBar: View {
     @State private var renameText = ""
 
     var body: some View {
+        // The strip bleeds into the popover's gutters so chips slide under
+        // the edges instead of being cut in half at the content margin,
+        // and the fade says "there is more over there" without a scrollbar.
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: Metrics.itemGap) {
                 ForEach(state.presets) { preset in
@@ -28,10 +31,29 @@ struct PresetBar: View {
                 }
                 addChip
             }
+            .padding(.horizontal, Metrics.gutter)
+            .padding(.vertical, 2)   // room for focus rings
         }
+        .padding(.horizontal, -Metrics.gutter)
+        .mask(edgeFade)
         .sheet(isPresented: $showingSaveSheet) { saveSheet }
         .sheet(item: $renameTarget) { preset in renameSheet(preset) }
         .accessibilityLabel("Presets")
+    }
+
+    /// Opaque across the content width, fading over the gutters the strip
+    /// now extends into — at rest nothing visible is dimmed, because the
+    /// chips are inset by exactly that much.
+    private var edgeFade: some View {
+        LinearGradient(
+            stops: [
+                .init(color: .clear, location: 0),
+                .init(color: .black, location: Metrics.gutter / Metrics.popoverWidth),
+                .init(color: .black, location: 1 - Metrics.gutter / Metrics.popoverWidth),
+                .init(color: .clear, location: 1),
+            ],
+            startPoint: .leading,
+            endPoint: .trailing)
     }
 
     // MARK: - Chips

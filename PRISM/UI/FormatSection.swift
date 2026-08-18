@@ -42,6 +42,11 @@ struct FormatSection: View {
                         }
                     }
                 }
+                // §6 — the trade-off, on the control it belongs to. It is
+                // spelled out in full in the main window's Format pane; two
+                // wrapped lines of standing text at the bottom of the
+                // popover is where a dropdown stops being scannable.
+                .help("Higher frame rates lower total latency but leave less time for effects")
                 row("Latency") {
                     Picker("Latency", selection: policyBinding) {
                         ForEach(LatencyPolicy.allCases, id: \.self) { policy in
@@ -51,11 +56,6 @@ struct FormatSection: View {
                     .focused($latencyPolicyFocused)
                     .accessibilityFocused($latencyPolicyA11yFocused)
                 }
-                // §6 — say the trade-off plainly rather than making users infer it.
-                Text("Higher frame rates lower total latency but leave less time for effects")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
             }
             .prismCard()
         } label: {

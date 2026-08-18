@@ -27,12 +27,22 @@ public struct AudioDeviceInfo: Identifiable, Equatable, Hashable {
 }
 
 /// §8.2 — drives the menu bar glyph.
+///
+/// The states below `.effects` all share one property: forgetting you are in
+/// one is the most damaging thing this app can do to you. That is why replay,
+/// away and panic each get their own glyph rather than folding into frozen —
+/// "why can nobody see me moving" has to be answerable at a glance.
 public enum MenuBarState: Equatable {
     case idle          // not in use by any client: outline, 40% opacity
     case live          // pass-through: outline, full opacity
     case effects       // filled
+    case replaying     // filled + rewind badge: clients are seeing the past
+    case away          // filled + moon badge: the idle loop is on air
+    case badConnection // filled + wifi badge: §5.14 fake bad connection on air
+    case lagging       // filled + hourglass badge: deliberate delay engaged
     case frozen        // filled + pause bar
     case muted         // filled + slash
+    case panicked      // filled + raised hand, red tint
     case error         // filled, red tint
 }
 
@@ -68,6 +78,7 @@ public struct SetupStatus: Equatable {
 public struct WarningMessage: Equatable, Identifiable {
     public enum Action: Equatable {
         case raiseBudget          // §3.4 pinned chain over budget
+        case armBuffer            // §5.9 replay/away asked for without a buffer
         case openSettings
         case none
     }
@@ -97,7 +108,43 @@ public struct StageStatus: Equatable {
 
 /// Popover disclosure groups remember their state (§8.3).
 public enum PopoverSection: String, CaseIterable {
-    case framing, effects, format
+    case framing, effects, format, scene, moments, voice
+}
+
+/// What is behind you, as one choice (§5.4, §5.7).
+///
+/// Blur and replacement are separate stages with separate costs, but they
+/// answer the same question and cannot both be true — blurring a background
+/// you have already replaced is nonsense. Presenting them as one control
+/// with modes is the honest shape; AppState.setBackgroundMode keeps the two
+/// stages consistent underneath.
+public enum BackgroundMode: String, CaseIterable, Identifiable, Hashable {
+    case off, blur, color, image, video
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .off: return "Off"
+        case .blur: return "Blur"
+        case .color: return "Colour"
+        case .image: return "Image"
+        case .video: return "Video"
+        }
+    }
+
+    public var symbolName: String {
+        switch self {
+        case .off: return "person.crop.square"
+        case .blur: return "drop.fill"
+        case .color: return "paintpalette"
+        case .image: return "photo"
+        case .video: return "film.stack"
+        }
+    }
+
+    /// The modes that need a file chosen before they render anything.
+    public var needsAsset: Bool { self == .image || self == .video }
 }
 
 /// The building blocks of the menu bar dropdown (§8.3), each independently
@@ -110,7 +157,10 @@ public enum PopoverModule: String, Codable, CaseIterable, Identifiable {
     case latencyMeter
     case inUse
     case controls      // Freeze / Mute / Clip tiles plus the clip scrub row
+    case moments       // Replay / Away / Panic tiles plus the replay transport
     case presets
+    case scene         // background mode + eye contact
+    case voice         // §5.13 microphone voice effects
     case framing
     case effects
     case format
@@ -125,7 +175,10 @@ public enum PopoverModule: String, Codable, CaseIterable, Identifiable {
         case .latencyMeter: return "Latency meter"
         case .inUse: return "In-use apps"
         case .controls: return "Freeze / Mute / Clip"
+        case .moments: return "Replay / Away / Panic"
         case .presets: return "Presets"
+        case .scene: return "Scene"
+        case .voice: return "Voice"
         case .framing: return "Framing"
         case .effects: return "Effects"
         case .format: return "Format"
@@ -140,7 +193,10 @@ public enum PopoverModule: String, Codable, CaseIterable, Identifiable {
         case .latencyMeter: return "gauge.medium"
         case .inUse: return "app.connected.to.app.below.fill"
         case .controls: return "square.grid.3x1.below.line.grid.1x2"
+        case .moments: return "backward.end.alt.fill"
         case .presets: return "square.stack"
+        case .scene: return "theatermasks"
+        case .voice: return "waveform.and.mic"
         case .framing: return "crop.rotate"
         case .effects: return "wand.and.stars"
         case .format: return "rectangle.on.rectangle"

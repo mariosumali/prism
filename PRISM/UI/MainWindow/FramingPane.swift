@@ -48,9 +48,10 @@ struct FramingPane: View {
             Section("Rotation") {
                 PrismSliderRow(label: "Rotate",
                                value: geometryBinding(\.rotationDegrees),
-                               range: -15...15,
+                               range: -180...180,
                                defaultValue: 0,
-                               fractionDigits: 0)
+                               fractionDigits: 0,
+                               unit: "°")
                 Picker("Orientation", selection: geometryBinding(\.orientation)) {
                     ForEach(Orientation.allCases, id: \.self) { orientation in
                         Text("\(orientation.rawValue)°").tag(orientation)

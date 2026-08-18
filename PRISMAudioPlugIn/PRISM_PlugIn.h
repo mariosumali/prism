@@ -46,6 +46,20 @@ enum : UInt32 {
     kPRISM_ChannelCount           = PRISM_CHANNELS,     // 2
 };
 
+// Read-anchor self-healing (SPEC §4.3: a late client must not underrun, and
+// M4 demands clean pass-through over 30 minutes). The device's sample clock
+// is synthesized from mach_absolute_time while the ring's write head advances
+// on the physical microphone's clock; the two share no oscillator. When the
+// window a cycle asks for leaves the ring's valid range — producer started
+// after StartIO, app restarted, or the clocks drifted apart — the anchor is
+// slid so the window lands kPRISM_ReanchorCushionFrames behind the write
+// head. The cushion absorbs producer burstiness (device buffers up to 512
+// frames) plus minutes of clock drift between corrections.
+enum : UInt32 {
+    kPRISM_ReanchorCushionFrames  = 1024,   // ~21ms behind the write head
+    kPRISM_MaxCushionFrames       = 8192,   // ~171ms; beyond this, trim latency
+};
+
 // 48000 Hz is the only supported rate.
 #define kPRISM_SampleRate          PRISM_SAMPLE_RATE
 

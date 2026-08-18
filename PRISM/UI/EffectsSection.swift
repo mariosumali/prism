@@ -1,7 +1,7 @@
 // EffectsSection.swift
 // PRISM
 //
-// Collapsible Effects section (§8.3): Adjust, LUT, and Blur rows with
+// Collapsible Effects section (§8.3): Adjust, LUT, Style, and Blur rows with
 // per-stage measured cost at .caption2 secondary, inline pickers, pin
 // ("Require this effect") via context menu, and the auto-disabled caption.
 //
@@ -21,6 +21,9 @@ struct EffectsSection: View {
                 effectRow(.lut, title: "LUT") {
                     lutPicker
                 }
+                effectRow(.style, title: "Style") {
+                    stylePicker
+                }
                 effectRow(.blur, title: "Blur") {
                     blurQualityPicker
                 }
@@ -33,6 +36,15 @@ struct EffectsSection: View {
     }
 
     // MARK: - Rows
+
+    /// The cost column is reserved for the whole section as soon as any one
+    /// stage reports a number, so the switches hold a single vertical line
+    /// instead of jogging sideways as stages are turned on and off.
+    private var showsCostColumn: Bool {
+        [StageID.adjust, .lut, .style, .blur].contains {
+            (state.stageStatus[$0] ?? StageStatus()).measuredMs > 0
+        }
+    }
 
     @ViewBuilder
     private func effectRow<Accessory: View>(
@@ -53,9 +65,10 @@ struct EffectsSection: View {
                     .controlSize(.mini)
                     .accessibilityLabel(title)
                     .accessibilityValue(state.editingConfig.flags(for: id).enabled ? "on" : "off")
-                if status.measuredMs > 0 {
+                if showsCostColumn {
                     // §8.6 — per-stage cost inline, .caption2 .secondary.
-                    Text(String(format: "%.1f ms", status.measuredMs))
+                    Text(status.measuredMs > 0
+                         ? String(format: "%.1f ms", status.measuredMs) : "")
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.secondary)
                         .frame(width: 44, alignment: .trailing)
@@ -65,11 +78,37 @@ struct EffectsSection: View {
                 Text("Off to keep video smooth")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+            } else if let reason = state.editingConfig.inertReason(id) {
+                inertCaption(id, reason: reason)
             }
         }
         .contextMenu {
             // §3.4 — pinning exempts a stage from automatic degradation.
             Toggle("Require this effect", isOn: pinnedBinding(id))
+        }
+    }
+
+    /// A switch that is on and changing nothing says so — and, where this
+    /// popover holds no control that would fix it, points at the surface that
+    /// does. Adjust's five parameters live only in the main window, so its row
+    /// here can otherwise look permanently broken (§8.4). Style's intensity
+    /// slider lives there too, so an intensity of 0 is the same trap: picking
+    /// looks here changes nothing until the main window fixes the slider.
+    @ViewBuilder
+    private func inertCaption(_ id: StageID, reason: String) -> some View {
+        HStack(spacing: Metrics.itemGap) {
+            Text(reason)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            if id == .adjust {
+                Button("Set adjustments…") { state.showMainWindow() }
+                    .buttonStyle(.link)
+                    .font(.caption2)
+            } else if id == .style, state.editingConfig.style.intensity <= 0 {
+                Button("Set intensity…") { state.showMainWindow() }
+                    .buttonStyle(.link)
+                    .font(.caption2)
+            }
         }
     }
 
@@ -84,6 +123,32 @@ struct EffectsSection: View {
         .controlSize(.small)
         .fixedSize()
         .accessibilityLabel("LUT")
+    }
+
+    private var stylePicker: some View {
+        Picker("Style", selection: styleEffectBinding) {
+            Text(StyleEffect.normal.displayName).tag(StyleEffect.normal)
+            Section("Distortions") {
+                ForEach(StyleEffect.distortions) { effect in
+                    Text(effect.displayName).tag(effect)
+                }
+            }
+            Section("Motion") {
+                ForEach(StyleEffect.motion) { effect in
+                    Text(effect.displayName).tag(effect)
+                }
+            }
+            Section("Looks") {
+                ForEach(StyleEffect.looks) { effect in
+                    Text(effect.displayName).tag(effect)
+                }
+            }
+        }
+        .pickerStyle(.menu)
+        .labelsHidden()
+        .controlSize(.small)
+        .fixedSize()
+        .accessibilityLabel("Style")
     }
 
     private var blurQualityPicker: some View {
@@ -130,9 +195,13 @@ struct EffectsSection: View {
     private var lutNameBinding: Binding<String> {
         Binding(
             get: { state.editingConfig.lut.lutName },
-            set: { name in
-                state.updateEditing { $0.lut.lutName = name }
-            })
+            set: { name in state.setLUTName(name) })
+    }
+
+    private var styleEffectBinding: Binding<StyleEffect> {
+        Binding(
+            get: { state.editingConfig.style.effect },
+            set: { state.setStyleEffect($0) })
     }
 
     private var blurQualityBinding: Binding<BlurQuality> {

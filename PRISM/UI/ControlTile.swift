@@ -40,6 +40,11 @@ struct ControlTile: View {
                     .symbolVariant(differentiateWithoutColor && isActive ? .fill : .none)
                 Text(title)
                     .font(.body)
+                    // Rows of four tiles are 66pt wide; a label never wraps
+                    // to a second line inside a tile.
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                    .padding(.horizontal, 2)
             }
             .foregroundStyle(isActive ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
             .frame(maxWidth: .infinity)

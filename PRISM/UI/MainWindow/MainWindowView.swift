@@ -14,13 +14,17 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 enum MainPane: String, CaseIterable, Identifiable {
-    case studio, framing, effects, format, devices, presets, menuBar, general, about
+    case studio, scene, moments, voice, framing, effects, format, devices,
+         presets, menuBar, general, about
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .studio: return "Studio"
+        case .scene: return "Scene"
+        case .moments: return "Moments"
+        case .voice: return "Voice"
         case .framing: return "Framing"
         case .effects: return "Effects"
         case .format: return "Format & Latency"
@@ -35,6 +39,9 @@ enum MainPane: String, CaseIterable, Identifiable {
     var symbol: String {
         switch self {
         case .studio: return "video"
+        case .scene: return "theatermasks"
+        case .moments: return "backward.end.alt.fill"
+        case .voice: return "waveform.and.mic"
         case .framing: return "crop.rotate"
         case .effects: return "wand.and.stars"
         case .format: return "rectangle.on.rectangle"
@@ -85,6 +92,9 @@ struct MainWindowView: View {
     private func paneView(_ pane: MainPane) -> some View {
         switch pane {
         case .studio: StudioPane(navigateToFormat: { selectedPane = .format })
+        case .scene: ScenePane()
+        case .moments: MomentsPane()
+        case .voice: VoicePane()
         case .framing: FramingPane()
         case .effects: EffectsPane()
         case .format: FormatPane()
@@ -188,6 +198,12 @@ private struct GeneralPane: View {
                 LabeledContent("Freeze", value: "⌥⌘F")
                 LabeledContent("Mute", value: "⌥⌘M")
                 LabeledContent("Freeze and mute", value: "⌥⌘⇧F")
+                LabeledContent("Instant replay", value: "⌥⌘R")
+                LabeledContent("Away loop", value: "⌥⌘A")
+                LabeledContent("Panic", value: "⌥⌘P")
+                LabeledContent("Eye contact", value: "⌥⌘E")
+                LabeledContent("Lag switch", value: "⌥⌘L")
+                LabeledContent("Voice changer", value: "⌃⌥⌘V")
                 ForEach(state.presets.filter { $0.hotkey != nil }) { preset in
                     LabeledContent(preset.name,
                                    value: preset.hotkey?.displayString ?? "")

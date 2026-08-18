@@ -7,6 +7,7 @@
 //
 // Licensed under the Apache License, Version 2.0.
 
+import Metal
 import XCTest
 
 final class FoundationTypesTests: XCTestCase {
@@ -69,7 +70,31 @@ final class FoundationTypesTests: XCTestCase {
 
     func testChainOrderIsFixed() {
         let ordered = StageID.allCases.sorted()
-        XCTAssertEqual(ordered, [.clip, .freeze, .geometry, .adjust, .lut, .blur, .outputFit])
+        XCTAssertEqual(ordered, [.clip, .replay, .freeze, .gaze, .geometry,
+                                 .adjust, .lut, .blur, .background, .overlay,
+                                 .style, .connection, .outputFit])
+    }
+
+    /// The three substituting stages escalate: a replay overrides a clip, a
+    /// freeze overrides a replay. Later stages write the whole frame, so
+    /// chain position IS the precedence.
+    func testSubstitutionStagesEscalate() {
+        XCTAssertLessThan(StageID.clip.chainIndex, StageID.replay.chainIndex)
+        XCTAssertLessThan(StageID.replay.chainIndex, StageID.freeze.chainIndex)
+    }
+
+    /// Eye contact warps in the space Vision measured landmarks in, so it
+    /// must precede any geometric transform.
+    func testGazePrecedesGeometry() {
+        XCTAssertLessThan(StageID.gaze.chainIndex, StageID.geometry.chainIndex)
+    }
+
+    /// Both mask consumers composite over the finished look, and a
+    /// foreground overlay layer must land above a replaced background.
+    func testCompositingStagesFollowTheLook() {
+        XCTAssertLessThan(StageID.lut.chainIndex, StageID.background.chainIndex)
+        XCTAssertLessThan(StageID.background.chainIndex, StageID.overlay.chainIndex)
+        XCTAssertLessThan(StageID.overlay.chainIndex, StageID.outputFit.chainIndex)
     }
 
     func testDegradationVictimOrdering() {
@@ -148,6 +173,84 @@ final class FoundationTypesTests: XCTestCase {
         var geometry = GeometrySettings()
         geometry.orientation = .deg90
         XCTAssertFalse(geometry.isIdentity)
+    }
+
+    func testNeutralLUTNameIsCaseInsensitive() {
+        XCTAssertTrue(LUTSettings.isNeutral("Neutral"))
+        XCTAssertTrue(LUTSettings.isNeutral("neutral"))
+        XCTAssertFalse(LUTSettings.isNeutral("Warm"))
+        XCTAssertTrue(LUTSettings().isNeutral, "the default LUT is the identity")
+    }
+
+    // MARK: Inert stages — enabled but skipped by the same fast paths
+
+    /// The switch says on, the pipeline skips the pass, the picture does not
+    /// change. Every Effects surface reads isInert/inertReason to say so, so
+    /// the mapping from "identity settings" to "inert" is load-bearing UI.
+    func testInertDetectionMatchesTheWantsEncodeFastPaths() {
+        var config = PipelineConfiguration()
+
+        // Off is not inert — there is nothing misleading about an off switch.
+        XCTAssertFalse(config.isInert(.adjust))
+        XCTAssertNil(config.inertReason(.adjust))
+
+        config.flags[.adjust] = StageFlags(enabled: true)
+        XCTAssertTrue(config.isInert(.adjust), "default adjustments are identity")
+        XCTAssertNotNil(config.inertReason(.adjust))
+        config.adjust.exposureEV = 0.5
+        XCTAssertFalse(config.isInert(.adjust))
+        XCTAssertNil(config.inertReason(.adjust))
+
+        config.flags[.lut] = StageFlags(enabled: true)
+        XCTAssertTrue(config.isInert(.lut), "Neutral IS the identity LUT")
+        config.lut.lutName = "Warm"
+        XCTAssertFalse(config.isInert(.lut))
+        config.lut.strength = 0
+        XCTAssertTrue(config.isInert(.lut), "zero strength applies nothing")
+
+        config.flags[.geometry] = StageFlags(enabled: true)
+        XCTAssertTrue(config.isInert(.geometry))
+        config.geometry.zoom = 1.5
+        XCTAssertFalse(config.isInert(.geometry))
+
+        config.flags[.overlay] = StageFlags(enabled: true)
+        XCTAssertTrue(config.isInert(.overlay), "no layer has a file")
+
+        // Blur and virtual background always change the picture when on —
+        // blur waits for the mask, background falls back to its colour.
+        config.flags[.blur] = StageFlags(enabled: true)
+        config.flags[.background] = StageFlags(enabled: true)
+        XCTAssertFalse(config.isInert(.blur))
+        XCTAssertFalse(config.isInert(.background))
+    }
+
+    /// The stages that decline to encode and the stages reported inert have
+    /// to be the same set, or a surface promises a change the pipeline skips.
+    func testInertStagesAreExactlyTheStagesThatDeclineToEncode() throws {
+        guard MTLCreateSystemDefaultDevice() != nil else {
+            throw XCTSkip("No Metal device on this host")
+        }
+        let metal = try MetalContext()
+
+        var config = PipelineConfiguration()
+        for id in StageID.allCases {
+            config.flags[id] = StageFlags(enabled: true)
+        }
+
+        let adjust = try AdjustStage(metal: metal)
+        adjust.isEnabled = true
+        adjust.settings = config.adjust
+        XCTAssertEqual(adjust.wantsEncode(), !config.isInert(.adjust))
+
+        let geometry = try GeometryStage(metal: metal)
+        geometry.isEnabled = true
+        geometry.settings = config.geometry
+        XCTAssertEqual(geometry.wantsEncode(), !config.isInert(.geometry))
+
+        let lut = try LUTStage(metal: metal)
+        lut.isEnabled = true
+        lut.settings = config.lut
+        XCTAssertEqual(lut.wantsEncode(), !config.isInert(.lut))
     }
 
     func testKernelParamStructSizes() {

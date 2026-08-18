@@ -84,6 +84,18 @@ uint64_t PRISMRingBufferProducerHeartbeat(const PRISMRingBuffer *rb);
 void PRISMRingBufferSetProducerHeartbeat(PRISMRingBuffer *rb, uint64_t machTime);
 void PRISMRingBufferSetProducerAlive(PRISMRingBuffer *rb, bool alive);
 
+// --- Generic SPSC counter shims -------------------------------------------
+
+// Release/acquire on a heap uint64_t, for Swift-side single-producer/
+// single-consumer counters (the §5.13 mic-tap ring). Swift has no standard
+// atomics at this deployment target, and a race-free handoff needs the
+// counter store to publish the sample writes sequenced before it. Both are
+// single instructions — wait-free, IO-thread safe. The _Atomic cast inside
+// is the standard idiom on platforms where _Atomic uint64_t and uint64_t
+// share size and alignment, which is every target PRISM builds for.
+void PRISMAtomicU64StoreRelease(uint64_t *target, uint64_t value);
+uint64_t PRISMAtomicU64LoadAcquire(const uint64_t *target);
+
 #ifdef __cplusplus
 }
 #endif

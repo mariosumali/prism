@@ -65,6 +65,14 @@ public final class LUTStore {
         return names + others
     }
 
+    /// The first look in the catalog that is not the identity — what turning
+    /// the LUT stage on should select when the current pick is Neutral, so
+    /// the switch shows a change instead of nothing. nil only when no .cube
+    /// beyond the synthesized Neutral is installed.
+    public var firstNonNeutralLUT: String? {
+        availableLUTs.first { !LUTSettings.isNeutral($0) }
+    }
+
     /// Case-insensitive lookup; parses and caches the .cube on first use.
     public func texture(named: String, device: MTLDevice) -> MTLTexture? {
         let key = named.lowercased()

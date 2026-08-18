@@ -203,6 +203,24 @@ public final class CameraCapture: NSObject {
         }
         session.addOutput(output)
 
+        // Capture the scene as it actually is. AVFoundation leaves
+        // automaticallyAdjustsVideoMirroring on by default, which mirrors
+        // front-position devices — the built-in FaceTime camera and
+        // Continuity Camera both report .front — so frames would arrive
+        // pre-flipped and every consumer downstream would inherit it: the
+        // preview, the virtual camera, replay, clips, moments. §5.4 makes
+        // Mirror a user control defaulting to none, and §8.3 makes the
+        // preview show exactly what clients see; both only hold if the feed
+        // entering the pipeline is unmirrored. Pin it explicitly rather than
+        // trusting a default that varies by device position and OS version.
+        // Order matters: isVideoMirrored throws while the automatic flag is
+        // still set, and both are only settable when mirroring is supported.
+        if let connection = output.connection(with: .video),
+           connection.isVideoMirroringSupported {
+            connection.automaticallyAdjustsVideoMirroring = false
+            connection.isVideoMirrored = false
+        }
+
         // §3.2: physical capture format — smallest native ≥ negotiated
         // output in both dimensions. Implemented by the pipeline component;
         // FormatManager is @MainActor so hop when needed.
