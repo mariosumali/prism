@@ -270,3 +270,13 @@ void PRISMRingBufferSetProducerAlive(PRISMRingBuffer *rb, bool alive) {
     atomic_store_explicit(&rb->producerAlive, alive ? 1u : 0u,
                           memory_order_release);
 }
+
+void PRISMAtomicU64StoreRelease(uint64_t *target, uint64_t value) {
+    atomic_store_explicit((_Atomic uint64_t *)target, value,
+                          memory_order_release);
+}
+
+uint64_t PRISMAtomicU64LoadAcquire(const uint64_t *target) {
+    return atomic_load_explicit((const _Atomic uint64_t *)target,
+                                memory_order_acquire);
+}

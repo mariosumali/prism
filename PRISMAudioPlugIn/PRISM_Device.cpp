@@ -687,20 +687,19 @@ OSStatus PRISM_Device_DoIOOperation(AudioObjectID inStreamObjectID,
         return noErr;
     }
 
-    AudioBufferList* abl = static_cast<AudioBufferList*>(ioMainBuffer);
-    const UInt32 bufferCount = abl->mNumberBuffers;
-
-    // Per-channel destination pointers and capacities for the two-buffer
-    // non-interleaved ABL. Missing/undersized buffers are tolerated.
-    float* dest[kPRISM_ChannelCount] = {nullptr, nullptr};
-    UInt32 destCapacity[kPRISM_ChannelCount] = {0, 0};
-    for (UInt32 c = 0; c < kPRISM_ChannelCount && c < bufferCount; ++c) {
-        dest[c] = static_cast<float*>(abl->mBuffers[c].mData);
-        destCapacity[c] = abl->mBuffers[c].mDataByteSize
-                        / static_cast<UInt32>(sizeof(float));
-    }
-
+    // ioMainBuffer is the stream's raw sample buffer — NOT an AudioBufferList.
+    // AudioServerPlugIn.h calls it "the primary buffer for the data for the
+    // operation", and Apple's NullAudio sample memcpy()s frames straight
+    // into it. Reading it as an ABL instead (as this driver did until the
+    // interleaved-format fix) makes the first float of sample data pose as
+    // mNumberBuffers; the HAL hands over a zeroed buffer, so that read 0,
+    // every destination pointer stayed null, and the device published pure
+    // silence to every client while the ring underneath carried real audio.
+    // The layout is the stream's physical format: interleaved stereo
+    // float32 (§4.2), which is exactly the ring's own layout.
+    float* const out = static_cast<float*>(ioMainBuffer);
     const UInt32 frameCount = inIOBufferFrameSize;
+    const size_t outSamples = static_cast<size_t>(frameCount) * kPRISM_ChannelCount;
 
     // Producer gone (or ring never mapped): silence, per SPEC §4.3. The
     // aliveness check reads two atomics against mach_absolute_time.
@@ -708,12 +707,7 @@ OSStatus PRISM_Device_DoIOOperation(AudioObjectID inStreamObjectID,
         && PRISMRingBufferProducerIsAlive(gDevice_Ring, mach_absolute_time());
 
     if (!haveAudio) {
-        for (UInt32 c = 0; c < kPRISM_ChannelCount; ++c) {
-            if (dest[c] != nullptr) {
-                UInt32 n = frameCount < destCapacity[c] ? frameCount : destCapacity[c];
-                std::memset(dest[c], 0, n * sizeof(float));
-            }
-        }
+        std::memset(out, 0, outSamples * sizeof(float));
         return noErr;
     }
 
@@ -723,14 +717,44 @@ OSStatus PRISM_Device_DoIOOperation(AudioObjectID inStreamObjectID,
     // ranges all receive the same audio. Frames outside the valid window
     // [wr − capacity, wr) — not yet produced, pre-anchor, or already
     // overwritten — are zero-filled and counted as an underrun.
-    const uint64_t anchor = atomic_load_explicit(&gDevice_AnchorWriteIndex,
-                                                 memory_order_relaxed);
+    uint64_t anchor = atomic_load_explicit(&gDevice_AnchorWriteIndex,
+                                           memory_order_relaxed);
     const uint64_t wr = atomic_load_explicit(&gDevice_Ring->writeIndex,
                                              memory_order_acquire);
     const uint64_t lowBound = wr > PRISM_RING_CAPACITY
                             ? wr - PRISM_RING_CAPACITY : 0;
     const int64_t stBase = (int64_t)inIOCycleInfo->mInputTime.mSampleTime;
     bool shortfall = false;
+
+    // Anchor self-healing. The sample clock above is synthesized from
+    // mach_absolute_time; the write head advances on the microphone's own
+    // clock; the StartIO anchor ties them together exactly once. Without
+    // repair, a producer that starts after StartIO (app launched or began
+    // capturing later, or restarted mid-session) leaves every future window
+    // ahead of the write head — permanent silence — and clock drift walks
+    // even a good anchor out of range within minutes. When the requested
+    // window's end misses the valid range, slide the anchor so it lands
+    // kPRISM_ReanchorCushionFrames behind the write head; when accumulated
+    // drift has pushed it more than kPRISM_MaxCushionFrames behind, slide
+    // the same way to trim latency. One slide is a ~21ms splice in the
+    // stream, paid only at repair moments. All arithmetic is modular
+    // uint64; the CAS keeps a concurrent StartIO reset authoritative.
+    const int64_t stEnd = stBase + (int64_t)frameCount;
+    if (stEnd > 0) {
+        const int64_t cushion = (int64_t)(wr - anchor) - stEnd;
+        if (cushion < 0 || cushion > (int64_t)kPRISM_MaxCushionFrames) {
+            const uint64_t healed =
+                wr - (uint64_t)stEnd - kPRISM_ReanchorCushionFrames;
+            uint64_t expected = anchor;
+            if (atomic_compare_exchange_strong_explicit(
+                    &gDevice_AnchorWriteIndex, &expected, healed,
+                    memory_order_relaxed, memory_order_relaxed)) {
+                anchor = healed;
+            } else {
+                anchor = expected;   // lost to a StartIO reset; theirs wins
+            }
+        }
+    }
 
     for (UInt32 i = 0; i < frameCount; ++i) {
         const int64_t rel = stBase + (int64_t)i;
@@ -744,11 +768,10 @@ OSStatus PRISM_Device_DoIOOperation(AudioObjectID inStreamObjectID,
                 shortfall = true;
             }
         }
+        // Interleaved out, interleaved in: the ring's layout is the stream's.
+        float* const frame = out + (size_t)i * kPRISM_ChannelCount;
         for (UInt32 c = 0; c < kPRISM_ChannelCount; ++c) {
-            float* out = dest[c];
-            if (out != nullptr && i < destCapacity[c]) {
-                out[i] = (src != nullptr) ? src[c] : 0.0f;
-            }
+            frame[c] = (src != nullptr) ? src[c] : 0.0f;
         }
     }
     if (shortfall) {

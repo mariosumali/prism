@@ -34,13 +34,16 @@ AudioStreamBasicDescription PRISM_Stream_Format(void)
     asbd.mFormatID         = kAudioFormatLinearPCM;
     asbd.mFormatFlags      = kAudioFormatFlagIsFloat
                            | kAudioFormatFlagsNativeEndian
-                           | kAudioFormatFlagIsPacked
-                           | kAudioFormatFlagIsNonInterleaved;
-    // Non-interleaved: each of the two AudioBuffers carries one channel of
-    // 32-bit floats, so packets and frames are 4 bytes per channel buffer.
-    asbd.mBytesPerPacket   = sizeof(Float32);
+                           | kAudioFormatFlagIsPacked;
+    // Interleaved (L R L R …), 8 bytes per frame. An AudioServerPlugIn's IO
+    // buffer is one raw block of sample data, not an AudioBufferList, so a
+    // stream cannot hand the HAL two per-channel planes — the driver would
+    // have nowhere to put the second one. This is the layout Apple's
+    // NullAudio publishes, and it is the ring's layout too, which makes
+    // ReadInput a straight copy (§4.2).
+    asbd.mBytesPerPacket   = kPRISM_ChannelCount * sizeof(Float32);
     asbd.mFramesPerPacket  = 1;
-    asbd.mBytesPerFrame    = sizeof(Float32);
+    asbd.mBytesPerFrame    = kPRISM_ChannelCount * sizeof(Float32);
     asbd.mChannelsPerFrame = kPRISM_ChannelCount;
     asbd.mBitsPerChannel   = 32;
     return asbd;
@@ -57,7 +60,7 @@ static bool PRISM_Stream_FormatIsSupported(const AudioStreamBasicDescription* in
         && inFormat->mChannelsPerFrame == kPRISM_ChannelCount
         && inFormat->mBitsPerChannel == 32
         && (inFormat->mFormatFlags & kAudioFormatFlagIsFloat) != 0
-        && (inFormat->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
+        && (inFormat->mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0;
 }
 
 // ===========================================================================
