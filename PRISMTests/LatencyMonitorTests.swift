@@ -3,11 +3,13 @@
 //
 // Exercises the degradation engine exactly as §3.4 / CONTRACTS.md specify:
 // a full 60-frame rolling mean over budget disables the most expensive
-// enabled unpinned stage (ties → later chain position), pinned stages are
-// exempt, re-enable fires only after 120 consecutive frames with the mean
-// below 60% of budget, an all-pinned chain over budget raises policy
-// pressure (rate-limited to once per 5s), and the published LatencyReport
-// carries the policy budget and accumulated dropped frames.
+// enabled unpinned stage (ties → later chain position), the last-resort
+// stage survives every other look, pinned stages are exempt, re-enable fires
+// only after 120 consecutive frames with the mean below 60% of budget, a
+// restored stage is held rather than sacrificed straight back, a chain with
+// nothing left to give raises policy pressure (rate-limited to once per 5s),
+// and the published LatencyReport carries the policy budget and accumulated
+// dropped frames.
 //
 // All timing is synthetic — no camera, no GPU. Callbacks are dispatched to
 // the main thread, so assertions ride on XCTest expectations.
@@ -29,11 +31,12 @@ final class LatencyMonitorTests: XCTestCase {
         var pinned: Set<StageID>
         let all: [(StageID, StageCost)]
 
-        init(enabled: Set<StageID>, pinned: Set<StageID> = []) {
+        init(enabled: Set<StageID>, pinned: Set<StageID> = [],
+             all: [(StageID, StageCost)] = [(.geometry, .cheap), (.adjust, .cheap),
+                                            (.lut, .moderate), (.blur, .expensive)]) {
             self.enabled = enabled
             self.pinned = pinned
-            self.all = [(.geometry, .cheap), (.adjust, .cheap),
-                        (.lut, .moderate), (.blur, .expensive)]
+            self.all = all
         }
 
         func rows() -> [StageRow] {
@@ -124,6 +127,34 @@ final class LatencyMonitorTests: XCTestCase {
         feed(monitor, frames: 60, gpuMs: 12)
         wait(for: [exp], timeout: 2)
         XCTAssertEqual(disabled, .adjust)
+    }
+
+    /// §5.7: a degraded path errs toward covering the background, never
+    /// revealing it. Cost-then-later-chain-position alone gets this exactly
+    /// backwards — virtual background (9) sits after both other expensive
+    /// stages, so the plain tie-break hands the user's real room back to the
+    /// call before it gives up eye contact or blur.
+    func testVirtualBackgroundIsSurrenderedLastAmongEqualCosts() {
+        let table = StageTable(enabled: [.gaze, .blur, .background],
+                               all: [(.gaze, .expensive), (.blur, .expensive),
+                                     (.background, .expensive)])
+        let monitor = makeMonitor(table: table)
+
+        var disabledSequence: [StageID] = []
+        var currentExpectation: XCTestExpectation?
+        monitor.onAutoDisable = { id in
+            disabledSequence.append(id)
+            table.enabled.remove(id)
+            currentExpectation?.fulfill()
+        }
+
+        for expected in [StageID.blur, .gaze, .background] {
+            let exp = expectation(description: "auto-disable \(expected)")
+            currentExpectation = exp
+            feed(monitor, frames: 60, gpuMs: 12)
+            wait(for: [exp], timeout: 2)
+        }
+        XCTAssertEqual(disabledSequence, [.blur, .gaze, .background])
     }
 
     // MARK: (b) Pinned stages are never auto-disabled
@@ -252,6 +283,41 @@ final class LatencyMonitorTests: XCTestCase {
 
         feed(monitor, frames: 150, gpuMs: 2)   // quiet forever, nothing disabled
         wait(for: [noFire], timeout: 0.3)
+    }
+
+    /// A chain that is over budget with a stage on and comfortably under it
+    /// with the stage off satisfies both halves of the engine forever. Without
+    /// hysteresis the user watches the same look switch off, come back, and
+    /// switch off again every few seconds; the restored stage is held instead,
+    /// so the second round finds nothing to give and asks for a bigger budget.
+    func testRestoredStageIsNotImmediatelySacrificedAgain() {
+        let table = StageTable(enabled: [.blur], all: [(.blur, .expensive)])
+        let monitor = makeMonitor(table: table)
+
+        let disabled = expectation(description: "blur disabled")
+        monitor.onAutoDisable = { id in
+            table.enabled.remove(id)
+            disabled.fulfill()
+        }
+        feed(monitor, frames: 60, gpuMs: 12)
+        wait(for: [disabled], timeout: 2)
+
+        let restored = expectation(description: "blur restored")
+        monitor.onAutoReenable = { id in
+            table.enabled.insert(id)
+            restored.fulfill()
+        }
+        feed(monitor, frames: 120, gpuMs: 2)
+        wait(for: [restored], timeout: 2)
+
+        // Over budget again with only the just-restored stage to give.
+        var disabledAgain = false
+        monitor.onAutoDisable = { _ in disabledAgain = true }
+        let pressure = expectation(description: "policy pressure instead of a second cycle")
+        monitor.onPolicyPressure = { pressure.fulfill() }
+        feed(monitor, frames: 60, gpuMs: 12)
+        wait(for: [pressure], timeout: 2)
+        XCTAssertFalse(disabledAgain, "a restored stage must not flicker back off")
     }
 
     // MARK: (d) All-pinned chain over budget → policy pressure, rate-limited

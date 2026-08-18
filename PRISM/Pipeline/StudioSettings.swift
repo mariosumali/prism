@@ -324,10 +324,18 @@ public struct StudioSettings: Codable, Equatable {
     public var lag = LagSettings()
     public var voice = VoiceSettings()
     public var connection = ConnectionSettings()
+    public var capture = CaptureSettings()
+    public var apps = AppRulesSettings()
+    public var cleanup = VoiceCleanupSettings()
+    public var micWatch = MicWatchSettings()
+    public var presence = PresenceSettings()
+    public var prompter = PrompterSettings()
+    public var gestures = GestureSettings()
     public init() {}
 
     public enum CodingKeys: String, CodingKey {
         case replay, away, panic, lag, voice, connection
+        case capture, apps, cleanup, micWatch, presence, prompter, gestures
     }
 
     /// Same forward-compatibility contract as PipelineConfiguration: a field
@@ -343,6 +351,13 @@ public struct StudioSettings: Codable, Equatable {
         lag = decode(.lag, LagSettings())
         voice = decode(.voice, VoiceSettings())
         connection = decode(.connection, ConnectionSettings())
+        capture = decode(.capture, CaptureSettings())
+        apps = decode(.apps, AppRulesSettings())
+        cleanup = decode(.cleanup, VoiceCleanupSettings())
+        micWatch = decode(.micWatch, MicWatchSettings())
+        presence = decode(.presence, PresenceSettings())
+        prompter = decode(.prompter, PrompterSettings())
+        gestures = decode(.gestures, GestureSettings())
     }
 
     /// The rolling buffer runs when replay is armed, or when the away loop

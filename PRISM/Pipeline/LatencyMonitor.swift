@@ -4,9 +4,10 @@
 // Per-stage timing and budget enforcement (§3.4, §6): 60-frame rolling means
 // per stage and in total, a 4Hz main-thread LatencyReport publish, and the
 // degradation engine — disable the most expensive unpinned stage when the
-// mean exceeds budget, re-enable (most recently disabled first) after 120
-// consecutive frames below 60% of budget, and surface policy pressure when
-// only pinned stages remain over budget.
+// mean exceeds budget (the last-resort stage only once nothing else is left),
+// re-enable (most recently disabled first) after 120 consecutive frames below
+// 60% of budget, hold a just-restored stage safe for a while so the two halves
+// cannot oscillate, and surface policy pressure when nothing may be given up.
 //
 // Licensed under the Apache License, Version 2.0.
 
@@ -87,6 +88,18 @@ public final class LatencyMonitor: ObservableObject {
     /// Throttle for onPolicyPressure: at most once per 5s.
     private var lastPressureTime: CFTimeInterval = -.greatestFiniteMagnitude
 
+    /// Host time at which a stage the engine restored may be sacrificed
+    /// again. Without it the two halves of the engine chase each other: a
+    /// chain that is over budget with the stage on and under 60% with it off
+    /// disables it, waits out the 120-frame quiet streak, restores it, and
+    /// disables it again — a look flickering on and off every few seconds,
+    /// which reads as a bug and is worse than either steady state. Holding a
+    /// restored stage means the second round finds nothing to give and raises
+    /// policy pressure instead, which is the honest answer: the budget, not
+    /// the chain, is what has to move.
+    private var restoreHoldUntil: [StageID: CFTimeInterval] = [:]
+    private static let restoreHoldSeconds: CFTimeInterval = 30
+
     private var handoffMs: Double = 0
     private var audioAddedMs: Double = 0
     private var deliberateDelayMs: Double = 0
@@ -99,14 +112,19 @@ public final class LatencyMonitor: ObservableObject {
     /// camera back on air behind the user's back, which is the one failure
     /// this app must never produce — and outputFit is structural.
     ///
-    /// Eye contact, virtual background, overlay and style ARE candidates:
-    /// they are looks, and a look is exactly what §3.4 says to sacrifice
-    /// before a dropped frame. Virtual background degrading means the real
-    /// room comes back, so it is weighted expensive and loses before cheaper
-    /// stages. Bad connection is excluded with the substituting stages: it is
-    /// engaged by intent (§5.14), not a preset look.
-    private static let disableCandidates: Set<StageID> = [
-        .geometry, .adjust, .lut, .style, .blur, .gaze, .background, .overlay,
+    /// Eye contact, skin retouch, virtual background, overlay and style ARE
+    /// candidates: they are looks, and a look is exactly what §3.4 says to
+    /// sacrifice before a dropped frame. Virtual background degrading means
+    /// the real room comes back, so it goes last of all (StageID.isLastResort)
+    /// however expensive it is. Bad connection is excluded with the
+    /// substituting stages: it is engaged by intent (§5.14), not a preset look.
+    ///
+    /// Internal rather than private so ChainRegistrationTests can prove every
+    /// user-facing stage is either a candidate or deliberately intent-owned;
+    /// a stage that is neither is one the budget can never reclaim.
+    static let disableCandidates: Set<StageID> = [
+        .geometry, .retouch, .adjust, .lut, .style, .blur, .gaze,
+        .background, .overlay,
     ]
 
     // MARK: Lifecycle
@@ -172,6 +190,8 @@ public final class LatencyMonitor: ObservableObject {
                 autoDisabledOrder.removeLast()
                 reenableStreak = 0
                 totalWindow.reset()
+                restoreHoldUntil[mostRecent] =
+                    CACurrentMediaTime() + Self.restoreHoldSeconds
                 decision = .reenable(mostRecent)
             }
         } else {
@@ -221,11 +241,25 @@ public final class LatencyMonitor: ObservableObject {
     private func handleOverBudget() {
         // stageQuery is invoked outside the lock — it reaches into AppState.
         let stages = stageQuery?() ?? []
+        let now = CACurrentMediaTime()
+        lock.lock()
+        restoreHoldUntil = restoreHoldUntil.filter { $0.value > now }
+        let held = Set(restoreHoldUntil.keys)
+        lock.unlock()
+
         let candidates = stages.filter {
             $0.enabled && !$0.pinned && Self.disableCandidates.contains($0.id)
+            && !held.contains($0.id)
         }
+        // The last-resort stage is not weighed against the others at all —
+        // cost-first with a later-chain-position tie-break would pick it
+        // FIRST among the expensive stages, which is precisely backwards
+        // (§5.7: never reveal the room). It is considered only once the pool
+        // of ordinary looks is empty.
+        let ordinary = candidates.filter { !$0.id.isLastResort }
+        let pool = ordinary.isEmpty ? candidates : ordinary
         // Highest cost first; tie broken by later chain position.
-        if let target = candidates.max(by: { a, b in
+        if let target = pool.max(by: { a, b in
             if a.cost != b.cost { return a.cost < b.cost }
             return a.id.chainIndex < b.id.chainIndex
         }) {
@@ -235,10 +269,9 @@ public final class LatencyMonitor: ObservableObject {
             lock.unlock()
             DispatchQueue.main.async { [weak self] in self?.onAutoDisable?(target.id) }
         } else {
-            // Nothing left to disable — everything enabled is pinned. Degrade
-            // the policy instead of dropping frames: surface pressure, at
-            // most once per 5 seconds.
-            let now = CACurrentMediaTime()
+            // Nothing left to give — what is enabled is pinned, or was only
+            // just restored and must not flicker. Degrade the policy instead
+            // of dropping frames: surface pressure, at most once per 5s.
             var fire = false
             lock.lock()
             if now - lastPressureTime >= 5 {

@@ -93,9 +93,24 @@ struct StudioPane: View {
             case .armBuffer:
                 Button("Turn on") { state.setBufferArmed(true) }
                     .controlSize(.small)
-            case .openSettings, .none:
+            case .openScreenRecordingSettings:
+                Button("Open Settings") { openScreenRecordingSettings() }
+                    .controlSize(.small)
+            // The capture folder and the app rules both live in this window,
+            // so from here the warning row has nowhere to send anyone.
+            case .chooseCaptureFolder, .openAppRules, .openSettings, .none:
                 EmptyView()
             }
+        }
+    }
+
+    /// Screen Recording is its own grant, and unlike camera and microphone
+    /// PRISM cannot prompt for it — the only working action is landing the
+    /// user on the pane (§9: every setup row has one).
+    private func openScreenRecordingSettings() {
+        let pane = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+        if let url = URL(string: pane) {
+            NSWorkspace.shared.open(url)
         }
     }
 

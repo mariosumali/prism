@@ -154,6 +154,7 @@ public final class VideoPipeline {
     public let freezeStage: FreezeStage
     public let gazeStage: GazeStage
     public let geometryStage: GeometryStage
+    public let retouchStage: RetouchStage
     public let adjustStage: AdjustStage
     public let lutStage: LUTStage
     public let blurStage: BlurStage
@@ -166,6 +167,9 @@ public final class VideoPipeline {
     /// One person mask, shared by blur, virtual background, behind-the-
     /// subject overlay layers, and auto-framing (§5.4, §5.7, §5.8).
     public let segmenter: PersonSegmenter
+    /// One face measurement, shared by eye contact, retouch and the
+    /// face-anchored overlay layers (§5.6).
+    public let faceTracker: FaceTracker
     /// Rolling buffer behind instant replay and the away loop (§5.9, §5.10).
     public let replayBuffer: ReplayBuffer
     public let replayPlayer: ReplayPlayer
@@ -229,6 +233,10 @@ public final class VideoPipeline {
     /// Previous frame's final output, retained (buffer + texture) so a preset
     /// switch or clip→live return can crossfade from it (§5.5, §5.3).
     private var lastOutput: (buffer: CVPixelBuffer, texture: MTLTexture)?
+    /// Host time the last output was emitted at. `lastOutput` alone cannot
+    /// answer "is the picture still moving?" — a stalled chain keeps handing
+    /// back the same perfectly valid frame forever.
+    private var lastOutputHostSeconds: CFTimeInterval?
     private var crossfadeActive = false
     private var crossfadeFrom: (buffer: CVPixelBuffer, texture: MTLTexture)?
     private var crossfadeStartTime: CFTimeInterval?
@@ -241,46 +249,68 @@ public final class VideoPipeline {
     /// separable blur passes plus the composite, hence 12. Eye contact is a
     /// single full-frame warp on the GPU but drags a Vision landmark request
     /// behind it, and the degradation engine has to see that cost somewhere.
-    /// Overlay is weighted for a typical single layer; a three-layer scene
-    /// under-reports somewhat, which is the acceptable direction — the model
-    /// is proportional, not a measurement.
-    private static let stageWeights: [StageID: Double] = [
+    /// Overlay carries several layer kinds now, each its own full-frame pass.
+    /// Style can run a second pass when looks stack. Both are weighted for the
+    /// typical case rather than the worst one; a maximal scene under-reports
+    /// somewhat, which is the acceptable direction — the model is
+    /// proportional, not a measurement.
+    ///
+    /// Internal rather than private so ChainRegistrationTests can prove every
+    /// StageID has an entry: a missing weight silently attributes 1ms-equivalent
+    /// to a stage that may be the most expensive in the chain.
+    static let stageWeights: [StageID: Double] = [
         .clip: 1, .replay: 1, .freeze: 1, .gaze: 8, .geometry: 2,
-        .adjust: 1, .lut: 3, .blur: 12, .background: 6, .overlay: 2,
-        .style: 3, .connection: 1, .outputFit: 1,
+        .retouch: 5, .adjust: 1, .lut: 3, .blur: 12, .background: 6,
+        .overlay: 3, .style: 5, .connection: 1, .outputFit: 1,
     ]
 
     /// Stages that consume the person mask. Segmentation runs once per frame
     /// at the first of these positions in the chain — post-geometry, so the
     /// mask lines up with everything that samples it, and so AutoFramer stays
     /// the closed-loop servo it is documented to be (§5.4).
+    ///
+    /// Retouch is deliberately absent: its skin gate is chroma, not a person
+    /// mask, and listing it here would move segmentation two stages earlier
+    /// and demand a Vision request for a stage that only wants the mask if one
+    /// happens to exist.
     private static let maskConsumers: Set<StageID> = [.blur, .background, .overlay]
+
+    /// Stages that consume the shared face measurement. Tracking runs once per
+    /// frame at the first of these positions — pre-geometry, which is the
+    /// space eye contact warps in (§5.6). Retouch and overlay are listed
+    /// because they hold the tracker for features still to land; neither
+    /// contributes demand yet, so today the request runs exactly when the
+    /// eye-contact pass does.
+    private static let faceConsumers: Set<StageID> = [.gaze, .retouch, .overlay]
 
     // MARK: Init / configure
 
     public init(metal: MetalContext) throws {
         self.metal = metal
         segmenter = try PersonSegmenter(metal: metal)
+        faceTracker = try FaceTracker(metal: metal)
         replayBuffer = try ReplayBuffer(metal: metal)
         replayPlayer = ReplayPlayer(metal: metal, buffer: replayBuffer)
 
         clipStage = try ClipStage(metal: metal)
         replayStage = try ReplayStage(metal: metal)
         freezeStage = try FreezeStage(metal: metal)
-        gazeStage = try GazeStage(metal: metal)
+        gazeStage = try GazeStage(metal: metal, faceTracker: faceTracker)
         geometryStage = try GeometryStage(metal: metal)
+        retouchStage = try RetouchStage(metal: metal, faceTracker: faceTracker)
         adjustStage = try AdjustStage(metal: metal)
         lutStage = try LUTStage(metal: metal)
         blurStage = try BlurStage(metal: metal, segmenter: segmenter)
         backgroundStage = try BackgroundStage(metal: metal, segmenter: segmenter)
-        overlayStage = try OverlayStage(metal: metal, segmenter: segmenter)
+        overlayStage = try OverlayStage(metal: metal, segmenter: segmenter,
+                                        faceTracker: faceTracker)
         styleStage = try StyleStage(metal: metal)
         connectionStage = try ConnectionStage(metal: metal)
         outputFitStage = try OutputFitStage(metal: metal)
 
         userStages = [clipStage, replayStage, freezeStage, gazeStage, geometryStage,
-                      adjustStage, lutStage, blurStage, backgroundStage, overlayStage,
-                      styleStage, connectionStage]
+                      retouchStage, adjustStage, lutStage, blurStage, backgroundStage,
+                      overlayStage, styleStage, connectionStage]
         stages = userStages + [outputFitStage]
 
         frameRing = try FrameRing(metal: metal, width: 1920, height: 1080)
@@ -314,6 +344,16 @@ public final class VideoPipeline {
         }
         stateLock.unlock()
         outputFitStage.outputSize = CGSize(width: outputFormat.width, height: outputFormat.height)
+    }
+
+    /// How long ago the last frame reached the sink; nil before the first one.
+    /// Polled by anything that has to distinguish "PRISM is quiet" from "PRISM
+    /// stopped" — the two look identical from outside the frame path.
+    public var lastOutputAgeSeconds: Double? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard let emitted = lastOutputHostSeconds else { return nil }
+        return max(0, CACurrentMediaTime() - emitted)
     }
 
     // MARK: Frozen state
@@ -394,6 +434,7 @@ public final class VideoPipeline {
 
     public func apply(_ config: PipelineConfiguration) {
         adjustStage.settings = config.adjust
+        retouchStage.settings = config.retouch
         lutStage.settings = config.lut
         blurStage.settings = config.blur
         geometryStage.settings = config.geometry
@@ -402,10 +443,14 @@ public final class VideoPipeline {
         overlayStage.settings = config.overlay
         styleStage.settings = config.style
         // The quality tier belongs to the shared segmenter now; blur is
-        // simply where the user happens to set it.
+        // simply where the user happens to set it. Landmark smoothing is the
+        // same arrangement one level along: the tracker smooths, eye contact
+        // is simply where the knob lives.
         segmenter.quality = config.blur.quality
+        faceTracker.smoothing = config.gaze.smoothing
 
         geometryStage.isEnabled = config.flags(for: .geometry).enabled
+        retouchStage.isEnabled = config.flags(for: .retouch).enabled
         adjustStage.isEnabled = config.flags(for: .adjust).enabled
         lutStage.isEnabled = config.flags(for: .lut).enabled
         blurStage.isEnabled = config.flags(for: .blur).enabled
@@ -586,7 +631,24 @@ public final class VideoPipeline {
         var current = source
         var useA = true
         var segmentationDone = false
+        var faceTrackingDone = false
         for stage in userStages {
+            // One landmark request per frame for every face consumer, taken
+            // at the first consumer's position, for the same reason as the
+            // mask below: two stages each running their own would pay twice
+            // for identical numbers.
+            if !faceTrackingDone, Self.faceConsumers.contains(stage.id) {
+                faceTrackingDone = true
+                if gazeStage.wantsEncode() {
+                    faceTracker.isDemanded = true
+                    faceTracker.update(commandBuffer: commandBuffer, input: current)
+                } else if faceTracker.isDemanded {
+                    // Last consumer just went away: drop the face so nothing
+                    // re-enabled later anchors to a stale one.
+                    faceTracker.isDemanded = false
+                    faceTracker.invalidate()
+                }
+            }
             // One segmentation per frame for every mask consumer, taken at
             // the first consumer's position in the chain. Driven here rather
             // than from inside a stage so it does not depend on which of blur
@@ -682,6 +744,7 @@ public final class VideoPipeline {
             let stageMs = Self.attribute(totalGpuMs: gpuMs, to: encoded)
             self.stateLock.lock()
             self.lastOutput = (outBuffer, outTexture)
+            self.lastOutputHostSeconds = CACurrentMediaTime()
             self.stateLock.unlock()
             self.onOutput?(outBuffer, time, outTexture)
             self.onTimings?(StageTimings(captureToTextureMs: captureMs, stageMs: stageMs,

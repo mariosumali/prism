@@ -23,7 +23,7 @@ final class GazeStageTests: XCTestCase {
         guard let metal = Self.sharedMetal else {
             throw XCTSkip("Metal unavailable: \(String(describing: Self.metalError))")
         }
-        return try GazeStage(metal: metal)
+        return try GazeStage(metal: metal, faceTracker: FaceTracker(metal: metal))
     }
 
     /// An eye at the centre of the frame with the pupil offset by `drift`.

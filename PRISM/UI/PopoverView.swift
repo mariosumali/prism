@@ -105,8 +105,16 @@ struct PopoverView: View {
     private static let metaModules: Set<PopoverModule> = [.preview, .status,
                                                           .latencyMeter, .inUse]
 
+    /// Modules whose section does not exist yet. They are listed in the Menu
+    /// Bar pane — hiding them there would hide that the row is coming, and
+    /// reorder it under the user later — but the dropdown skips them, because
+    /// a row that renders nothing still costs a section gap and two blank
+    /// bands read as a broken popover. Delete an entry the moment its section
+    /// draws anything.
+    private static let unbuiltModules: Set<PopoverModule> = [.capture, .prompter]
+
     private var moduleRows: [ModuleRow] {
-        let visible = state.visiblePopoverModules
+        let visible = state.visiblePopoverModules.filter { !Self.unbuiltModules.contains($0) }
         var rows: [ModuleRow] = []
         var index = 0
         while index < visible.count {
@@ -175,6 +183,10 @@ struct PopoverView: View {
             }
         case .moments:
             MomentsSection()
+        case .capture:
+            CaptureSection()
+        case .prompter:
+            PrompterSection()
         case .presets:
             PresetBar()
         case .scene:
@@ -294,6 +306,18 @@ struct PopoverView: View {
                     .controlSize(.small)
             case .openSettings:
                 Button("Open Settings") { openSettingsWindow() }
+                    .controlSize(.small)
+            // Both of these are settled in the main window — the capture
+            // folder and the app rules list are too large to answer from a
+            // dropdown, so the button opens the place that can answer them.
+            case .chooseCaptureFolder:
+                Button("Choose folder") { state.showMainWindow() }
+                    .controlSize(.small)
+            case .openAppRules:
+                Button("App rules") { state.showMainWindow() }
+                    .controlSize(.small)
+            case .openScreenRecordingSettings:
+                Button("Open Settings") { openScreenRecordingSettings() }
                     .controlSize(.small)
             case .none:
                 EmptyView()
@@ -494,6 +518,16 @@ struct PopoverView: View {
             NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
         }
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Screen Recording is its own grant, and unlike camera and microphone
+    /// PRISM cannot prompt for it — the only working action is landing the
+    /// user on the pane (§9: every setup row has one).
+    private func openScreenRecordingSettings() {
+        let pane = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+        if let url = URL(string: pane) {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     // MARK: - LUT drag-and-drop (§5.4)

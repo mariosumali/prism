@@ -53,6 +53,17 @@ jobs:
         run: |
           if [ -x Tools/driver_smoke/run.sh ]; then Tools/driver_smoke/run.sh; fi
 
+      - name: Verify no networking APIs in source
+        # §7 again, from the other end: the otool check below only fires if a
+        # framework actually links, which every Foundation-provided path
+        # (URLSession lives in Foundation, getaddrinfo in libSystem) walks
+        # straight past. Catch the call site instead.
+        run: |
+          if grep -rnE 'URLSession|NWConnection|NWBrowser|CFNetwork|dnssd|getaddrinfo' \
+               PRISM PRISMCameraExtension PRISMAudioPlugIn; then
+            echo "::error::Networking API referenced in source"; exit 1
+          fi
+
       - name: Verify no network symbols in app
         # §7: PRISM makes no network connections. Cheap tripwire: the app
         # binary must not link networking frameworks.

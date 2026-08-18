@@ -14,51 +14,113 @@ import AppKit
 import CoreGraphics
 import Foundation
 
-public final class Hotkeys {
-
-    // MARK: Fixed combos
-    //
-    // §5.2 originals plus the studio chords (§5.6, §5.9–§5.14). All share the
-    // ⌥⌘ prefix so they read as one family — except the voice changer, which
-    // adds ⌃ because ⌥⌘V belongs to Finder (see voiceCombo). ANSI keycodes:
-    // F = 3, M = 46, R = 15, A = 0, P = 35, E = 14, V = 9, B = 11.
-
-    public static let freezeCombo = HotkeyCombo(keyCode: 3, option: true, command: true)
-    public static let muteCombo = HotkeyCombo(keyCode: 46, option: true, command: true)
-    public static let freezeAndMuteCombo = HotkeyCombo(keyCode: 3, option: true, command: true, shift: true)
-    public static let replayCombo = HotkeyCombo(keyCode: 15, option: true, command: true)
-    public static let awayCombo = HotkeyCombo(keyCode: 0, option: true, command: true)
+/// One case per global intent PRISM can be driven by, and the chord that
+/// reaches it.
+///
+/// The shape this replaced — a constant, a callback and a rung of an if/else
+/// ladder per chord — made every new shortcut a three-place edit, and made a
+/// rebindable chord impossible, since matching could only ever compare
+/// against constants. With the binding as data, `match` is a lookup and the
+/// receiver switches over the action exhaustively: a shortcut cannot be added
+/// without the compiler asking what it does.
+///
+/// Every chord shares the ⌥⌘ family prefix except the two that add ⌃ for the
+/// reason documented on their cases.
+public enum ShortcutAction: String, Codable, CaseIterable {
+    case freeze                 // ⌥⌘F
+    case mute                   // ⌥⌘M
+    case freezeAndMute          // ⌥⌘⇧F
+    case replay                 // ⌥⌘R
+    case away                   // ⌥⌘A
     /// Deliberately un-shifted: a panic key you have to reach for is not one.
-    public static let panicCombo = HotkeyCombo(keyCode: 35, option: true, command: true)
-    public static let eyeContactCombo = HotkeyCombo(keyCode: 14, option: true, command: true)
-    /// §5.12. The only combo that also reports its key release, so it can be
+    case panic                  // ⌥⌘P
+    case eyeContact             // ⌥⌘E
+    /// §5.12. The only action that also reports its key release, so it can be
     /// held rather than toggled — which is what "switch" means.
-    public static let lagCombo = HotkeyCombo(keyCode: 37, option: true, command: true)
+    case lag                    // ⌥⌘L
     /// §5.14: B for bad connection. A toggle, not a hold — the stunt runs for
     /// minutes, and nobody holds a chord through a meeting.
-    public static let badConnectionCombo = HotkeyCombo(keyCode: 11, option: true, command: true)
-    /// §5.13: voice changer on/off, recalling the last used effect. The one
-    /// chord that adds ⌃ to the family prefix: ⌥⌘V is Finder's "Move Item
-    /// Here" (and Xcode's paste-preserving-formatting), so the plain combo
-    /// would put a chipmunk on air every time someone moved files mid-call —
-    /// and ⌥⇧⌘V is the system-wide Paste and Match Style, so ⌃ it is.
-    public static let voiceCombo = HotkeyCombo(keyCode: 9, option: true,
-                                               command: true, control: true)
+    case badConnection          // ⌥⌘B
+    /// §5.13: voice changer on/off, recalling the last used effect. ⌥⌘V is
+    /// Finder's "Move Item Here" (and Xcode's paste-preserving-formatting),
+    /// so the plain combo would put a chipmunk on air every time someone
+    /// moved files mid-call — and ⌥⇧⌘V is the system-wide Paste and Match
+    /// Style, so ⌃ it is.
+    case voice                  // ⌃⌥⌘V
+    case saveClip               // ⌥⌘S
+    /// The shifted sibling of save, exactly as freeze+mute is the shifted
+    /// sibling of freeze: matching is exact over all four modifiers, so
+    /// ⌥⌘S and ⌥⌘⇧S are two chords rather than one shadowing the other.
+    case snapshot               // ⌥⌘⇧S
+    case screenSource           // ⌥⌘D
+    /// Carries ⌃ for the same reason the voice changer does: PRISM's tap
+    /// never consumes, so a plain ⌥⌘T would also open the frontmost app's
+    /// Show Fonts panel every time the prompter was toggled.
+    case prompter               // ⌃⌥⌘T
+
+    /// ANSI key codes: F = 3, M = 46, R = 15, A = 0, P = 35, E = 14,
+    /// L = 37, B = 11, V = 9, S = 1, D = 2, T = 17.
+    public var defaultCombo: HotkeyCombo {
+        switch self {
+        case .freeze:
+            return HotkeyCombo(keyCode: 3, option: true, command: true)
+        case .mute:
+            return HotkeyCombo(keyCode: 46, option: true, command: true)
+        case .freezeAndMute:
+            return HotkeyCombo(keyCode: 3, option: true, command: true, shift: true)
+        case .replay:
+            return HotkeyCombo(keyCode: 15, option: true, command: true)
+        case .away:
+            return HotkeyCombo(keyCode: 0, option: true, command: true)
+        case .panic:
+            return HotkeyCombo(keyCode: 35, option: true, command: true)
+        case .eyeContact:
+            return HotkeyCombo(keyCode: 14, option: true, command: true)
+        case .lag:
+            return HotkeyCombo(keyCode: 37, option: true, command: true)
+        case .badConnection:
+            return HotkeyCombo(keyCode: 11, option: true, command: true)
+        case .voice:
+            return HotkeyCombo(keyCode: 9, option: true, command: true, control: true)
+        case .saveClip:
+            return HotkeyCombo(keyCode: 1, option: true, command: true)
+        case .snapshot:
+            return HotkeyCombo(keyCode: 1, option: true, command: true, shift: true)
+        case .screenSource:
+            return HotkeyCombo(keyCode: 2, option: true, command: true)
+        case .prompter:
+            return HotkeyCombo(keyCode: 17, option: true, command: true, control: true)
+        }
+    }
+
+    public var displayName: String {
+        switch self {
+        case .freeze: return "Freeze"
+        case .mute: return "Mute"
+        case .freezeAndMute: return "Freeze and mute"
+        case .replay: return "Instant replay"
+        case .away: return "Away loop"
+        case .panic: return "Panic"
+        case .eyeContact: return "Eye contact"
+        case .lag: return "Lag switch"
+        case .badConnection: return "Bad connection"
+        case .voice: return "Voice changer"
+        case .saveClip: return "Save the last seconds"
+        case .snapshot: return "Take a still"
+        case .screenSource: return "Share a screen"
+        case .prompter: return "Prompter"
+        }
+    }
+}
+
+public final class Hotkeys {
 
     // MARK: Callbacks (invoked on the main thread)
 
-    public var onFreeze: (() -> Void)?             // ⌥⌘F
-    public var onMute: (() -> Void)?               // ⌥⌘M
-    public var onFreezeAndMute: (() -> Void)?      // ⌥⌘⇧F
-    public var onReplay: (() -> Void)?             // ⌥⌘R
-    public var onAway: (() -> Void)?               // ⌥⌘A
-    public var onPanic: (() -> Void)?              // ⌥⌘P
-    public var onEyeContact: (() -> Void)?         // ⌥⌘E
-    /// ⌥⌘L press and release. `true` on keyDown, `false` on keyUp, so the
-    /// receiver can implement either hold-to-lag or a toggle (§5.12).
-    public var onLag: ((Bool) -> Void)?
-    public var onBadConnection: (() -> Void)?      // ⌥⌘B
-    public var onVoice: (() -> Void)?              // ⌃⌥⌘V
+    public var onAction: ((ShortcutAction) -> Void)?
+    /// Key releases, reported only for the actions that are held rather than
+    /// toggled — today only `.lag` (§5.12).
+    public var onActionRelease: ((ShortcutAction) -> Void)?
     public var onPreset: ((UUID) -> Void)?
 
     // MARK: State
@@ -68,6 +130,10 @@ public final class Hotkeys {
     private var globalMonitor: Any?
     private var localMonitor: Any?
     private var presetBindings: [(UUID, HotkeyCombo)] = []
+    /// Every action always has a chord, so a partial saved map cannot leave an
+    /// intent unreachable with no way to notice.
+    private var bindings: [(action: ShortcutAction, combo: HotkeyCombo)] =
+        ShortcutAction.allCases.map { ($0, $0.defaultCombo) }
 
     public init() {}
 
@@ -75,9 +141,15 @@ public final class Hotkeys {
         stop()
     }
 
-    /// Registers preset hotkeys (§5.5). Call on the main thread; the tap's
-    /// run-loop source lives on the main run loop, so matching reads this
-    /// array on the main thread too.
+    /// Replaces the chords the user has rebound; actions absent from the map
+    /// keep their default. Call on the main thread; the tap's run-loop source
+    /// lives on the main run loop, so matching reads this array on the main
+    /// thread too.
+    public func setBindings(_ bindings: [ShortcutAction: HotkeyCombo]) {
+        self.bindings = ShortcutAction.allCases.map { ($0, bindings[$0] ?? $0.defaultCombo) }
+    }
+
+    /// Registers preset hotkeys (§5.5). Same threading rule as setBindings.
     public func setPresetBindings(_ bindings: [(UUID, HotkeyCombo)]) {
         presetBindings = bindings
     }
@@ -199,13 +271,19 @@ public final class Hotkeys {
     /// switch stuck on — exactly the failure this app cares most about.
     /// Matching the bare keycode means a stray L keyup releases a lag that
     /// was not engaged, which is harmless.
+    ///
+    /// The keycode comes from the current binding, not a constant: a rebound
+    /// lag switch that could be pressed but never released would be the worst
+    /// possible outcome of rebinding it.
     private func matchRelease(keyCode: UInt16) {
-        guard keyCode == Self.lagCombo.keyCode else { return }
-        fire { $0.onLag?(false) }
+        guard let lag = bindings.first(where: { $0.action == .lag })?.combo,
+              lag.keyCode == keyCode else { return }
+        fire { $0.onActionRelease?(.lag) }
     }
 
     /// Exact modifier matching over {⌥, ⌘, ⇧, ⌃} so ⌥⌘F and ⌥⌘⇧F stay
-    /// distinct combos rather than one shadowing the other.
+    /// distinct combos rather than one shadowing the other — which is also
+    /// why the table can be scanned in any order.
     private func match(keyCode: UInt16, option: Bool, command: Bool,
                        shift: Bool, control: Bool) {
         func matches(_ combo: HotkeyCombo) -> Bool {
@@ -216,26 +294,9 @@ public final class Hotkeys {
                 && combo.control == control
         }
 
-        if matches(Self.freezeAndMuteCombo) {
-            fire { $0.onFreezeAndMute?() }
-        } else if matches(Self.freezeCombo) {
-            fire { $0.onFreeze?() }
-        } else if matches(Self.muteCombo) {
-            fire { $0.onMute?() }
-        } else if matches(Self.replayCombo) {
-            fire { $0.onReplay?() }
-        } else if matches(Self.awayCombo) {
-            fire { $0.onAway?() }
-        } else if matches(Self.panicCombo) {
-            fire { $0.onPanic?() }
-        } else if matches(Self.eyeContactCombo) {
-            fire { $0.onEyeContact?() }
-        } else if matches(Self.voiceCombo) {
-            fire { $0.onVoice?() }
-        } else if matches(Self.badConnectionCombo) {
-            fire { $0.onBadConnection?() }
-        } else if matches(Self.lagCombo) {
-            fire { $0.onLag?(true) }
+        if let binding = bindings.first(where: { matches($0.combo) }) {
+            let action = binding.action
+            fire { $0.onAction?(action) }
         } else if let (id, _) = presetBindings.first(where: { matches($0.1) }) {
             fire { $0.onPreset?(id) }
         }
