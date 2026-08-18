@@ -29,9 +29,13 @@ public enum StillFormat: String, Codable, CaseIterable {
 
 public struct CaptureSettings: Codable, Equatable {
     public var format: StillFormat = .png
-    /// Absolute path to the destination folder; nil means the system Pictures
-    /// folder. PRISM is not sandboxed (§9), so no bookmark round-trip is
-    /// needed — the same arrangement as background assets.
+    /// Absolute path to the destination folder; nil means ~/Movies/PRISM.
+    /// PRISM is not sandboxed (§9), so no bookmark round-trip is needed —
+    /// the same arrangement as background assets.
+    ///
+    /// One folder for stills and clips both. Two would mean two places to
+    /// look for the thing you just saved, and the names already say which
+    /// is which.
     public var folderPath: String?
     /// Seconds of countdown before the shutter. Zero is the default because a
     /// countdown you did not ask for is a photo you missed; the delay exists
@@ -53,14 +57,24 @@ public struct CaptureSettings: Codable, Equatable {
 
     public var clampedCountdownSeconds: Int { min(max(countdownSeconds, 0), 10) }
 
-    /// Resolved destination. Falls back to Pictures rather than to nothing —
-    /// a capture that silently goes nowhere is worse than one that goes
-    /// somewhere ordinary.
+    /// Resolved destination. Falls back to a folder of PRISM's own inside
+    /// Movies rather than to nothing — a capture that silently goes nowhere
+    /// is worse than one that goes somewhere ordinary, and the clips are
+    /// the reason it is Movies rather than Pictures.
     public var folderURL: URL {
         if let folderPath {
             return URL(fileURLWithPath: folderPath, isDirectory: true)
         }
-        return FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser
+        return Self.defaultFolderURL
     }
+
+    public static var defaultFolderURL: URL {
+        let movies = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+        return movies.appendingPathComponent("PRISM", isDirectory: true)
+    }
+
+    /// True while the user has not repointed the folder — the surfaces say
+    /// "~/Movies/PRISM" rather than an absolute path in that case.
+    public var usesDefaultFolder: Bool { folderPath == nil }
 }

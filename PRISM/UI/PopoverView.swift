@@ -57,6 +57,10 @@ struct PopoverView: View {
                 warningRow(warning)
                     .padding(.bottom, Metrics.sectionGap)
             }
+            if let notice = state.notice {
+                noticeRow(notice)
+                    .padding(.bottom, Metrics.sectionGap)
+            }
             if state.draftConfig != nil {
                 draftBanner
                     .padding(.bottom, Metrics.sectionGap)
@@ -111,7 +115,7 @@ struct PopoverView: View {
     /// a row that renders nothing still costs a section gap and two blank
     /// bands read as a broken popover. Delete an entry the moment its section
     /// draws anything.
-    private static let unbuiltModules: Set<PopoverModule> = [.capture, .prompter]
+    private static let unbuiltModules: Set<PopoverModule> = [.prompter]
 
     private var moduleRows: [ModuleRow] {
         let visible = state.visiblePopoverModules.filter { !Self.unbuiltModules.contains($0) }
@@ -321,6 +325,27 @@ struct PopoverView: View {
                     .controlSize(.small)
             case .none:
                 EmptyView()
+            }
+        }
+    }
+
+    /// The mirror of the warning row: something that went right, and — when
+    /// it produced a file — the one button that answers "where did it go?".
+    /// A saved file the user cannot find is a file that was not saved.
+    private func noticeRow(_ notice: NoticeMessage) -> some View {
+        HStack(spacing: Metrics.itemGap) {
+            Image(systemName: notice.symbolName)
+                .foregroundStyle(.green)
+            Text(notice.text)
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            if let url = notice.fileURL {
+                Button("Show") {
+                    NSWorkspace.shared.activateFileViewerSelecting([url])
+                    state.dismissNotice()
+                }
+                .controlSize(.small)
             }
         }
     }

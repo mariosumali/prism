@@ -50,7 +50,8 @@ PRISM/
 │   │   ├── VideoPipeline.swift     # frame graph orchestration
 │   │   ├── EffectStage.swift       # protocol
 │   │   ├── Stages/                 # Geometry, Adjust, LUT, Style, Blur, Freeze, Clip
-│   │   ├── FrameRing.swift         # 500ms sharpest-frame buffer
+│   │   ├── FrameRing.swift         # 500ms sharpest-frame buffer (camera side)
+│   │   ├── StillRing.swift         # a few finished frames, scored, for stills
 │   │   ├── FormatManager.swift     # advertised format set, negotiation
 │   │   ├── PresetStore.swift       # named user configurations
 │   │   └── LatencyMonitor.swift    # per-stage timing, budget enforcement
@@ -59,6 +60,12 @@ PRISM/
 │   │   └── AudioSink.swift         # write PCM to shared ring buffer
 │   ├── Clip/
 │   │   └── ClipPlayer.swift        # AVAssetReader-based decode
+│   ├── Export/                     # §5.15, §5.16 — frames onto disk
+│   │   ├── CaptureDestination.swift  # folder, screenshot-convention names
+│   │   ├── ClipPlan.swift            # trim / rebase / duration synthesis
+│   │   ├── ClipExporter.swift        # AVAssetWriter passthrough remux
+│   │   ├── ClipDisclosure.swift      # what a saved clip would reveal
+│   │   └── StillExporter.swift       # CGImageDestination PNG / HEIC
 │   ├── UI/
 │   │   ├── PopoverView.swift
 │   │   ├── PreviewView.swift       # MTKView wrapper
@@ -600,6 +607,58 @@ The per-block shimmer is reseeded on every refresh so held frames "boil" between
 
 Connection settings persist in `StudioSettings`, not in presets: switching from Meeting to Studio must not silently fake a network problem. Engagement itself is never persisted — PRISM always launches with a clean feed.
 
+### 5.15 Save the last seconds
+
+The rolling buffer, written to a file.
+
+| Property | Specification |
+|---|---|
+| Trigger | Capture tile, plus global hotkey ⌥⌘S |
+| Source | The §5.9 rolling buffer — requires it to be armed |
+| Container | QuickTime `.mov`, `AVAssetWriter` with `outputSettings: nil` |
+| Contents | Video only. The raw camera, upstream of every effect. No audio |
+| Naming | `PRISM Clip <date> at <time>.mov` in the §5.16 folder |
+
+**Nothing is re-encoded.** The samples in the ring are already hardware-encoded H.264 with a valid format description and no frame reordering (§5.9), so the save is a remux: passthrough input, no media engine work, no GPU work at all. Saving the last ten seconds must not be the thing that makes the next ten seconds stutter.
+
+**Durations are synthesised, and that is the whole trick.** The ring's samples carry `.invalid` durations — VideoToolbox is handed `.invalid` on the way in and hands it straight back — and `AVAssetWriter` cannot build a sample table without them. `ClipPlanner` trims to the first keyframe (a clip that starts mid-GOP references pictures the file does not contain), rebases presentation times to zero (host-clock timestamps produce a file that is legal and unplayable in half the tools that open it), and derives each sample's duration from the next sample's presentation delta, the last inheriting the gap before it. Durations are floored at 1/240 s and capped at 1 s: a duplicate timestamp cannot be written, and a single sample held across an eleven-second camera stall reads as a hung file rather than as a gap.
+
+Any failure cancels the writer and deletes the partial file. A truncated `.mov` in the user's folder is worse than no file, because it looks like the save worked.
+
+**The confirmation is the feature.** The buffer records the camera *upstream of every effect* — that is what lets a replay run through the current look (§5.9), and it is what makes a saved clip a recording of everything the effects were covering. Saving while background blur, a virtual background, a behind-the-subject layer, or the panic backdrop is on air writes a video of the room the user was hiding.
+
+So:
+
+- Every surface states, always, that a saved clip is the raw camera with no effects and no sound. Not only when PRISM has decided there is a risk — a caption that appears only at the moment of danger teaches nobody what the feature does.
+- When something concealing *is* on air, the write does not happen until a modal alert has been read and accepted. This is the only deliberately modal confirmation in PRISM: everything else the app does is undoable or visible on air, and this one is reached by a global chord that works with every PRISM window closed, so there is no surface a passive warning could appear on. Cancel is the default button — a return key pressed out of habit must not disclose anything.
+- The confirmation fires for concealment only (`ClipDisclosure`). Cropping, rotation and colour also make a saved clip differ from the call, and the standing caption covers them; a modal that fires on a zoom is a modal nobody reads by the time it matters.
+
+### 5.16 Stills
+
+One frame, saved as a picture.
+
+| Property | Specification |
+|---|---|
+| Trigger | Capture tile, plus global hotkey ⌥⌘⇧S |
+| Source | The **finished** output — post-effects, exactly what the call sees |
+| Format | PNG (default) or HEIC |
+| Countdown | 0–10 s, default 0 |
+| Sharpest frame | Off by default |
+| Folder | User-chosen, persisted in `CaptureSettings`; default `~/Movies/PRISM` |
+| Naming | `PRISM <date> at <time>.png`, the system's screenshot convention |
+
+**A still is the opposite of a saved clip, deliberately.** A photo pulled off a call should look like the person on the call — retouched, framed, in front of whatever background they chose. A clip you keep should not quietly turn out to be a recording you did not know you were making. The two features read from opposite ends of the pipeline for those two reasons, and both surfaces say which is which.
+
+**The sharpest recent frame, optionally.** PRISM already scores every frame it produces for Laplacian variance — it is how a freeze avoids landing mid-blink (§5.2) — so a still can be the best frame of the recent moment rather than whichever one arrived when the key went down. `StillRing` holds six *finished* frames and their scores; it takes references to the pipeline's own pool buffers rather than copying, so the only per-frame cost is one threadgroup of `prism_sharpness` inside the frame's existing command buffer.
+
+It is off by default for two reasons. Six full output frames is ~50 MB at 1080p against a 250 MB budget (§7), and it must not be spent on a feature nobody switched on — disarmed, the ring holds nothing. And the honest still is the one the user was looking at, which is what PRISM saves when the setting is off: the last frame that reached the sink.
+
+Encoding is `CGImageDestination`, never Core Image. The pixels are copied out of the pool buffer first, row by row against the buffer's real stride — the pipeline reuses that buffer the moment nothing references it, and a lazy encoder would be racing the next frame.
+
+Stills and clips share one folder: two would mean two places to look for the thing you just saved, and the names already say which is which. The folder is created and proved writable *before* anything is encoded — a capture that fails after the work is done has already cost the moment it was trying to keep — and a second capture inside the same second is disambiguated the way the system disambiguates a second screenshot.
+
+Capture settings persist in `StudioSettings`, not in presets: a preset captures a look, and switching from Meeting to Studio must never repoint someone's folder.
+
 ---
 
 ## 6. Latency requirements
@@ -764,6 +823,11 @@ There is deliberately no recording state: writing a file changes nothing on air,
 │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐   │  Moments tiles, one full row
 │  │Replay││Away ││Panic││ Lag │     │  never a part-filled row
 │  └─────┘ └─────┘ └─────┘ └─────┘   │
+│  ┌──────────────┐ ┌──────────────┐ │  Capture tiles, §5.15/§5.16
+│  │    Still     │ │  Save clip   │ │
+│  └──────────────┘ └──────────────┘ │
+│  A saved clip is the raw camera —  │  .caption2 — always, not only
+│  no effects, no sound.             │  when something is being hidden
 │                                    │
 │  ● Natural  Meeting  Studio  ＋     │  preset bar, horizontal scroll
 │                                    │
@@ -815,6 +879,11 @@ Explanatory captions appear when the thing they explain is on. "Others will
 see this flipped" under an off switch is noise on every open; as a tooltip
 on the switch it is still discoverable before the fact.
 
+The Capture caption is the one standing exception, and §5.15 is why: what a
+saved clip contains has to be legible *before* the file exists, so the line
+is there on every open and only gets louder when something on air is
+actually hiding a room.
+
 Height fits content up to the visible screen height, then scrolls. A dropdown
 whose bottom is off the display is worse than one that scrolls.
 
@@ -864,6 +933,13 @@ Sentence case throughout. Active voice. Name things by what the user controls, n
 | Mic check playing | `This is what everyone else hears.` |
 | Mic check heard silence | `PRISM didn't hear anything. Check the microphone picker.` |
 | Mic check while muted | `Unmute to test your voice` |
+| Saved clip / still, standing line | `A saved clip is the raw camera — no effects, no sound.` |
+| Saved clip with an effect hiding the room | `Right now that means the room behind background blur. PRISM will ask before it writes the file.` |
+| Saved clip confirmation | `This clip will show the room behind you.` — buttons `Save the raw camera` / `Cancel` (Cancel is the default) |
+| Save with the buffer off | `Turn the rolling buffer on to save the last seconds` + action `Turn it on` |
+| Save with an empty buffer | `Nothing buffered to save yet` |
+| Capture folder not writable | `PRISM can't write to /Volumes/Gone. Choose another folder.` + action `Choose folder` |
+| Capture succeeded | `Saved PRISM 2026-08-18 at 14.23.05.png` + action `Show` |
 
 Errors state what happened and what to do. They do not apologize and are never vague.
 
