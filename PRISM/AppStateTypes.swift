@@ -26,6 +26,30 @@ public struct AudioDeviceInfo: Identifiable, Equatable, Hashable {
     }
 }
 
+/// An app streaming from PRISM Camera, as reported over 'clnt'.
+///
+/// Both halves travel together because both are load-bearing and neither can
+/// be recovered from the other: §5.15 rules match the signing ID (an
+/// identity), while §8.4 copy shows the friendly name (a label, and one that
+/// collides — two apps can both render as "Studio").
+public struct CameraClient: Identifiable, Equatable, Hashable {
+    public var signingID: String
+    public var name: String
+
+    public var id: String { signingID }
+
+    public init(signingID: String, name: String) {
+        self.signingID = signingID
+        self.name = name
+    }
+
+    /// The usual construction: the name is derived, not supplied.
+    public init(signingID: String) {
+        self.signingID = signingID
+        self.name = CMIOSink.displayName(forSigningID: signingID)
+    }
+}
+
 /// §8.2 — drives the menu bar glyph.
 ///
 /// The states below `.effects` all share one property: forgetting you are in
@@ -79,6 +103,7 @@ public struct WarningMessage: Equatable, Identifiable {
     public enum Action: Equatable {
         case raiseBudget          // §3.4 pinned chain over budget
         case armBuffer            // §5.9 replay/away asked for without a buffer
+        case clearBlocks          // §5.15 a per-app block is refusing a client
         case openSettings
         case none
     }

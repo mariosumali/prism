@@ -15,7 +15,7 @@ import UniformTypeIdentifiers
 
 enum MainPane: String, CaseIterable, Identifiable {
     case studio, scene, moments, voice, framing, effects, format, devices,
-         presets, menuBar, general, about
+         presets, apps, menuBar, general, about
 
     var id: String { rawValue }
 
@@ -30,6 +30,7 @@ enum MainPane: String, CaseIterable, Identifiable {
         case .format: return "Format & Latency"
         case .devices: return "Devices"
         case .presets: return "Presets"
+        case .apps: return "Apps"
         case .menuBar: return "Menu Bar"
         case .general: return "General"
         case .about: return "About"
@@ -47,6 +48,7 @@ enum MainPane: String, CaseIterable, Identifiable {
         case .format: return "rectangle.on.rectangle"
         case .devices: return "camera"
         case .presets: return "square.stack"
+        case .apps: return "app.badge.checkmark"
         case .menuBar: return "menubar.arrow.up.rectangle"
         case .general: return "gearshape"
         case .about: return "info.circle"
@@ -100,6 +102,7 @@ struct MainWindowView: View {
         case .format: FormatPane()
         case .devices: DevicesPane()
         case .presets: PresetsPane()
+        case .apps: AppsPane()
         case .menuBar: MenuBarLayoutPane()
         case .general: GeneralPane()
         case .about: AboutPane()

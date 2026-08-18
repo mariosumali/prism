@@ -60,11 +60,21 @@ struct PresetBar: View {
 
     private func chip(for preset: Preset) -> some View {
         let isActive = state.activePresetID == preset.id
+        let ruleApp = ruleAppName(for: preset)
         return Button {
             state.selectPreset(preset.id)
         } label: {
             HStack(spacing: 5) {
-                if isActive {
+                if let ruleApp {
+                    // §5.15: a look the user did not pick reads as a bug
+                    // unless the chip says who did. The glyph replaces the
+                    // active dot rather than joining it — both mean "this one
+                    // is on air", and the glyph also says why.
+                    Image(systemName: "app.badge.checkmark")
+                        .font(.caption2)
+                        .foregroundStyle(Color.accentColor)
+                        .help("Applied automatically because \(ruleApp) is using PRISM Camera")
+                } else if isActive {
                     Circle()
                         .fill(Color.accentColor)
                         .frame(width: 6, height: 6)
@@ -79,8 +89,12 @@ struct PresetBar: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(preset.name)
-        .accessibilityValue(isActive ? "active" : "inactive")
+        .accessibilityValue(accessibilityValue(isActive: isActive, ruleApp: ruleApp))
         .contextMenu {
+            if let ruleApp {
+                Text("Applied by a rule for \(ruleApp)")
+                Divider()
+            }
             Button("Rename…") {
                 renameText = preset.name
                 renameTarget = preset
@@ -104,6 +118,18 @@ struct PresetBar: View {
                 Text("No hotkey")
             }
         }
+    }
+
+    /// The app whose §5.15 rule put this preset on air, or nil when the
+    /// user chose it themselves.
+    private func ruleAppName(for preset: Preset) -> String? {
+        guard let rule = state.activeAppRule, rule.presetID == preset.id else { return nil }
+        return CMIOSink.displayName(forSigningID: rule.signingID)
+    }
+
+    private func accessibilityValue(isActive: Bool, ruleApp: String?) -> String {
+        if let ruleApp { return "active, applied by a rule for \(ruleApp)" }
+        return isActive ? "active" : "inactive"
     }
 
     private var addChip: some View {

@@ -2,9 +2,10 @@
 // PRISMCameraExtension — the two streams of "PRISM Camera" (SPEC §3.1–§3.2).
 // PRISMStreamSource is the source stream client apps read from; it emits the
 // placeholder card at 1 fps when the sink has been silent for more than
-// 1000 ms. PRISMSinkStreamSource is the sink stream PRISM.app writes into;
-// it runs the consume loop, forwards every buffer to the source stream, and
-// records the sink-receive → source-emit handoff time.
+// 1000 ms, and enforces the §5.15 per-app access policy in
+// authorizedToStartStream. PRISMSinkStreamSource is the sink stream
+// PRISM.app writes into; it runs the consume loop, forwards every buffer to
+// the source stream, and records the sink-receive → source-emit handoff time.
 //
 // Licensed under the Apache License, Version 2.0.
 
@@ -149,6 +150,25 @@ final class PRISMStreamSource: NSObject, CMIOExtensionStreamSource {
     }
 
     func authorizedToStartStream(for client: CMIOExtensionClient) -> Bool {
+        // §5.15 policy hook. Refusing here is the only per-client decision
+        // the extension gets: `stream.send` fans one picture out to every
+        // consumer, so there is no way to show *this* client a card while
+        // another sees video — a per-client placeholder would need a stream
+        // per client, which CMIOExtension does not offer. Returning false
+        // makes the client's AVCaptureSession fail to start, which is the
+        // same shape as a TCC denial and is therefore a failure every video
+        // app already knows how to draw.
+        //
+        // Fail open lives one level down, in PRISMAccessPolicy: no policy,
+        // an unreadable one, or one this build cannot evaluate all say yes.
+        // Written as "refuse only on an explicit no" rather than "allow only
+        // on an explicit yes" so a missing deviceSource admits the client
+        // instead of locking the camera on a released weak reference.
+        if let policy = deviceSource?.accessPolicy,
+           !policy.isAllowed(client.signingID) {
+            deviceSource?.noteClientRefused(client)
+            return false
+        }
         // Every client that begins streaming passes through here; record it
         // for the 'clnt' property (removed on disconnect / full stop).
         deviceSource?.noteStreamingClient(client)

@@ -53,6 +53,7 @@ PRISM/
 │   │   ├── FrameRing.swift         # 500ms sharpest-frame buffer
 │   │   ├── FormatManager.swift     # advertised format set, negotiation
 │   │   ├── PresetStore.swift       # named user configurations
+│   │   ├── AppRuleSettings.swift   # per-app rules + resolver, §5.15
 │   │   └── LatencyMonitor.swift    # per-stage timing, budget enforcement
 │   ├── Sinks/
 │   │   ├── CMIOSink.swift          # push frames to camera extension
@@ -80,7 +81,7 @@ PRISM/
 ├── PRISMCameraExtension/
 │   ├── main.swift
 │   ├── ExtensionProvider.swift     # CMIOExtensionProviderSource
-│   ├── DeviceSource.swift          # CMIOExtensionDeviceSource
+│   ├── DeviceSource.swift          # CMIOExtensionDeviceSource, access policy
 │   ├── StreamSource.swift          # source + sink CMIOExtensionStreamSource
 │   └── PlaceholderRenderer.swift   # "PRISM not running" card
 ├── PRISMAudioPlugIn/
@@ -110,6 +111,8 @@ PRISM/
 ### 3.1 Architecture rule
 
 The camera extension is a dumb relay. It exposes a **sink stream** that PRISM.app writes into and a **source stream** that client apps read from, and forwards sink → source. All processing lives in PRISM.app.
+
+The one decision the extension makes for itself is whether a client may start streaming at all (§5.15) — it has to, because that decision has to hold when PRISM is not running. It is a set-membership test against a policy the app ships it, it fails open on every unclear path, and it touches no pixels.
 
 This is not a style preference. System extensions run as root while the app runs as the user; App Groups do not cross that boundary and direct app-to-extension XPC is unavailable. The CMIO sink stream is therefore the IPC channel — do not build a second one. Keeping the extension thin also means effects changes never require reloading the system extension, which frequently demands a reboot.
 
@@ -145,6 +148,8 @@ Switching the *active* format within the already-published set is free and requi
 **Sink stream (`.sink` direction)** — publishes the same format set. PRISM.app consumes it via the CoreMediaIO C API (`CMIOObjectGetPropertyData` to enumerate, `CMIOStreamCopyBufferQueue` to enqueue). `FormatManager` keeps sink and source sets identical at all times; a mismatch is a hard error and must assert in debug builds.
 
 **Source-to-output resolution.** The physical camera's native format and the negotiated output format are independent. `FormatManager` selects the physical capture format as the smallest native format greater than or equal to the negotiated output in both dimensions, to avoid upscaling. If no native format is large enough, use the largest available and upscale with Lanczos in the Geometry stage.
+
+**Access.** `authorizedToStartStream` on the source stream enforces the §5.15 per-app policy, shipped over the `'polc'` custom property. Refusal is per-client, but the picture is not: one source stream fans out to every consumer, so a refused client is refused rather than shown a card.
 
 **Placeholder state.** When the sink has not received a frame in 1000ms, the source stream emits a placeholder card at 1 fps: system background color, PRISM wordmark centered, and the text `PRISM is not running` below it in 32pt system font at 60% opacity. Never emit a black frame — a black frame reads as broken hardware and generates support noise.
 
@@ -597,6 +602,49 @@ The per-block shimmer is reseeded on every refresh so held frames "boil" between
 
 Connection settings persist in `StudioSettings`, not in presets: switching from Meeting to Studio must not silently fake a network problem. Engagement itself is never persisted — PRISM always launches with a clean feed.
 
+### 5.15 Per-app rules
+
+PRISM already knows which apps are watching — the extension reports their signing IDs over `'clnt'`. Two things follow from knowing that, and this section is both of them: give each app the look it should have, and decide which apps may have the camera at all.
+
+**Ships off.** `AppRuleSettings.isEnabled` is `false` and `defaultAccess` is `.allow` out of the box. This is the only feature in PRISM that can leave an app without a camera while PRISM is not running, and nothing here does anything until the user deliberately turns it on.
+
+#### Per-app presets
+
+An ordered list of rules, each naming one app by signing ID and optionally a preset. When a rule's app starts streaming, its preset goes on air over the existing 200 ms crossfade (§5.5); when the app stops, PRISM crossfades back to whatever the user had before any rule fired.
+
+| Property | Specification |
+|---|---|
+| Matching | Exact signing ID equality. Prefix matching would let `com.evil.zoom` inherit a rule written for Zoom |
+| Conflict | **List order.** The earliest rule whose app is streaming wins |
+| Apply | `applyPreset(_:mayRepublishFormats:)`, the shared body of `selectPreset` — the 200 ms crossfade, minus the format republish |
+| Revert | The snapshot is taken once, on the transition into "a rule is in effect", so a Zoom → Teams handover in one sitting still returns to where the user started |
+| Override | An explicit preset pick — or any hand edit to the look — takes the wheel back: the rule stops being in effect and there is nothing left to revert to, so an hour of adjustment during a call is never thrown away when the call ends |
+| Persistence | Rule-driven looks are never saved as the user's configuration, exactly like a panic backdrop (§5.11) — `persistConfig` writes `appRuleRestore ?? panicRestore ?? config` |
+
+**Two clients at once is the case that has to be specified, not discovered.** PRISM Camera is one camera with one picture; the extension's source stream fans that picture out to every consumer. So when Zoom and FaceTime stream together there is no honest way to give them different looks. "Most recent to connect" would make the look depend on which app the user happened to open first — unpredictable, and impossible to write down. List order is the rule instead: it is visible on screen, it is stable, and dragging a row is how the user says which app matters more. A rule that names no preset does not veto a lower rule that does; neither does a blocked rule.
+
+**Saying so without nagging.** A look that changes itself is indistinguishable from a bug, so PRISM posts one notification naming both sides — `Zoom connected — Meeting preset applied` — and then goes quiet. There is no notification on revert. The preset surfaces carry the state continuously instead: the popover's chip swaps its active dot for a badge, the Presets pane spells it out (`Applied by a rule for Zoom`), and both announce it to VoiceOver. Which preset is on air *because of a rule* rather than because you picked it is always answerable at a glance.
+
+#### Per-app blocking
+
+`authorizedToStartStream` becomes a real policy hook. The policy travels over the `'polc'` custom device property in the same style as `'pfmt'` — §3.1 says the CMIO channel is the only IPC there is, and App Groups do not cross the user/root boundary.
+
+**The extension fails open, on every path.** No policy ever received, a missing or unreadable `policy.json`, a `version` above what this build understands, or a signing ID the policy does not mention under `defaultAccess: "allow"` all resolve to *allow*. The hook is written as "refuse only on an explicit no" rather than "allow only on an explicit yes", so even a released `deviceSource` reference admits the client instead of locking the camera. PRISM's own signing ID is never refused at any layer.
+
+**The policy is persisted, and that is deliberate.** CMIO extensions are launched on demand and torn down when idle, so an in-memory policy would be cleared by quitting and reopening the very app the user blocked — a block anybody can bypass by accident is not a block. A corrupt policy file is deleted on read rather than left to fail open forever in silence.
+
+**A blocked client is refused, not shown a card.** `stream.send` fans one picture out to every consumer, so there is no way to show *this* client a placeholder while another sees video; a per-client card would need a stream per client, which CMIOExtension does not offer. Returning `false` makes the client's `AVCaptureSession` fail to start — the same shape as a TCC denial, which is a failure every video app already knows how to draw. The refusal is invisible from inside the refused app, so the extension reports recent refusals over `'blkd'` and PRISM says what happened.
+
+**Getting out.** The failure mode this feature makes easy is blocking the app you are on a call in, so:
+
+- Blocking an app that is streaming right now raises a confirmation, and the block only bites on that app's *next* camera start — PRISM never cuts a call that is already running.
+- Turning `defaultAccess` to `.block` (allow-list mode) raises its own confirmation naming the consequence for apps installed later.
+- A live refusal raises the §8.3 warning row, with `Unblock all` in the row itself: the user never has to find a pane to get out.
+- The Apps pane carries `Unblock every app`, which lifts every block and resets the default while keeping preset assignments — the failure being recovered from is "my camera is dead", not "I regret my presets".
+- Removing PRISM removes the embedded extension, and every block with it.
+
+Rules live in `AppRuleSettings`, persisted separately from presets: a preset captures a look, and "Zoom gets the Meeting look" is a rule *about* presets. A preset that carried rules could apply itself. The full editor lives in the main window's Apps pane (§8.3 puts deeper controls in the roomier surface); the consequences — which preset a rule chose, and who is being refused — appear in both surfaces.
+
 ---
 
 ## 6. Latency requirements
@@ -857,6 +905,11 @@ Sentence case throughout. Active voice. Name things by what the user controls, n
 | Mic check playing | `This is what everyone else hears.` |
 | Mic check heard silence | `PRISM didn't hear anything. Check the microphone picker.` |
 | Mic check while muted | `Unmute to test your voice` |
+| Rule applied a preset | `Zoom connected — Meeting preset applied` |
+| A block is refusing a client | `PRISM is blocking Zoom from using PRISM Camera` + action `Unblock all` |
+| In-use line while blocking | `In use by FaceTime · blocking Zoom` |
+| Blocking a live client | `Zoom is using PRISM Camera right now. Block it anyway?` |
+| Allow-list confirmation | `Block every app you have not allowed?` |
 
 Errors state what happened and what to do. They do not apologize and are never vague.
 
@@ -892,6 +945,8 @@ Per-stage cost appears inline in the Effects list at `.caption2` `.secondary`. W
 Background blur (§5.4) and virtual backgrounds (§5.7) are separate stages with separate costs, but they answer the same question and cannot both be true — blurring a background you have already replaced is nonsense. They are therefore presented as **one** control with modes: `Off / Blur / Colour / Image / Video`. Two independent switches would let a user construct exactly the nonsense case, and the underlying stage flags are kept consistent for them.
 
 The same reasoning governs where things live. `Effects` holds per-pixel colour work (Adjust, LUT, Style). `Scene` holds everything that changes what is in frame besides you (Background, Overlay, Eye contact). `Moments` holds everything that changes what is on air in *time* rather than space (Replay, Away, Panic).
+
+**Per-app rules are not part of a preset either (§5.15).** "Zoom gets the Meeting look" is a rule *about* presets; a preset that carried rules could apply itself. They persist as `AppRuleSettings`, and their editor lives in the main window rather than the popover — but which preset a rule put on air, and which app is being refused, show in both surfaces, because those are things happening to you rather than settings you are changing.
 
 **Replay, away and panic settings are not part of a preset.** A preset captures a look. "How many seconds do you keep in memory" and "what does the panic key do" are not looks, and switching from Meeting to Studio must not silently rearm a hardware encoder or repoint a panic backdrop. They persist separately as `StudioSettings`.
 

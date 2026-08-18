@@ -59,12 +59,14 @@
 		4586A148816F107CD05E4DEC /* PixelFormats.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93070807D31FCC2579995DBC /* PixelFormats.swift */; };
 		45B17D4FB593E69A1D14E951 /* PRISMApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCF581196F074CC78EF6E49A /* PRISMApp.swift */; };
 		45C1643D61F74834684CEDC4 /* PresetsPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59DE48E698981ADCCC127856 /* PresetsPane.swift */; };
+		460C6C2413EB04F97D99DC5B /* AppsPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2806D5DD0530130385C99B88 /* AppsPane.swift */; };
 		48831D16987F5255F4410172 /* ReplayBufferTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93DF453D1AD025F78107920C /* ReplayBufferTests.swift */; };
 		4CDF21B240459C66D7D97EF0 /* EffectsPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = F83B9E6AE227921AA633A2A1 /* EffectsPane.swift */; };
 		4CFF7D54279FF9949E785AD6 /* FramingPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = 985EBBD95DF6C83F13A30A4A /* FramingPane.swift */; };
 		4D08DCAD2F2B9368687D0A78 /* AudioSink.swift in Sources */ = {isa = PBXBuildFile; fileRef = 367E6B83C5BE24FFC29A2B64 /* AudioSink.swift */; };
 		4D753CE9B98FDE578B6D0C61 /* VoiceChanger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20BFF280BEB1FB7E10563950 /* VoiceChanger.swift */; };
 		4ED2E4698E027A514789B68A /* ScenePane.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0085374A06F1C7AECB0AB857 /* ScenePane.swift */; };
+		50FAD346752443E4E5640533 /* AppRuleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB8DF25A1D37B89D67992AC5 /* AppRuleTests.swift */; };
 		532FA68CEF2F36887E34663C /* MomentsSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 12C343B3A84A51C036889902 /* MomentsSection.swift */; };
 		53BF17FAEE2EC7393693EFAC /* OverlayStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CB075C6D6D34CA3BE2BB96D /* OverlayStage.swift */; };
 		54002C1336EFDE2DB32F9737 /* FreezeStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 21CC8265134D3F7EFB19E105 /* FreezeStage.swift */; };
@@ -76,6 +78,7 @@
 		60100DB363BE2B15347F2770 /* SceneSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E4230754DD0CC06066B1699 /* SceneSection.swift */; };
 		6177F63D41057A39E3026C18 /* VoiceSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8A7B6CD75FF1E46A071E655 /* VoiceSection.swift */; };
 		62432F3DB10485974FAC5235 /* MenuBarLayoutPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95D50908EB1583324D4BF7B8 /* MenuBarLayoutPane.swift */; };
+		664D47D82D835BE37F59C0BF /* AppRuleSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 90E55C411E775BE40BB5F667 /* AppRuleSettings.swift */; };
 		6654C19B8CF13CB1211B93F0 /* DesignSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = E428DF4772A95B7DACD74F98 /* DesignSystem.swift */; };
 		67F5BD244F0B193BB652C30F /* Film.cube in Resources */ = {isa = PBXBuildFile; fileRef = 52BC20A79E3805278E9CEDA5 /* Film.cube */; };
 		68E826BECFBEC7E5D54FDB0F /* ClipStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3B73B15856323C3240286438 /* ClipStage.swift */; };
@@ -104,6 +107,7 @@
 		87E85ACF08D5F56243FC8E93 /* ConnectionStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 687E298F56390E8081059AEC /* ConnectionStage.swift */; };
 		88A406B90AEDA715588C49BC /* Mono.cube in Resources */ = {isa = PBXBuildFile; fileRef = E6939C7C96B029684841510E /* Mono.cube */; };
 		88B3B6F868E815F0D18B98F4 /* Cool.cube in Resources */ = {isa = PBXBuildFile; fileRef = F5CF86EF692111A7BC80FF9F /* Cool.cube */; };
+		89129823A3F7853981588057 /* AppRuleSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 90E55C411E775BE40BB5F667 /* AppRuleSettings.swift */; };
 		8ABE672138DF16F2160C62D4 /* MenuBarIcon.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A1EC4ED23C9BD0CCD087D71 /* MenuBarIcon.swift */; };
 		8B31065501BDBE33FD9A3DD3 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8949CE3186FBB24B552D6A6D /* SettingsView.swift */; };
 		907E78395A000D9465917CDB /* AdjustStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2D1A5DE99E9DCD69AFA2645 /* AdjustStage.swift */; };
@@ -227,6 +231,7 @@
 		21CC8265134D3F7EFB19E105 /* FreezeStage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FreezeStage.swift; sourceTree = "<group>"; };
 		23DF6FB0C9E81B3D1E58A0B2 /* Neutral.cube */ = {isa = PBXFileReference; path = Neutral.cube; sourceTree = "<group>"; };
 		2435E0B8D2F51C5BA54E2363 /* PRISM_PlugIn.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = PRISM_PlugIn.h; sourceTree = "<group>"; };
+		2806D5DD0530130385C99B88 /* AppsPane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppsPane.swift; sourceTree = "<group>"; };
 		2C3E91CDAD0F5859F1D113C2 /* PRISM.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PRISM.entitlements; sourceTree = "<group>"; };
 		2F2D2D84A17A12C4AA5F0873 /* ReplayStage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReplayStage.swift; sourceTree = "<group>"; };
 		334E7F01542A708162B01D41 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
@@ -272,6 +277,7 @@
 		8D88CE1466967F22224CD876 /* StreamSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamSource.swift; sourceTree = "<group>"; };
 		8ECBD2378C965EA3C4DE5B3E /* Hotkeys.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Hotkeys.swift; sourceTree = "<group>"; };
 		908D97B57D980B712327EB7B /* LUT.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = LUT.metal; sourceTree = "<group>"; };
+		90E55C411E775BE40BB5F667 /* AppRuleSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppRuleSettings.swift; sourceTree = "<group>"; };
 		93070807D31FCC2579995DBC /* PixelFormats.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PixelFormats.swift; sourceTree = "<group>"; };
 		93DF453D1AD025F78107920C /* ReplayBufferTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReplayBufferTests.swift; sourceTree = "<group>"; };
 		954600C921AC4A39BF54C986 /* SceneCompositingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneCompositingTests.swift; sourceTree = "<group>"; };
@@ -327,6 +333,7 @@
 		E8CB82B65292DC6EEB8FA768 /* LatencyMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LatencyMonitor.swift; sourceTree = "<group>"; };
 		E8D1B82A692934B670FF6FE7 /* Adjust.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Adjust.metal; sourceTree = "<group>"; };
 		EAB8340AC048FB9FBABD347E /* PreviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewView.swift; sourceTree = "<group>"; };
+		EB8DF25A1D37B89D67992AC5 /* AppRuleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppRuleTests.swift; sourceTree = "<group>"; };
 		EC236B6B716770D870EC4658 /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
 		EC692B18502267749EC66F7D /* PRISMTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PRISMTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		ED9EEE45DD9D6C7C1C7D098E /* FormatSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FormatSection.swift; sourceTree = "<group>"; };
@@ -365,6 +372,7 @@
 		345A9A240694A9DEDA845DD6 /* PRISMTests */ = {
 			isa = PBXGroup;
 			children = (
+				EB8DF25A1D37B89D67992AC5 /* AppRuleTests.swift */,
 				665587966FF1DC8F9D0575C3 /* AutoFramerTests.swift */,
 				9BC207D78079C6331980E17D /* BadConnectionTests.swift */,
 				4C154757DBE0811782C08AA8 /* ClientNameTests.swift */,
@@ -436,6 +444,7 @@
 		5100807BB4CE0FA6843CD74A /* Pipeline */ = {
 			isa = PBXGroup;
 			children = (
+				90E55C411E775BE40BB5F667 /* AppRuleSettings.swift */,
 				6C53F2782DAEA73F7178BC47 /* DraftRenderer.swift */,
 				78484AC653FD132ADA559CCF /* EffectStage.swift */,
 				B1316A897BE17127EF6A8D0D /* FormatManager.swift */,
@@ -555,6 +564,7 @@
 		B56C92A12876CEDC6FB1755C /* MainWindow */ = {
 			isa = PBXGroup;
 			children = (
+				2806D5DD0530130385C99B88 /* AppsPane.swift */,
 				F83B9E6AE227921AA633A2A1 /* EffectsPane.swift */,
 				3C02463C50F08564384E6C5B /* FormatPane.swift */,
 				985EBBD95DF6C83F13A30A4A /* FramingPane.swift */,
@@ -810,6 +820,8 @@
 			files = (
 				242FAFD6C52888FE1B69F1BC /* Adjust.metal in Sources */,
 				0056429A1E140FCE0D2811B6 /* AdjustStage.swift in Sources */,
+				664D47D82D835BE37F59C0BF /* AppRuleSettings.swift in Sources */,
+				50FAD346752443E4E5640533 /* AppRuleTests.swift in Sources */,
 				F756830956D37714288553B7 /* AppState.swift in Sources */,
 				0E8B3A768A67EA41396D9111 /* AppStateTypes.swift in Sources */,
 				7828206F9B97B429A62B5BEF /* AudioCapture.swift in Sources */,
@@ -889,8 +901,10 @@
 			files = (
 				ACDFF2564655D3097A21C900 /* Adjust.metal in Sources */,
 				907E78395A000D9465917CDB /* AdjustStage.swift in Sources */,
+				89129823A3F7853981588057 /* AppRuleSettings.swift in Sources */,
 				177EFFF03CC605C85B0E9733 /* AppState.swift in Sources */,
 				BE129B9E06E67A5276BB1FFE /* AppStateTypes.swift in Sources */,
+				460C6C2413EB04F97D99DC5B /* AppsPane.swift in Sources */,
 				D66E1CCCCC04289DCE65F4E0 /* AudioCapture.swift in Sources */,
 				925278567290F9E725EED4B2 /* AudioSink.swift in Sources */,
 				E89124469D1FE6A190031339 /* AutoFramer.swift in Sources */,

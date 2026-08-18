@@ -270,11 +270,17 @@ struct PopoverView: View {
         state.latency.deliberateDelayMs >= 50
     }
 
-    /// §8.4 — "In use by Zoom, FaceTime" / "Not in use".
+    /// §8.4 — "In use by Zoom, FaceTime" / "Not in use", plus the §5.15
+    /// refusal when one is biting. A blocked app cannot tell its user why its
+    /// camera will not start, so this line is the only place that can.
     private var inUseLine: String {
-        state.clientsInUse.isEmpty
+        var line = state.clientsInUse.isEmpty
             ? "Not in use"
-            : "In use by \(state.clientsInUse.joined(separator: ", "))"
+            : "In use by \(state.clientsInUse.map(\.name).joined(separator: ", "))"
+        if !state.blockedClients.isEmpty {
+            line += " · blocking \(state.blockedClients.map(\.name).joined(separator: ", "))"
+        }
+        return line
     }
 
     private func warningRow(_ warning: WarningMessage) -> some View {
@@ -291,6 +297,9 @@ struct PopoverView: View {
                     .controlSize(.small)
             case .armBuffer:
                 Button("Turn on") { state.setBufferArmed(true) }
+                    .controlSize(.small)
+            case .clearBlocks:
+                Button("Unblock all") { state.clearAllBlocks() }
                     .controlSize(.small)
             case .openSettings:
                 Button("Open Settings") { openSettingsWindow() }

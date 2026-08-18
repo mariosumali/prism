@@ -72,10 +72,16 @@ struct StudioPane: View {
         return line
     }
 
+    /// Same composition as the popover's, including the §5.15 refusal — both
+    /// surfaces answer "who is watching" identically.
     private var inUseLine: String {
-        state.clientsInUse.isEmpty
+        var line = state.clientsInUse.isEmpty
             ? "Not in use"
-            : "In use by \(state.clientsInUse.joined(separator: ", "))"
+            : "In use by \(state.clientsInUse.map(\.name).joined(separator: ", "))"
+        if !state.blockedClients.isEmpty {
+            line += " · blocking \(state.blockedClients.map(\.name).joined(separator: ", "))"
+        }
+        return line
     }
 
     private func warningRow(_ warning: WarningMessage) -> some View {
@@ -92,6 +98,9 @@ struct StudioPane: View {
                     .controlSize(.small)
             case .armBuffer:
                 Button("Turn on") { state.setBufferArmed(true) }
+                    .controlSize(.small)
+            case .clearBlocks:
+                Button("Unblock all") { state.clearAllBlocks() }
                     .controlSize(.small)
             case .openSettings, .none:
                 EmptyView()
