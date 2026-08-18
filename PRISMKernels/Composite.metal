@@ -106,6 +106,58 @@ kernel void prism_crossfade(texture2d<float, access::sample> texA   [[texture(0)
     dst.write(mix(a, b, saturate(params.mix)), gid);
 }
 
+// Simulated bad connection (§5.14): quantise the frame into codec-style
+// macroblocks (every pixel in a block samples the block's centre), posterise
+// colour to a starved bit depth, and add a per-block shimmer so consecutive
+// refreshes "boil" the way a codec out of bits does. Under partial refresh
+// (updateFraction < 1) a per-block lottery decides which blocks receive
+// fresh content; losers copy last frame's degraded pixels from `prev`, so a
+// moving subject leaves stale blocks behind — the packet-loss smear that
+// actually sells the effect. One pass; the irregular refresh cadence and the
+// delay are done by the stage's gate and §5.12 respectively.
+kernel void prism_connection(texture2d<float, access::sample> src    [[texture(0)]],
+                             texture2d<float, access::read>   prev   [[texture(1)]],
+                             texture2d<float, access::write>  dst    [[texture(2)]],
+                             constant PRISMConnectionParams&  params [[buffer(0)]],
+                             uint2                            gid    [[thread_position_in_grid]])
+{
+    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) {
+        return;
+    }
+
+    float block = max(params.blockSize, 1.0);
+    float2 blockIndex = floor(float2(gid) / block);
+
+    // Stale-block lottery first: a codec under loss updates only the blocks
+    // it received. Distinct hash constants from the shimmer below, so the
+    // same blocks do not always shimmer brightest AND update last.
+    if (params.hasPrev > 0.5) {
+        float updateHash = fract(sin(dot(blockIndex + params.seed + 17.0,
+                                         float2(26.651, 41.113))) * 33421.177);
+        if (updateHash > params.updateFraction) {
+            dst.write(prev.read(gid), gid);
+            return;
+        }
+    }
+
+    constexpr sampler smp(coord::normalized, address::clamp_to_edge, filter::linear);
+    float2 dstSize = float2(dst.get_width(), dst.get_height());
+    float2 uv = clamp((blockIndex + 0.5) * block / dstSize, 0.0, 1.0);
+    float3 rgb = src.sample(smp, uv).rgb;
+
+    // Per-block hash shimmer, applied before quantisation so the noise
+    // pushes blocks across posterisation steps — that flicker between two
+    // adjacent colour bands is the artifact, not smooth grain.
+    float hash = fract(sin(dot(blockIndex + params.seed,
+                               float2(12.9898, 78.233))) * 43758.5453);
+    rgb += (hash - 0.5) * params.noise;
+
+    float levels = max(params.levels, 2.0);
+    rgb = floor(saturate(rgb) * (levels - 1.0) + 0.5) / (levels - 1.0);
+
+    dst.write(float4(rgb, 1.0), gid);
+}
+
 // Sharpness score for FrameRing (§5.2): variance of a 3×3 Laplacian of
 // Rec.709 luma over a 128×72 downsample of src. Dispatched as exactly ONE
 // threadgroup of 256 threads; each thread strides the sample grid, the

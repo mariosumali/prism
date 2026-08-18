@@ -46,6 +46,7 @@ final class DraftRenderer {
     private let blurStage: BlurStage
     private let backgroundStage: BackgroundStage
     private let overlayStage: OverlayStage
+    private let styleStage: StyleStage
     private let outputFitStage: OutputFitStage
     private let userStages: [EffectStage]
 
@@ -83,9 +84,12 @@ final class DraftRenderer {
         blurStage = try BlurStage(metal: metal, segmenter: segmenter)
         backgroundStage = try BackgroundStage(metal: metal, segmenter: segmenter)
         overlayStage = try OverlayStage(metal: metal, segmenter: segmenter)
+        styleStage = try StyleStage(metal: metal)
         outputFitStage = try OutputFitStage(metal: metal)
+        // No connection stage here: bad connection is engaged behaviour, not
+        // a look — a draft previews the look it would apply (§5.14 excluded).
         userStages = [gazeStage, geometryStage, adjustStage, lutStage,
-                      blurStage, backgroundStage, overlayStage]
+                      blurStage, backgroundStage, overlayStage, styleStage]
         outputFitStage.outputSize = CGSize(width: outputFormat.width,
                                            height: outputFormat.height)
     }
@@ -118,6 +122,7 @@ final class DraftRenderer {
         gazeStage.settings = config.gaze
         backgroundStage.settings = config.background
         overlayStage.settings = config.overlay
+        styleStage.settings = config.style
         segmenter.quality = config.blur.quality
 
         geometryStage.isEnabled = config.flags(for: .geometry).enabled
@@ -127,6 +132,7 @@ final class DraftRenderer {
         gazeStage.isEnabled = config.flags(for: .gaze).enabled
         backgroundStage.isEnabled = config.flags(for: .background).enabled
         overlayStage.isEnabled = config.flags(for: .overlay).enabled
+        styleStage.isEnabled = config.flags(for: .style).enabled
 
         backgroundStage.setDemandActive(true)
         overlayStage.setDemandActive(true)

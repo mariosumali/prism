@@ -1,11 +1,12 @@
 // StudioSettings.swift
 // PRISM
 //
-// Behaviour settings for instant replay, the away loop, and the panic chord
-// (§5.9–§5.11). Deliberately NOT part of PipelineConfiguration: a preset
-// captures a *look*, and "how many seconds of video do you keep in memory"
-// or "what does the panic key do" are not looks. Switching from Meeting to
-// Studio must not silently rearm a buffer or repoint a panic backdrop.
+// Behaviour settings for instant replay, the away loop, the panic chord,
+// the lag switch and the voice changer (§5.9–§5.13). Deliberately NOT part
+// of PipelineConfiguration: a preset captures a *look*, and "how many
+// seconds of video do you keep in memory" or "what does the panic key do"
+// are not looks. Switching from Meeting to Studio must not silently rearm a
+// buffer, repoint a panic backdrop, or change what you sound like.
 //
 // Persisted whole in UserDefaults by AppState.
 //
@@ -141,6 +142,92 @@ public struct LagSettings: Codable, Equatable {
     }
 }
 
+// MARK: - Bad connection (§5.14)
+
+/// Simulated poor network (§5.14): the picture goes blocky and colour-starved,
+/// the frame rate collapses, and — optionally — the whole feed falls behind
+/// live via the §5.12 delay machinery. One switch, because "my connection is
+/// struggling" is one excuse, not three settings to remember.
+///
+/// The degradation is cosmetic and applies to the published frame only: PRISM
+/// still runs the full chain at full rate underneath, so releasing the switch
+/// is instant and costless.
+public struct ConnectionSettings: Codable, Equatable {
+    /// How bad it looks, 0.1…1. One knob drives block size, colour depth and
+    /// frame rate together, because a connection never degrades one of those
+    /// without the others — independent sliders would let you dial in a
+    /// failure mode no network produces.
+    public var severity: Double = 0.6
+    /// Hold each frame and refresh at the throttled rate below. Off leaves
+    /// motion smooth and degrades only the image itself.
+    public var dropsFrames: Bool = true
+    /// Also fall behind live (§5.12) while degraded. On by default: a feed
+    /// that pixelates but answers instantly reads as a filter, not a network.
+    /// Requires the rolling buffer, exactly like the lag switch.
+    public var addsLag: Bool = true
+    /// Delay used when `addsLag` engages. Smaller default than the lag
+    /// switch's 3 s — a struggling connection is behind, not absent.
+    public var lagMs: Double = 1200              // 200…10000
+    public init() {}
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        severity = c.tolerant(.severity, 0.6)
+        dropsFrames = c.tolerant(.dropsFrames, true)
+        addsLag = c.tolerant(.addsLag, true)
+        lagMs = c.tolerant(.lagMs, 1200)
+    }
+
+    /// The floor exists because a severity of zero would be an "on" switch
+    /// that changes nothing — the §8.7 inert-toggle problem.
+    public var clampedSeverity: Double { min(max(severity, 0.1), 1) }
+    public var clampedLagMs: Double { min(max(lagMs, 200), 10_000) }
+    public var lagSeconds: Double { clampedLagMs / 1000 }
+
+    // Severity mappings live here, in one place, so the stage, the UI's
+    // "looks like" readout and the tests can never disagree about what a
+    // severity means.
+
+    /// Pixelation block edge in pixels at the given frame height. Quadratic
+    /// in severity: block *area* is what the eye reads, and linear edge
+    /// growth back-loads the whole range into the last quarter of the slider.
+    public func blockSize(forHeight height: Int) -> Double {
+        let s = clampedSeverity
+        let at1080 = 4 + 44 * s * s
+        return max(2, at1080 * Double(height) / 1080)
+    }
+
+    /// Colour steps per channel. A starved encoder posterises before it
+    /// pixelates — but subtly: heavy uniform banding reads as a poster
+    /// filter, not a codec, so the floor stays well above unmistakable.
+    public var posterizeLevels: Double {
+        (34 - 22 * clampedSeverity).rounded()
+    }
+
+    /// Mean refresh rate while `dropsFrames` is on — the gate jitters the
+    /// actual intervals and adds occasional stalls, because a metronomic
+    /// frame rate is a strobe, not a network. Never reaches zero: a frozen
+    /// picture is the §5.2 freeze, not a bad connection.
+    public var throttledFps: Double {
+        18 - 12 * clampedSeverity
+    }
+
+    /// Per-block shimmer amplitude — the boiling, blocky noise of a codec
+    /// running out of bits. Kept subtle; the pulsing does the selling.
+    public var artifactAmount: Double {
+        0.02 + 0.05 * clampedSeverity
+    }
+
+    /// Fraction of blocks that receive fresh content on each refresh; the
+    /// rest hold last frame's pixels. This is the packet-loss smear — moving
+    /// subjects leave stale blocks behind, which is the single most
+    /// recognisable artifact of a genuinely bad connection. A uniform
+    /// full-frame mosaic, by contrast, reads as a deliberate filter.
+    public var updateFraction: Double {
+        0.95 - 0.55 * clampedSeverity
+    }
+}
+
 // MARK: - Panic chord (§5.11)
 
 /// One chord, built entirely from primitives PRISM already has. Every part
@@ -193,6 +280,41 @@ public struct PanicSettings: Codable, Equatable {
     }
 }
 
+// MARK: - Voice changer (§5.13)
+
+/// The microphone voice effects. Behaviour, not look: an alien voice is a
+/// stunt you engage, and a preset switch must never silently change what
+/// you sound like — so this lives here, beside mute's other neighbours,
+/// rather than in PipelineConfiguration.
+public struct VoiceSettings: Codable, Equatable {
+    /// What is on air right now. `.off` is honest pass-through.
+    public var effect: VoiceEffect = .off
+    /// Remembered by the ⌃⌥⌘V toggle: switching the voice off must not
+    /// forget which voice it was.
+    public var lastUsedEffect: VoiceEffect = .chipmunk
+    /// Effect strength, 0.25…1. Scales pitch offsets geometrically and
+    /// mixes linearly; the floor exists because an amount of zero would be
+    /// an "on" switch that changes nothing (the §8.7 inert-toggle problem).
+    public var amount: Double = 1
+    public init() {}
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        effect = c.tolerant(.effect, .off)
+        lastUsedEffect = c.tolerant(.lastUsedEffect, .chipmunk)
+        amount = c.tolerant(.amount, 1)
+    }
+
+    public var clampedAmount: Double { min(max(amount, 0.25), 1) }
+    public var isActive: Bool { effect != .off }
+
+    /// What the toggle recalls. Never `.off`: a toggle that recalls "off"
+    /// is a switch wired to nothing.
+    public var recallEffect: VoiceEffect {
+        lastUsedEffect == .off ? .chipmunk : lastUsedEffect
+    }
+}
+
 // MARK: - Aggregate
 
 public struct StudioSettings: Codable, Equatable {
@@ -200,10 +322,12 @@ public struct StudioSettings: Codable, Equatable {
     public var away = AwaySettings()
     public var panic = PanicSettings()
     public var lag = LagSettings()
+    public var voice = VoiceSettings()
+    public var connection = ConnectionSettings()
     public init() {}
 
     public enum CodingKeys: String, CodingKey {
-        case replay, away, panic, lag
+        case replay, away, panic, lag, voice, connection
     }
 
     /// Same forward-compatibility contract as PipelineConfiguration: a field
@@ -217,6 +341,8 @@ public struct StudioSettings: Codable, Equatable {
         away = decode(.away, AwaySettings())
         panic = decode(.panic, PanicSettings())
         lag = decode(.lag, LagSettings())
+        voice = decode(.voice, VoiceSettings())
+        connection = decode(.connection, ConnectionSettings())
     }
 
     /// The rolling buffer runs when replay is armed, or when the away loop

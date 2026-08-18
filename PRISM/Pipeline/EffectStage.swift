@@ -12,7 +12,8 @@ import Metal
 
 /// Fixed chain order (§3.3, extended):
 /// Clip → Replay → Freeze → Eye contact → Geometry → Adjust → LUT →
-/// Background blur → Virtual background → Overlay → Output fit
+/// Background blur → Virtual background → Overlay → Style → Bad connection →
+/// Output fit
 ///
 /// The three substituting stages come first and in escalating order of
 /// authority: a clip replaces the camera, a replay overrides the clip, and a
@@ -21,7 +22,12 @@ import Metal
 /// the same space Vision measured the landmarks in. Virtual background and
 /// Overlay run after blur because both consume the same person mask and must
 /// composite over the finished look, and Overlay runs last of the two so a
-/// foreground layer sits above a replaced background.
+/// foreground layer sits above a replaced background. Style is the last
+/// composing stage: a preset look applies to the finished scene — backdrop
+/// and overlays included — exactly as Photo Booth styles a finished photo.
+/// Bad connection sits after everything the user composes: a struggling
+/// network degrades the finished picture, styled look included — a crisp
+/// overlay on a pixelated face would give the game away instantly.
 public enum StageID: String, Codable, CaseIterable, Hashable, Comparable {
     case clip
     case replay
@@ -33,6 +39,8 @@ public enum StageID: String, Codable, CaseIterable, Hashable, Comparable {
     case blur
     case background
     case overlay
+    case style       // §5.4 preset visual effects (Photo Booth-style looks)
+    case connection  // §5.14 simulated bad connection; engaged, not preset
     case outputFit   // always-on final fit; not user-visible as a stage
 
     /// Position in the chain; also the degradation tie-breaker (§3.4:
@@ -49,7 +57,9 @@ public enum StageID: String, Codable, CaseIterable, Hashable, Comparable {
         case .blur: return 7
         case .background: return 8
         case .overlay: return 9
-        case .outputFit: return 10
+        case .style: return 10
+        case .connection: return 11
+        case .outputFit: return 12
         }
     }
 
@@ -70,6 +80,8 @@ public enum StageID: String, Codable, CaseIterable, Hashable, Comparable {
         case .blur: return "Background blur"
         case .background: return "Virtual background"
         case .overlay: return "Overlay"
+        case .style: return "Style"
+        case .connection: return "Bad connection"
         case .outputFit: return "Output fit"
         }
     }

@@ -95,6 +95,20 @@ typedef struct {
     unsigned int _pad0;
 } PRISMThumbnailParams;
 
+// Composite.metal — simulated bad connection (§5.14): block pixelation,
+// colour posterisation, per-block shimmer, and packet-loss-style partial
+// refresh against the previous degraded frame, in one pass.
+typedef struct {
+    float blockSize;             // block edge in destination pixels, ≥ 1
+    float levels;                // colour steps per channel, ≥ 2
+    float noise;                 // per-block shimmer amplitude, 0…1
+    float seed;                  // reseeded on each held-frame refresh
+    float updateFraction;        // fraction of blocks refreshed this pass, 0…1
+    float hasPrev;               // 1 = prev holds the previous degraded frame
+    float _pad0;
+    float _pad1;
+} PRISMConnectionParams;
+
 // Gaze.metal — one eye's warp geometry, all in input UV space. The iris
 // disc translates rigidly by `shift`; the surrounding sclera stretches; the
 // lid ellipse pins the deformation so eyelids and skin never move.
@@ -143,5 +157,21 @@ typedef struct {
     unsigned int keyMode;        // 0 = none, 1 = chroma, 2 = luma
     unsigned int placement;      // 0 = in front of everything, 1 = behind the person
 } PRISMOverlayParams;
+
+// Style.metal — one preset-effect pass (§5.4); every prism_style_* kernel
+// takes the same params. `time` animates only the effects that use it. The
+// motion effects additionally read a history texture holding the previous
+// styled output (the stage blits dst → history each frame); `hasHistory`
+// gates the first frame, whose history contents are undefined.
+typedef struct {
+    float intensity;      // 0…1 effect strength; 0 must reproduce the source
+    float time;           // seconds since the stage started, wraps hourly
+    float aspect;         // src width / height (radial effects stay circular)
+    float hasHistory;     // 1 = history holds the previous styled frame
+    float _pad0;
+    float _pad1;
+    float _pad2;
+    float _pad3;
+} PRISMStyleParams;
 
 #endif /* PRISM_KERNEL_TYPES_H */

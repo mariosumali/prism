@@ -23,14 +23,14 @@ public final class MetalContext {
     public let device: MTLDevice
     public let commandQueue: MTLCommandQueue
     public let library: MTLLibrary            // default library (PRISMKernels)
-    public let textureCache: CVMetalTextureCache
 
     private var pipelineCache: [String: MTLComputePipelineState] = [:]
     private let pipelineLock = NSLock()
 
-    /// Associated-object key used to pin the CVMetalTexture to the MTLTexture
-    /// it vends, so the IOSurface binding stays alive for the frame.
-    private static var cvTextureOwnerKey: UInt8 = 0
+    /// Associated-object key used to pin the pixel buffer to the MTLTexture
+    /// that views it, so its IOSurface stays out of the pool's free list for
+    /// as long as anything holds the texture.
+    private static var pixelBufferOwnerKey: UInt8 = 0
 
     public init() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -46,35 +46,49 @@ public final class MetalContext {
             ?? (try? device.makeDefaultLibrary(bundle: Bundle(for: MetalContext.self))) else {
             throw PipelineError.pipelineStateUnavailable("Default Metal library missing")
         }
-        var cache: CVMetalTextureCache?
-        let status = CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache)
-        guard status == kCVReturnSuccess, let cache else {
-            throw PipelineError.pipelineStateUnavailable("CVMetalTextureCacheCreate failed (\(status))")
-        }
         self.device = device
         self.commandQueue = queue
         self.library = library
-        self.textureCache = cache
     }
 
-    /// BGRA8 texture view of an IOSurface-backed pixel buffer. Keeps the
-    /// CVMetalTexture alive for the frame via the returned wrapper.
+    /// BGRA8 texture view of an IOSurface-backed pixel buffer.
+    ///
+    /// Built straight from the buffer's IOSurface rather than through a
+    /// CVMetalTextureCache. The cache route hands back a CVMetalTexture that
+    /// owns the MTLTexture, and it has to outlive every use of that texture
+    /// — but pinning it to the texture (the obvious way to arrange that) is
+    /// a retain cycle, so neither is ever freed and every wrapped frame
+    /// keeps its IOSurface. Nothing looks wrong until the process hits the
+    /// per-client limit of 16384 surfaces and dies: about nine minutes of
+    /// 30 fps, which is exactly how it presented (a crash mid-session, with
+    /// "IOSurface creation failed … likely per client IOSurface limit
+    /// reached" filling the log).
+    ///
+    /// Attaching the pixel buffer to the texture instead is one-way, so the
+    /// pair is released together: the surface stays out of the pool's free
+    /// list while the texture is referenced, and goes back the moment it is
+    /// not. The texture holds its own reference to the surface, so the
+    /// pixels remain valid for as long as the texture does.
     public func makeTexture(from pixelBuffer: CVPixelBuffer) throws -> MTLTexture {
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
-        var cvTexture: CVMetalTexture?
-        let status = CVMetalTextureCacheCreateTextureFromImage(
-            kCFAllocatorDefault, textureCache, pixelBuffer, nil,
-            .bgra8Unorm, width, height, 0, &cvTexture)
-        guard status == kCVReturnSuccess,
-              let cvTexture,
-              let texture = CVMetalTextureGetTexture(cvTexture) else {
+        guard let surface = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue() else {
             throw PipelineError.textureAllocationFailed
         }
-        // The MTLTexture does not retain its CVMetalTexture; attach it so the
-        // texture keeps the IOSurface mapping alive as long as it is referenced.
-        objc_setAssociatedObject(texture, &MetalContext.cvTextureOwnerKey,
-                                 cvTexture, .OBJC_ASSOCIATION_RETAIN)
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: CVPixelBufferGetWidth(pixelBuffer),
+            height: CVPixelBufferGetHeight(pixelBuffer),
+            mipmapped: false)
+        descriptor.usage = [.shaderRead, .shaderWrite]
+        // An IOSurface-backed texture is never .private; on Apple silicon the
+        // surface is already shared with the CPU, on Intel it is managed.
+        descriptor.storageMode = device.hasUnifiedMemory ? .shared : .managed
+        guard let texture = device.makeTexture(descriptor: descriptor,
+                                               iosurface: surface,
+                                               plane: 0) else {
+            throw PipelineError.textureAllocationFailed
+        }
+        objc_setAssociatedObject(texture, &MetalContext.pixelBufferOwnerKey,
+                                 pixelBuffer, .OBJC_ASSOCIATION_RETAIN)
         return texture
     }
 
@@ -145,6 +159,8 @@ public final class VideoPipeline {
     public let blurStage: BlurStage
     public let backgroundStage: BackgroundStage
     public let overlayStage: OverlayStage
+    public let styleStage: StyleStage
+    public let connectionStage: ConnectionStage
     public let outputFitStage: OutputFitStage
 
     /// One person mask, shared by blur, virtual background, behind-the-
@@ -231,7 +247,7 @@ public final class VideoPipeline {
     private static let stageWeights: [StageID: Double] = [
         .clip: 1, .replay: 1, .freeze: 1, .gaze: 8, .geometry: 2,
         .adjust: 1, .lut: 3, .blur: 12, .background: 6, .overlay: 2,
-        .outputFit: 1,
+        .style: 3, .connection: 1, .outputFit: 1,
     ]
 
     /// Stages that consume the person mask. Segmentation runs once per frame
@@ -258,10 +274,13 @@ public final class VideoPipeline {
         blurStage = try BlurStage(metal: metal, segmenter: segmenter)
         backgroundStage = try BackgroundStage(metal: metal, segmenter: segmenter)
         overlayStage = try OverlayStage(metal: metal, segmenter: segmenter)
+        styleStage = try StyleStage(metal: metal)
+        connectionStage = try ConnectionStage(metal: metal)
         outputFitStage = try OutputFitStage(metal: metal)
 
         userStages = [clipStage, replayStage, freezeStage, gazeStage, geometryStage,
-                      adjustStage, lutStage, blurStage, backgroundStage, overlayStage]
+                      adjustStage, lutStage, blurStage, backgroundStage, overlayStage,
+                      styleStage, connectionStage]
         stages = userStages + [outputFitStage]
 
         frameRing = try FrameRing(metal: metal, width: 1920, height: 1080)
@@ -381,6 +400,7 @@ public final class VideoPipeline {
         gazeStage.settings = config.gaze
         backgroundStage.settings = config.background
         overlayStage.settings = config.overlay
+        styleStage.settings = config.style
         // The quality tier belongs to the shared segmenter now; blur is
         // simply where the user happens to set it.
         segmenter.quality = config.blur.quality
@@ -391,6 +411,7 @@ public final class VideoPipeline {
         blurStage.isEnabled = config.flags(for: .blur).enabled
         backgroundStage.isEnabled = config.flags(for: .background).enabled
         overlayStage.isEnabled = config.flags(for: .overlay).enabled
+        styleStage.isEnabled = config.flags(for: .style).enabled
 
         let gazeWasEnabled = gazeStage.isEnabled
         gazeStage.isEnabled = config.flags(for: .gaze).enabled
@@ -418,6 +439,9 @@ public final class VideoPipeline {
                                bufferSeconds: settings.replay.clampedBufferSeconds,
                                maxHeight: settings.replay.maxHeight,
                                frameRate: frameRate)
+        // Severity edits apply live while engaged; engagement itself is an
+        // AppState intent (§5.14), exactly like freeze.
+        connectionStage.settings = settings.connection
     }
 
     /// Forwards the pipeline's demand gate to every stage that owns a media

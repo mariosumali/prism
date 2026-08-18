@@ -433,6 +433,100 @@ public struct OverlaySettings: Codable, Equatable {
     }
 }
 
+// MARK: - Style — preset visual effects (§5.4)
+
+/// The preset effects, curated toward what plays on a live call: warps,
+/// glitches and motion trails, plus a few gadget-camera looks — not color
+/// filters. Raw values are persisted in presets AND generate the kernel
+/// names (`prism_style_<raw>`), so renaming a case is a preset-format
+/// change and a kernel rename — don't. Removed cases decode as .normal via
+/// the tolerant fallback, so old presets degrade to the unstyled picture.
+public enum StyleEffect: String, Codable, CaseIterable, Identifiable {
+    case normal
+    // Looks — the gadget cameras.
+    case thermal, xray, nightVision, vhs, pixellate
+    // Distortions — move the picture around (some animated).
+    case bulge, dent, twirl, squeeze, mirror, lightTunnel, fisheye, stretch
+    case kaleidoscope, wave, underwater, glitch, tinyPlanet, rgbSplit
+    // Motion — trails and ghosts of your own movement (feedback history).
+    case afterimage, echo, longExposure, strobe
+
+    public var id: String { rawValue }
+
+    /// The three catalogue pages: distortions move pixels, motion effects
+    /// remember them, looks recolor them. Normal belongs to none — it is
+    /// the unstyled picture.
+    public static let looks: [StyleEffect] = [
+        .thermal, .xray, .nightVision, .vhs, .pixellate,
+    ]
+    public static let distortions: [StyleEffect] = [
+        .bulge, .dent, .twirl, .squeeze, .fisheye, .stretch, .mirror,
+        .lightTunnel, .kaleidoscope, .wave, .underwater, .glitch,
+        .tinyPlanet, .rgbSplit,
+    ]
+    public static let motion: [StyleEffect] = [
+        .afterimage, .echo, .longExposure, .strobe,
+    ]
+
+    public var displayName: String {
+        switch self {
+        case .normal: return "Normal"
+        case .thermal: return "Thermal Camera"
+        case .xray: return "X-Ray"
+        case .nightVision: return "Night Vision"
+        case .vhs: return "VHS"
+        case .pixellate: return "Pixelate"
+        case .bulge: return "Bulge"
+        case .dent: return "Dent"
+        case .twirl: return "Twirl"
+        case .squeeze: return "Squeeze"
+        case .mirror: return "Mirror"
+        case .lightTunnel: return "Light Tunnel"
+        case .fisheye: return "Fish Eye"
+        case .stretch: return "Stretch"
+        case .kaleidoscope: return "Kaleidoscope"
+        case .wave: return "Wave"
+        case .underwater: return "Underwater"
+        case .glitch: return "Glitch"
+        case .tinyPlanet: return "Tiny Planet"
+        case .rgbSplit: return "RGB Split"
+        case .afterimage: return "Afterimage"
+        case .echo: return "Echo"
+        case .longExposure: return "Long Exposure"
+        case .strobe: return "Strobe"
+        }
+    }
+
+    /// Metal kernel for this effect; nil for .normal (nothing to run).
+    public var kernelFunction: String? {
+        self == .normal ? nil : "prism_style_\(rawValue)"
+    }
+
+    /// Motion effects read a history texture holding the previous styled
+    /// frame (the stage blits its output into it each frame). Everything
+    /// else is a pure function of the current frame.
+    public var isTemporal: Bool {
+        Self.motion.contains(self)
+    }
+}
+
+public struct StyleSettings: Codable, Equatable {
+    public var effect: StyleEffect = .normal
+    public var intensity: Double = 1       // 0…1
+    public init() {}
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        effect = c.tolerant(.effect, .normal)
+        intensity = c.tolerant(.intensity, 1)
+    }
+
+    /// "Normal" IS the unstyled picture, so every surface treats
+    /// "Style = Normal" and "Style off" as the same state (see `isInert`) —
+    /// the LUT / Neutral rule applied to the second catalogue.
+    public var isNormal: Bool { effect == .normal }
+}
+
 // MARK: - Stage flags
 
 public struct StageFlags: Codable, Equatable {
@@ -461,12 +555,13 @@ public struct PipelineConfiguration: Codable, Equatable {
     public var gaze = GazeSettings()
     public var background = BackgroundSettings()
     public var overlay = OverlaySettings()
+    public var style = StyleSettings()
 
     public var flags: [StageID: StageFlags] = [
         .geometry: StageFlags(), .adjust: StageFlags(),
         .lut: StageFlags(), .blur: StageFlags(),
         .gaze: StageFlags(), .background: StageFlags(),
-        .overlay: StageFlags(),
+        .overlay: StageFlags(), .style: StageFlags(),
     ]
 
     public var format: VideoFormat = VideoFormat(width: 1920, height: 1080, frameRate: 30)
@@ -502,10 +597,14 @@ public struct PipelineConfiguration: Codable, Equatable {
             return geometry.isIdentity
         case .overlay:
             return overlay.renderableLayers.isEmpty
-        case .blur, .background, .gaze, .clip, .replay, .freeze, .outputFit:
+        case .style:
+            return style.isNormal || style.intensity <= 0
+        case .blur, .background, .gaze, .clip, .replay, .freeze, .connection,
+             .outputFit:
             // These change the picture whenever they are on (background
             // replacement falls back to its colour rather than to nothing,
-            // and blur waits for the mask rather than declining).
+            // blur waits for the mask rather than declining, and connection's
+            // severity is floored above zero for exactly this reason).
             return false
         }
     }
@@ -526,13 +625,17 @@ public struct PipelineConfiguration: Codable, Equatable {
             return "On, but framing is still at its default."
         case .overlay:
             return "On, but no layer has a file."
+        case .style:
+            return style.intensity <= 0
+                ? "On, but intensity is 0."
+                : "On, but Normal is the unstyled picture."
         default:
             return nil
         }
     }
 
     public enum CodingKeys: String, CodingKey {
-        case adjust, lut, blur, geometry, gaze, background, overlay
+        case adjust, lut, blur, geometry, gaze, background, overlay, style
         case flags, format, latencyPolicy, cameraID, microphoneID
     }
 
@@ -554,6 +657,7 @@ public struct PipelineConfiguration: Codable, Equatable {
         gaze = decode(.gaze, GazeSettings())
         background = decode(.background, BackgroundSettings())
         overlay = decode(.overlay, OverlaySettings())
+        style = decode(.style, StyleSettings())
         flags = decode(.flags, [:])
         format = decode(.format, VideoFormat(width: 1920, height: 1080, frameRate: 30))
         latencyPolicy = decode(.latencyPolicy, LatencyPolicy.balanced)
