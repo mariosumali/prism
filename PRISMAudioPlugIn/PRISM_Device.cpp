@@ -739,7 +739,8 @@ OSStatus PRISM_Device_DoIOOperation(AudioObjectID inStreamObjectID,
     // the same way to trim latency. One slide is a ~21ms splice in the
     // stream, paid only at repair moments. All arithmetic is modular
     // uint64; the CAS keeps a concurrent StartIO reset authoritative.
-    const int64_t stEnd = stBase + (int64_t)frameCount;
+    const int64_t stBaseFrames = stBase / (int64_t)kPRISM_ChannelCount;
+    const int64_t stEnd = stBaseFrames + (int64_t)frameCount;
     if (stEnd > 0) {
         const int64_t cushion = (int64_t)(wr - anchor) - stEnd;
         if (cushion < 0 || cushion > (int64_t)kPRISM_MaxCushionFrames) {
@@ -786,7 +787,7 @@ OSStatus PRISM_Device_DoIOOperation(AudioObjectID inStreamObjectID,
     // Advance readIndex as a consumption high-water mark only (never past
     // the write index, never backwards) so the producer's overrun accounting
     // keeps working; it is not a read cursor and reads never depend on it.
-    const int64_t endRel = stBase + (int64_t)frameCount;
+    const int64_t endRel = stBaseFrames + (int64_t)frameCount;
     if (endRel > 0) {
         uint64_t end = anchor + (uint64_t)endRel;
         if (end > wr) {
