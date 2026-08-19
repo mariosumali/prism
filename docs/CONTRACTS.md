@@ -184,6 +184,15 @@ public final class VideoPipeline {
     public var onOutput: ((CVPixelBuffer, CMTime, MTLTexture) -> Void)?
     /// Per-frame timings for LatencyMonitor. Called on an arbitrary queue.
     public var onTimings: ((StageTimings) -> Void)?
+    /// Fires only when the memory plan actually changes (§5.23).
+    public var onResourcePlan: ((ResourcePlan) -> Void)?
+
+    /// One request per modality per frame, one modality per frame, and the
+    /// seam a new recogniser registers through (§5.23).
+    public let vision: VisionCoordinator
+    /// What ResourceGovernor granted at the current format; the ring depths
+    /// are already following it.
+    public private(set) var resourcePlan: ResourcePlan
 
     public init(metal: MetalContext) throws
     public func configure(outputFormat: VideoFormat)
@@ -233,20 +242,112 @@ documented in code.
 
 ### FrameRing (`PRISM/Pipeline/FrameRing.swift`)
 
+Depth is `ResourceGovernor`'s, not this file's (§5.23): half a second of raw
+1080p60 measured 237.9 MB against a 250 MB ceiling. The ring clamps whatever
+it is handed to at least `ResourceGovernor.minimumFreezeDepth`, because a
+ring with nothing to choose between is a broken freeze rather than a cheap
+one.
+
 ```swift
 public final class FrameRing {
-    public let capacity: Int                      // 15
-    public let sharpnessBuffer: MTLBuffer         // capacity × Float
-    public init(metal: MetalContext, width: Int, height: Int) throws
+    public private(set) var capacity: Int         // granted depth
+    public let sharpnessBuffer: MTLBuffer         // maximumFreezeDepth × Float
+    public init(metal: MetalContext, width: Int, height: Int,
+                depth: Int) throws
     /// Copy (GPU blit, IOSurface pool) the frame into the ring; returns slot.
     public func record(_ buffer: CVPixelBuffer, at time: CMTime,
                        encoder commandBuffer: MTLCommandBuffer) -> Int
-    /// Sharpest stored frame within [now − windowMs, now − skipMs] (§5.2:
-    /// windowMs 300, skipMs 0). Reads sharpnessBuffer CPU-side.
+    public func publish(slot: Int)
+    /// Sharpest stored frame within [now − windowMs, now] (§5.2:
+    /// windowMs 300). Reads sharpnessBuffer CPU-side.
     public func sharpestFrame(nowTime: CMTime, windowMs: Double) -> CVPixelBuffer?
-    public func reconfigure(width: Int, height: Int) throws
+    public func reconfigure(width: Int, height: Int, depth: Int) throws
 }
 ```
+
+### ResourceGovernor (`PRISM/Pipeline/ResourceGovernor.swift`)
+
+The one place that decides how much memory each elastic allocation gets
+(§5.23, §7). Pure arithmetic on a format and a ceiling — no Metal, no
+allocation — which is what makes `ResourceGovernorTests` able to check the
+sum the shipped constants never added up to.
+
+```swift
+public struct ResourceDemand: Equatable {
+    public var format: VideoFormat
+    public var stillsWantSharpest: Bool           // §5.16 setting armed
+}
+
+public enum ResourceTier: String { case full, reduced, minimum, exceeded }
+
+public struct ResourcePlan: Equatable {
+    public var format: VideoFormat
+    public var freezeDepth: Int                   // FrameRing slots
+    public var freezeStride: Int                  // record 1 camera frame in N
+    public var stillDepth: Int                    // 0 → stills use last frame
+    public var plannedMB: Double
+    public var ceilingMB: Double
+    public var tier: ResourceTier
+    public var stillsSummary: String?
+    public var freezeSpanSeconds: Double { get }  // depth × stride ÷ fps
+    public var headroomMB: Double { get }
+    public var summary: String { get }            // one sentence, names the number
+}
+
+public enum ResourceGovernor {
+    public static let ceilingMB: Double = 250     // §7
+    public static let minimumFreezeDepth = 6      // slots — a choice, not a frame
+    public static let minimumFreezeSeconds = 0.2  // wider than a blink
+    public static let preferredFreezeSeconds = 0.5
+    public static let maximumFreezeDepth = 64
+    public static func preferredDepth(for: VideoFormat) -> Int
+    public static func stride(depth: Int, frameRate: Int) -> Int
+    public static func frameMB(for: VideoFormat) -> Double
+    public static func plan(for demand: ResourceDemand) -> ResourcePlan
+}
+```
+
+Order of service, fixed and deterministic: freeze's floor, then the still
+ring if armed, then whatever is left widening the freeze window toward
+`preferredFreezeSeconds`. The floor is taken before the ceiling is weighed —
+where it does not fit the tier is `exceeded` and the plan names the figure.
+
+### VisionCoordinator (`PRISM/Pipeline/VisionCoordinator.swift`)
+
+Decides which Vision request runs on this frame (§5.23). Frame-queue-confined,
+no locks. Two hard-coded parities stayed out of each other's way for exactly
+as long as there were two of them.
+
+```swift
+public final class VisionCoordinator {
+    /// Declaration order is the tie-break.
+    public enum Modality: Int, CaseIterable, Comparable { case face, person, hands }
+
+    public struct Decision: Equatable {
+        public var demanded: Set<Modality>
+        public var running: Modality?             // at most one per frame
+        public var ended: Set<Modality>           // demand went to zero → invalidate
+    }
+
+    public init()
+    /// Registering is what makes a modality eligible; `hands` has a case and
+    /// no registration until the gesture recogniser arrives.
+    public func register(_ modality: Modality, cadence: Int)
+    /// Evaluated once per frame — never cached, because a stage's enabled
+    /// flag has six writers.
+    public func addConsumer(of modality: Modality, demand: @escaping () -> Bool)
+    public func beginFrame() -> Decision           // once, at the top of the frame
+    public func reset()
+}
+```
+
+Pick: among demanded, registered modalities at or past their cadence, the
+one with the highest `waited ÷ cadence`, ties to the earlier-declared. With
+`face` and `person` both at cadence 2 this reproduces the previous even/odd
+alternation exactly, which is what keeps eye contact's smoothing unchanged.
+`PersonSegmenter.update` and `FaceTracker.update` take `capture:` from the
+decision and run their per-frame work regardless — the smoothing has to
+resolve at frame rate, not at detection rate.
 
 ### StillRing (`PRISM/Pipeline/StillRing.swift`)
 
@@ -258,12 +359,18 @@ the frame's existing command buffer.
 
 ```swift
 public final class StillRing {
-    public static let capacity = 6                // ~50 MB at 1080p, §7
-    public let sharpnessBuffer: MTLBuffer         // capacity × Float
+    public static let maximumDepth = 6            // measured 47.6 MB at 1080p, §7
+    public static let minimumDepth = 4            // 133 ms at 30 fps — still a choice
+    public let sharpnessBuffer: MTLBuffer         // maximumDepth × Float
     public init(metal: MetalContext) throws
-    public var isArmed: Bool { get }
+    public var isArmed: Bool { get }              // armed AND depth > 0
     /// Disarming releases every held frame immediately.
     public func setArmed(_ armed: Bool)
+    /// ResourceGovernor's grant (§5.23); 0 disables the ring without
+    /// disarming the setting, and `sharpest` returns nil so `stillFrame()`
+    /// falls back to the last frame. Shrinking clears held frames — they
+    /// would otherwise sit in slots the cursor no longer reaches.
+    public func setDepth(_ depth: Int)
     /// Retains the finished frame; returns the slot to score, or -1.
     public func record(_ buffer: CVPixelBuffer, at hostSeconds: Double) -> Int
     /// Called from the frame's completed handler — the pixels are not final
@@ -988,14 +1095,17 @@ public final class ReplayStage: EffectStage {       // id .replay, cost .cheap
 }
 
 /// One mask, four consumers (§3.3). The pipeline calls `update` once per
-/// frame at the first mask-consuming stage's chain position; stages only read.
+/// frame at the first mask-consuming stage's chain position; stages only
+/// read. Whether that call carries a capture is VisionCoordinator's answer
+/// (§5.23) — the segmenter asks for every 2nd frame and takes what it gets.
 public final class PersonSegmenter {
     public init(metal: MetalContext) throws
     public var quality: BlurQuality
     public var isDemanded: Bool
     public var latestMask: MTLTexture? { get }      // thread-safe
     public var latestSubjectBox: CGRect? { get }    // thread-safe, top-left origin
-    public func update(commandBuffer: MTLCommandBuffer, input: MTLTexture)
+    public func update(commandBuffer: MTLCommandBuffer, input: MTLTexture,
+                       capture: Bool)               // capture: from the coordinator
     public func invalidate()                        // demand went to zero
 }
 
@@ -1003,7 +1113,9 @@ public final class PersonSegmenter {
 /// `update` once per frame at the first face-consuming stage's chain
 /// position — pre-geometry, the space eye contact warps in — and stages only
 /// read. Owns the 76-point landmark request, its detection texture ring, the
-/// every-other-frame cadence, the per-frame smoothing and the ramps.
+/// per-frame smoothing and the ramps. The cadence is VisionCoordinator's
+/// (§5.23); the smoothing runs on every frame either way, which is why eye
+/// contact survives being measured less often than it is drawn.
 public final class FaceTracker {
     public init(metal: MetalContext) throws
     public struct EyeMeasurement: Equatable {       // input UV, top-left origin
@@ -1025,7 +1137,8 @@ public final class FaceTracker {
     public var confidence: Confidence { get }       // thread-safe
     public var isTracking: Bool { get }             // a face at all
     public var hasEyes: Bool { get }                // with usable eye landmarks
-    public func update(commandBuffer: MTLCommandBuffer, input: MTLTexture)
+    public func update(commandBuffer: MTLCommandBuffer, input: MTLTexture,
+                       capture: Bool)               // capture: from the coordinator
     public func invalidate()                        // demand went to zero
     public func reset()                             // invalidate + the ramps
 }
@@ -1176,6 +1289,10 @@ UI codes against exactly this surface:
 public final class AppState: ObservableObject {
     // Status
     @Published public var latency: LatencyReport
+    /// §5.23 — what the memory ceiling is currently paying for. Published
+    /// because a freeze window that quietly halves at 60 fps is otherwise
+    /// something the user cannot find out about.
+    @Published public private(set) var resources: ResourcePlan
     @Published public var clients: [CameraClient]         // signing ID + name
     public var clientsInUse: [String] { get }             // names, projected
     @Published public var blockedClients: [CameraClient]  // §5.18, refused now

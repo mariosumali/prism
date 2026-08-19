@@ -10,8 +10,11 @@
 //
 // Extracted from BlurStage, which used to own this outright. The mechanics
 // are unchanged: VNGeneratePersonSegmentationRequest on a serial background
-// queue, every 2nd frame, request input capped at 720p (and quality forced
-// to .fast on Intel per SPEC §5.4).
+// queue, request input capped at 720p (and quality forced to .fast on Intel
+// per SPEC §5.4).
+//
+// When it runs is VisionCoordinator's decision, not this file's. The
+// segmenter asks for every 2nd frame and takes what it is given.
 //
 // Threading. `update` is called from the pipeline's frame queue at the blur
 // stage's position in the chain — post-geometry, so the mask is aligned with
@@ -68,13 +71,16 @@ public final class PersonSegmenter {
     }
 
     /// One segmentation step for the frame. Dispatches the frame captured
-    /// into the PREVIOUS command buffer (a frame interval has elapsed, so its
-    /// GPU work is done) and captures this one for the next dispatch.
-    /// Call at most once per frame, on the frame queue.
-    public func update(commandBuffer: MTLCommandBuffer, input: MTLTexture) {
-        frameIndex &+= 1
+    /// into an EARLIER command buffer (at least a frame interval has elapsed,
+    /// so its GPU work is done) and captures this one for the next dispatch
+    /// when the coordinator says this is segmentation's frame. Call at most
+    /// once per frame, on the frame queue.
+    public func update(commandBuffer: MTLCommandBuffer, input: MTLTexture,
+                       capture: Bool) {
         dispatchPending()
-        captureIfDue(commandBuffer: commandBuffer, input: input)
+        if capture {
+            captureFrame(commandBuffer: commandBuffer, input: input)
+        }
     }
 
     /// Drops the mask so a consumer re-enabled later never composites against
@@ -96,7 +102,6 @@ public final class PersonSegmenter {
                                          qos: .userInitiated)
     private let request = VNGeneratePersonSegmentationRequest()
     private let stateLock = NSLock()
-    private var frameIndex: UInt64 = 0
 
     private struct SegSlot {
         let pixelBuffer: CVPixelBuffer
@@ -141,8 +146,7 @@ public final class PersonSegmenter {
         }
     }
 
-    private func captureIfDue(commandBuffer: MTLCommandBuffer, input: MTLTexture) {
-        guard frameIndex % 2 == 0 else { return }   // every 2nd frame (§5.4)
+    private func captureFrame(commandBuffer: MTLCommandBuffer, input: MTLTexture) {
         let target = cappedSize(width: input.width, height: input.height)
 
         stateLock.lock()

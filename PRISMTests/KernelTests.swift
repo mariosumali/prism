@@ -733,7 +733,7 @@ final class KernelTests: XCTestCase {
     }
 
     func testSharpnessOrderingAndSlotAddressing() throws {
-        let slotCount = 15                          // matches FrameRing capacity
+        let slotCount = 15                          // a plausible FrameRing depth
         guard let buffer = device.makeBuffer(length: slotCount * MemoryLayout<Float>.stride,
                                              options: .storageModeShared) else {
             throw Failure.resourceAllocation("sharpness result buffer")

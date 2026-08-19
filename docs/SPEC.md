@@ -50,8 +50,10 @@ PRISM/
 │   │   ├── VideoPipeline.swift     # frame graph orchestration
 │   │   ├── EffectStage.swift       # protocol
 │   │   ├── Stages/                 # Geometry, Adjust, LUT, Style, Blur, Freeze, Clip
-│   │   ├── FrameRing.swift         # 500ms sharpest-frame buffer (camera side)
+│   │   ├── FrameRing.swift         # sharpest-frame buffer (camera side)
 │   │   ├── StillRing.swift         # a few finished frames, scored, for stills
+│   │   ├── ResourceGovernor.swift  # who gets the memory ceiling (§5.23, §7)
+│   │   ├── VisionCoordinator.swift # which Vision request runs this frame
 │   │   ├── FormatManager.swift     # advertised format set, negotiation
 │   │   ├── PresetStore.swift       # named user configurations
 │   │   ├── Settings/               # behaviour settings a preset must not carry
@@ -341,7 +343,7 @@ Holds a still image on the video output; clients see a frozen picture.
 | Property | Specification |
 |---|---|
 | Trigger | Popover tile, plus global hotkey ⌥⌘F |
-| Frame selected | **Not** the frame at click time. `FrameRing` retains the last 500ms of frames; on freeze, select the sharpest frame within the preceding 300ms, scored by Laplacian variance computed on a 128×72 downsample. |
+| Frame selected | **Not** the frame at click time. `FrameRing` retains as much of the recent past as §5.23 can afford — half a second where there is room, never less than 200ms; on freeze, select the sharpest frame within the preceding 300ms, scored by Laplacian variance computed on a 128×72 downsample. |
 | Audio | Continues live. Mute is a separate control with a separate hotkey (⌥⌘M). |
 | Combined | ⌥⌘⇧F freezes and mutes together. |
 | Response time | Freeze and unfreeze take effect within one frame interval (33.3ms) of the trigger. |
@@ -349,7 +351,7 @@ Holds a still image on the video output; clients see a frozen picture.
 
 Audio continuing by default is deliberate: people freeze because something visual happened, not because they stopped talking.
 
-`FrameRing` holds 15 frames at 30fps in a preallocated `CVPixelBufferPool`. Sharpness scoring runs on the GPU as part of the normal command buffer, writing a single float per frame into a small `MTLBuffer` — never as a separate synchronous pass.
+`FrameRing` holds `ResourceGovernor`'s granted depth in a preallocated `CVPixelBufferPool` — 11 frames at 1080p30, 15 at 720p30, 6 at 4K. Sharpness scoring runs on the GPU as part of the normal command buffer, writing a single float per frame into a small `MTLBuffer` — never as a separate synchronous pass.
 
 ### 5.3 Clip playback
 
@@ -842,6 +844,34 @@ An edge-preserving smooth over skin, and nothing else in the frame.
 
 **Amount 0 is off, and 0 is where it ships.** The stage declines to encode, `isInert` reports it, and every surface says `On, but the amount is 0.` Switching the stage on when the amount is still zero lifts it to `RetouchSettings.defaultAmount` — the LUT/Neutral and Style/Normal remedy for the §8.7 inert-toggle problem, applied to an effect that has exactly one knob and therefore exactly one unambiguous value meaning "on".
 
+### 5.23 Resource governance
+
+Every elastic allocation in PRISM was sized against §7's 250 MB ceiling independently, none of them knew about each other, and the sum had never been added up. It does not fit. `ResourceGovernor` is the one place that adds it up and decides who gets what.
+
+**Measured, on an M-series Mac.** One BGRA `IOSurface` slot costs 3.5 MB at 720p, 7.9 MB at 1080p, 31.7 MB at 4K. `FrameRing` at its shipped depth — half a second, so its slot count follows the frame rate — measured **118.9 MB at 1080p30, 237.9 MB at 1080p60 and 474.8 MB at 4K30**. The output pool plus the two working intermediates measured 31.7 MB at 1080p and 126.6 MB at 4K. An armed `StillRing` measured 47.6 MB at 1080p. Everything that is not a pixel buffer measured 36 MB peak with the chain built and no camera, plus 33 MB once the three Vision models are resident (15.8 segmentation, 11.1 landmarks, 6.5 hand pose). A live session with the chain running measured 446 MB resident, 293 MB of it `IOSurface`.
+
+**What the governor decides**, from the negotiated format and nothing else:
+
+| Output | Meaning |
+|---|---|
+| `freezeDepth` | `FrameRing` slots |
+| `freezeStride` | record one camera frame in this many |
+| `stillDepth` | `StillRing` slots; 0 means stills fall back to the last frame |
+| `tier` | `full` / `reduced` / `minimum` / `exceeded` |
+| `plannedMB` | the sum, against `ceilingMB` |
+
+**The order of service is fixed**, which is what makes the degradation predictable: freeze's floor, then the still ring if the user armed it, then whatever is left widening the freeze window back toward half a second. Nothing is decided by which feature asked first.
+
+**Freeze's floor is the guarantee, and it is never spent.** §5.2 promises the sharpest frame of the recent past. A ring too shallow to hold a choice turns that into "the frame at the moment you pressed it", which §5.2 says freeze is not. So: **never fewer than six slots, and never less than 200 ms of wall time.** Six, because two slots are unavailable at any instant — the one being written and the one whose command buffer has not landed. 200 ms, because a blink closes the eyes for 100–150 ms and a window shorter than one has nothing sharper to offer. Where those two pull against each other — 200 ms of 60 fps is twelve slots — the ring **strides**: six slots recording every second frame still span 200 ms and still hold a choice, for half the memory. A coarser choice inside the window is a far cheaper loss than a window narrower than a blink.
+
+**The still ring is granted whole or refused.** Below `StillRing.minimumDepth` (4 slots, 133 ms at 30 fps) it is paying full-frame prices for no real choice, so it gets nothing and `stillFrame()` falls back to the last frame — which it already does, and which is the honest answer to "save what I am looking at".
+
+**4K is over the ceiling and says so.** At 31.7 MB a frame the output pool and the intermediates alone exceed 250 MB before freeze holds anything; the plan reports `exceeded` and names the figure rather than pretending. See §7.
+
+**The policy is legible or it is a mystery.** The Diagnostics pane shows the planned figure against the ceiling, how far back freeze reaches in seconds and frames, and the sentence explaining why. A change to the plan is a §5.21 session event, for the same reason an auto-disabled effect is: the freeze window shortening is invisible until somebody freezes and finds the picture came from less history than they expected.
+
+**Vision consolidation.** `VisionCoordinator` decides which Vision request runs on each frame. At most one request per modality per frame and at most one modality per frame; each modality declares its own duty cycle; each consumer declares its own standing demand, evaluated per frame rather than cached. The pick is the modality furthest past its own cadence, ties to the earlier-declared one — which reproduces the previous hard-coded even/odd alternation exactly when only the person mask and the face are demanded, and shares the slip proportionally when a third modality is. Modalities are `face`, `person`, `hands`; `hands` has a case but no registration until the gesture recogniser arrives, and an unregistered modality never runs however loudly it is demanded.
+
 ---
 
 ## 6. Latency requirements
@@ -915,10 +945,13 @@ Zero dropped frames at 1080p30 with the full effects chain at Balanced policy, o
 | Requirement | Value |
 |---|---|
 | Idle CPU, popover closed, pass-through, 1080p30 | < 3% |
-| Resident memory | < 250MB |
+| Resident memory, 1080p60 and below | < 250MB, enforced by `ResourceGovernor` (§5.23) |
+| Resident memory, 4K | over the ceiling; the plan reports the figure |
 | Time from login to first valid virtual camera frame | < 2s |
 | Launch at login | `SMAppService.mainApp`, default enabled, user-disableable |
 | Network access | **None.** No analytics, no telemetry, no update check. |
+
+**The memory ceiling is a policy, not a hope.** It was written as a number and nothing enforced it, so the elastic allocations grew past it independently and nobody could have said by how much. §5.23 is the enforcement: one function decides every depth from the negotiated format, the sum is checked in `ResourceGovernorTests`, and the one format that cannot be made to fit is the one the table above now admits to. 4K30's output pool and working intermediates measured 126.6 MB before freeze holds a single frame; there is no depth that redeems that, and a requirement quietly false for one published format is worse than one that names it.
 
 **Sleep/wake** is the single most common real-world failure for apps in this category. `AVCaptureSession` and the HAL input unit must both reestablish automatically on `NSWorkspace.didWakeNotification`, with a retry schedule of 0.5s / 1s / 2s / 4s. Treat this as a first-class test case at M7, not an edge case.
 

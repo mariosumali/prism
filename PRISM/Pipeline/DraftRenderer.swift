@@ -40,6 +40,10 @@ final class DraftRenderer {
     private let metal: MetalContext
     private let segmenter: PersonSegmenter
     private let faceTracker: FaceTracker
+    /// The draft's own schedule. Separate from the live pipeline's because
+    /// the two run different chains over the same camera and each has to be
+    /// able to answer "what runs this frame" for itself.
+    private let vision = VisionCoordinator()
     private let gazeStage: GazeStage
     private let geometryStage: GeometryStage
     private let retouchStage: RetouchStage
@@ -101,6 +105,18 @@ final class DraftRenderer {
                       styleStage]
         outputFitStage.outputSize = CGSize(width: outputFormat.width,
                                            height: outputFormat.height)
+
+        vision.register(.face, cadence: 2)
+        vision.register(.person, cadence: 2)
+        let gaze = gazeStage, overlay = overlayStage
+        let blur = blurStage, background = backgroundStage
+        vision.addConsumer(of: .face) { gaze.wantsEncode() }
+        vision.addConsumer(of: .face) { overlay.needsFaceTracker }
+        vision.addConsumer(of: .person) { blur.isEnabled }
+        vision.addConsumer(of: .person) { background.needsPersonMask }
+        vision.addConsumer(of: .person) { overlay.needsPersonMask }
+        // No auto-frame consumer: the draft is driven by the live
+        // auto-framer's offset, so it never needs a subject box of its own.
     }
 
     deinit {
@@ -197,36 +213,35 @@ final class DraftRenderer {
         var useA = true
         var segmentationDone = false
         var faceTrackingDone = false
+        let visionDecision = vision.beginFrame()
         overlayStage.faceSpaceTransform = geometryStage.appliedUVTransform(
             inputSize: CGSize(width: source.width, height: source.height))
         for stage in userStages {
-            // Same one-request-per-frame contract as VideoPipeline, and for
-            // the same reason the draft segments: a drafted eye contact that
-            // previewed as pass-through would be the one thing a preview must
-            // not do.
+            // Same one-request-per-modality-per-frame contract as
+            // VideoPipeline, and for the same reason the draft segments at
+            // all: a drafted eye contact that previewed as pass-through would
+            // be the one thing a preview must not do.
             if !faceTrackingDone, Self.faceConsumers.contains(stage.id) {
                 faceTrackingDone = true
-                if gazeStage.wantsEncode() || overlayStage.needsFaceTracker {
+                if visionDecision.demanded.contains(.face) {
                     faceTracker.isDemanded = true
-                    faceTracker.update(commandBuffer: commandBuffer, input: current)
-                } else if faceTracker.isDemanded {
+                    faceTracker.update(commandBuffer: commandBuffer, input: current,
+                                       capture: visionDecision.running == .face)
+                } else if visionDecision.ended.contains(.face) {
                     faceTracker.isDemanded = false
                     faceTracker.invalidate()
                 }
             }
-            // Same one-segmentation-per-frame contract as VideoPipeline. The
-            // draft does run its own Vision request when a mask consumer is
-            // staged — without it a drafted background or blur would preview
-            // as pass-through, which is the one thing a preview must not do.
+            // The draft does run its own Vision request when a mask consumer
+            // is staged — without it a drafted background or blur would
+            // preview as pass-through.
             if !segmentationDone, Self.maskConsumers.contains(stage.id) {
                 segmentationDone = true
-                let demanded = blurStage.isEnabled
-                    || backgroundStage.needsPersonMask
-                    || overlayStage.needsPersonMask
-                if demanded {
+                if visionDecision.demanded.contains(.person) {
                     segmenter.isDemanded = true
-                    segmenter.update(commandBuffer: commandBuffer, input: current)
-                } else if segmenter.isDemanded {
+                    segmenter.update(commandBuffer: commandBuffer, input: current,
+                                     capture: visionDecision.running == .person)
+                } else if visionDecision.ended.contains(.person) {
                     segmenter.isDemanded = false
                     segmenter.invalidate()
                 }

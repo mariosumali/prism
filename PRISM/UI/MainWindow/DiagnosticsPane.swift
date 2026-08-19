@@ -4,7 +4,8 @@
 // What happened this session (§5.21). The latency meter answers "what is
 // this costing me right now"; this pane answers "why did my effects turn
 // off", which is a question nobody asks until several minutes after the
-// warning row has moved on.
+// warning row has moved on — and "why did freeze reach back less far than
+// it used to", which nobody would otherwise be able to ask at all.
 //
 // Everything shown here is held in memory and dies with the process. The
 // Export button writes a file because the user pressed Export, and that is
@@ -35,6 +36,26 @@ struct DiagnosticsPane: View {
                 Text("§3.4: a frame is never dropped to protect an effect — when the chain runs long, the effect goes, not the frame.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+            Section("Memory") {
+                LabeledContent("Planned for this format",
+                               value: String(format: "%.0f MB of %.0f MB",
+                                             state.resources.plannedMB,
+                                             state.resources.ceilingMB))
+                    .font(.body.monospacedDigit())
+                LabeledContent("Freeze reaches back",
+                               value: String(format: "%.2g s · %d frames",
+                                             state.resources.freezeSpanSeconds,
+                                             state.resources.freezeDepth))
+                    .font(.body.monospacedDigit())
+                Text(state.resources.summary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let stills = state.resources.stillsSummary {
+                    Text(stills)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             Section("GPU cost per effect") {
                 if measuredStages.isEmpty {

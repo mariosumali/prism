@@ -60,6 +60,12 @@ public final class AppState: ObservableObject {
 
     // Status
     @Published public var latency = LatencyReport()
+    /// §7 — what the memory ceiling is currently paying for. Published
+    /// because the alternative is a freeze window that quietly halves at
+    /// 60 fps and a user with no way to find out why.
+    @Published public private(set) var resources = ResourceGovernor.plan(
+        for: ResourceDemand(format: VideoFormat(width: 1920, height: 1080,
+                                                frameRate: 30)))
     /// Who is streaming, with the signing IDs per-app rules match on. Two
     /// apps can share a display name, so the name alone cannot identify a
     /// client and cannot be the thing rules are keyed on.
@@ -516,6 +522,21 @@ public final class AppState: ObservableObject {
         pipeline.onTimings = { [weak self] timings in
             self?.monitor.record(timings)
         }
+        pipeline.onResourcePlan = { [weak self] plan in
+            Task { @MainActor [weak self] in
+                guard let self, plan != self.resources else { return }
+                self.resources = plan
+                // §5.21: the freeze window shortening is invisible until
+                // someone freezes and finds the picture came from less
+                // history than they expected. It goes in the record for the
+                // same reason an auto-disabled effect does.
+                self.sessionLog.record(.degradation, plan.summary)
+                if let stills = plan.stillsSummary, plan.stillDepth == 0 {
+                    self.sessionLog.record(.degradation, stills)
+                }
+            }
+        }
+        resources = pipeline.resourcePlan
     }
 
     private func wireLatencyMonitor() {

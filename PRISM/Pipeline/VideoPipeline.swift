@@ -170,6 +170,10 @@ public final class VideoPipeline {
     /// One face measurement, shared by eye contact, retouch and the
     /// face-anchored overlay layers (§5.6).
     public let faceTracker: FaceTracker
+    /// Decides which of them runs this frame, and which frames a modality
+    /// added later gets. One request per modality per frame, at most one
+    /// modality per frame.
+    public let vision = VisionCoordinator()
     /// Rolling buffer behind instant replay and the away loop (§5.9, §5.10).
     public let replayBuffer: ReplayBuffer
     public let replayPlayer: ReplayPlayer
@@ -183,6 +187,13 @@ public final class VideoPipeline {
     public var onOutput: ((CVPixelBuffer, CMTime, MTLTexture) -> Void)?
     /// Per-frame timings for LatencyMonitor. Called on an arbitrary queue.
     public var onTimings: ((StageTimings) -> Void)?
+    /// Fires when the memory plan changes — a new format, or the still ring
+    /// being armed. Called on the caller's queue, only on an actual change.
+    public var onResourcePlan: ((ResourcePlan) -> Void)?
+
+    /// What ResourceGovernor granted at the current format (§7). Read by the
+    /// diagnostics pane; the ring depths below are already following it.
+    public private(set) var resourcePlan: ResourcePlan
 
     /// Preview texture retention: false tears the preview path down (§8.3).
     /// The pipeline itself keeps no preview-only resources; consumers gate
@@ -225,6 +236,14 @@ public final class VideoPipeline {
     private var lastFrameTime = CMTime.zero
     /// Auto-framing's mask demand — the one consumer with no stage of its own.
     private var autoFrameNeedsMask = false
+    /// §5.16's setting, remembered so a format change can re-plan against it
+    /// without waiting for the next applyStudio.
+    private var stillsWantSharpest = false
+    /// Counts camera frames past the freeze ring, and the stride it is
+    /// counted against — read off the plan once per frame in ensureWorking so
+    /// the hot path never takes stateLock for it. Both frameQueue-confined.
+    private var ringStrideCounter: UInt64 = 0
+    private var ringStride = 1
 
     /// frameQueue-confined. Set when freeze is engaged but no frame exists to
     /// hold (capture stopped, ring empty); the next live camera frame becomes
@@ -273,19 +292,21 @@ public final class VideoPipeline {
         .overlay: 3, .style: 5, .connection: 1, .outputFit: 1,
     ]
 
-    /// Stages that consume the person mask. Segmentation runs once per frame
-    /// at the first of these positions in the chain — post-geometry, so the
-    /// mask lines up with everything that samples it, and so AutoFramer stays
-    /// the closed-loop servo it is documented to be (§5.4).
+    /// Where in the chain segmentation is taken: the first stage that
+    /// consumes the person mask — post-geometry, so the mask lines up with
+    /// everything that samples it, and so AutoFramer stays the closed-loop
+    /// servo it is documented to be (§5.4).
     ///
     /// Retouch is deliberately absent: its skin gate is chroma, not a person
     /// mask, and listing it here would move segmentation two stages earlier
     /// and demand a Vision request for a stage that only wants the mask if one
     /// happens to exist.
+    ///
+    /// Whether it runs at all is VisionCoordinator's answer, not this set's —
+    /// this only says where.
     private static let maskConsumers: Set<StageID> = [.blur, .background, .overlay]
 
-    /// Stages that consume the shared face measurement. Tracking runs once per
-    /// frame at the first of these positions — pre-geometry, which is the
+    /// Where the shared face measurement is taken: pre-geometry, which is the
     /// space eye contact warps in (§5.6) and the space face-anchored overlay
     /// layers are placed in before the geometry matrix carries them forward.
     private static let faceConsumers: Set<StageID> = [.gaze, .overlay]
@@ -294,6 +315,10 @@ public final class VideoPipeline {
 
     public init(metal: MetalContext) throws {
         self.metal = metal
+        let initialFormat = VideoFormat(width: 1920, height: 1080, frameRate: 30)
+        let initialPlan = ResourceGovernor.plan(
+            for: ResourceDemand(format: initialFormat))
+        resourcePlan = initialPlan
         segmenter = try PersonSegmenter(metal: metal)
         faceTracker = try FaceTracker(metal: metal)
         replayBuffer = try ReplayBuffer(metal: metal)
@@ -320,12 +345,37 @@ public final class VideoPipeline {
                       overlayStage, styleStage, connectionStage]
         stages = userStages + [outputFitStage]
 
-        frameRing = try FrameRing(metal: metal, width: 1920, height: 1080)
+        frameRing = try FrameRing(metal: metal, width: initialFormat.width,
+                                  height: initialFormat.height,
+                                  depth: initialPlan.freezeDepth)
         stillRing = try StillRing(metal: metal)
         sharpnessPipeline = try metal.computePipeline(function: "prism_sharpness")
         crossfadePipeline = try metal.computePipeline(function: "prism_crossfade")
         replayStage.player = replayPlayer
-        configure(outputFormat: VideoFormat(width: 1920, height: 1080, frameRate: 30))
+
+        // Every consumer of a Vision modality, declared once. The demands are
+        // asked rather than pushed because a stage's enabled flag is written
+        // from presets, per-app rules, hotkeys, gestures, panic and the
+        // degradation engine — six writers, and a cached copy would be stale
+        // at one of them.
+        vision.register(.face, cadence: 2)
+        vision.register(.person, cadence: 2)
+        let gaze = gazeStage, overlay = overlayStage
+        let blur = blurStage, background = backgroundStage
+        vision.addConsumer(of: .face) { gaze.wantsEncode() }
+        // A frame-anchored layer never reaches this, so nobody pays for
+        // Vision because they dropped a lower third on the picture.
+        vision.addConsumer(of: .face) { overlay.needsFaceTracker }
+        vision.addConsumer(of: .person) { blur.isEnabled }
+        vision.addConsumer(of: .person) { background.needsPersonMask }
+        vision.addConsumer(of: .person) { overlay.needsPersonMask }
+        // Auto-framing is the one consumer with no stage of its own, and the
+        // reason the mask survives the degradation engine turning blur off.
+        vision.addConsumer(of: .person) { [weak self] in
+            self?.autoFrameNeedsMask ?? false
+        }
+
+        configure(outputFormat: initialFormat)
     }
 
     public func configure(outputFormat: VideoFormat) {
@@ -352,6 +402,27 @@ public final class VideoPipeline {
         }
         stateLock.unlock()
         outputFitStage.outputSize = CGSize(width: outputFormat.width, height: outputFormat.height)
+        replan()
+    }
+
+    /// Re-asks ResourceGovernor and applies the answer. Called whenever an
+    /// input to the plan moves — the negotiated format, or the still ring
+    /// being armed — so the depths can never drift from the plan the
+    /// diagnostics pane is showing.
+    private func replan() {
+        stateLock.lock()
+        let demand = ResourceDemand(format: outputFormat,
+                                    stillsWantSharpest: stillsWantSharpest)
+        let plan = ResourceGovernor.plan(for: demand)
+        let changed = plan != resourcePlan
+        resourcePlan = plan
+        stateLock.unlock()
+        guard changed else { return }
+        stillRing.setDepth(plan.stillDepth)
+        // No frame ring call here: it is sized to the camera's dimensions
+        // rather than the output's, so ensureWorking applies the new depth on
+        // the next frame, where it already knows how big a slot has to be.
+        onResourcePlan?(plan)
     }
 
     /// How long ago the last frame reached the sink; nil before the first one.
@@ -496,8 +567,13 @@ public final class VideoPipeline {
         // AppState intent (§5.14), exactly like freeze.
         connectionStage.settings = settings.connection
         // §5.16: holding finished frames is the cost of the "sharpest frame"
-        // setting, so it is paid only while that setting is on.
+        // setting, so it is paid only while that setting is on — and how many
+        // it may hold is §7's call, not the setting's.
+        stateLock.lock()
+        stillsWantSharpest = settings.capture.prefersSharp
+        stateLock.unlock()
         stillRing.setArmed(settings.capture.prefersSharp)
+        replan()
     }
 
     /// The frame a still should be written from (§5.16): the sharpest of the
@@ -627,18 +703,21 @@ public final class VideoPipeline {
         }
 
         // Ring record + sharpness score, encoded into the same command buffer
-        // (§5.2: never a separate synchronous pass). Camera frames only. The
-        // slot is published (marked valid) only after this frame's command
-        // buffer is committed, so a freeze pick can never snapshot a slot
-        // whose copy has not yet been submitted to the queue.
+        // (§5.2: never a separate synchronous pass). Camera frames only, and
+        // only every `freezeStride`-th of those — at 60 fps the ring covers
+        // its window by sampling it rather than by holding twice the frames
+        // (§7). The slot is published (marked valid) only after this frame's
+        // command buffer is committed, so a freeze pick can never snapshot a
+        // slot whose copy has not yet been submitted to the queue.
         var ringSlot = -1
-        if let cameraBuffer {
+        if let cameraBuffer, ringStrideCounter % UInt64(ringStride) == 0 {
             ringSlot = frameRing.record(cameraBuffer, at: time, encoder: commandBuffer)
             if ringSlot >= 0 {
                 encodeSharpness(into: commandBuffer, source: source, slot: ringSlot,
                                 result: frameRing.sharpnessBuffer)
             }
         }
+        if cameraBuffer != nil { ringStrideCounter &+= 1 }
 
         // Rolling replay buffer (§5.9): raw camera frames only, recorded
         // upstream of every effect so a replay runs the live chain rather
@@ -661,47 +740,43 @@ public final class VideoPipeline {
         var useA = true
         var segmentationDone = false
         var faceTrackingDone = false
+        // One decision for the whole frame, taken before any stage runs: what
+        // Vision is wanted, and which single modality gets this frame.
+        let visionDecision = vision.beginFrame()
         // The face is measured pre-Geometry and the layers land post-Geometry,
         // so the overlay stage needs this frame's crop to put a prop back on
         // the head it was measured on.
         overlayStage.faceSpaceTransform = geometryStage.appliedUVTransform(
             inputSize: CGSize(width: source.width, height: source.height))
         for stage in userStages {
-            // One landmark request per frame for every face consumer, taken
-            // at the first consumer's position, for the same reason as the
-            // mask below: two stages each running their own would pay twice
-            // for identical numbers.
+            // The face measurement is taken at the first consumer's position,
+            // for the same reason as the mask below: two stages each running
+            // their own would pay twice for identical numbers.
             if !faceTrackingDone, Self.faceConsumers.contains(stage.id) {
                 faceTrackingDone = true
-                // Eye contact, or a layer actually anchored to a face. A
-                // frame-anchored layer never reaches this, so nobody pays for
-                // Vision because they dropped a lower third on the picture.
-                if gazeStage.wantsEncode() || overlayStage.needsFaceTracker {
+                if visionDecision.demanded.contains(.face) {
                     faceTracker.isDemanded = true
-                    faceTracker.update(commandBuffer: commandBuffer, input: current)
-                } else if faceTracker.isDemanded {
+                    faceTracker.update(commandBuffer: commandBuffer, input: current,
+                                       capture: visionDecision.running == .face)
+                } else if visionDecision.ended.contains(.face) {
                     // Last consumer just went away: drop the face so nothing
                     // re-enabled later anchors to a stale one.
                     faceTracker.isDemanded = false
                     faceTracker.invalidate()
                 }
             }
-            // One segmentation per frame for every mask consumer, taken at
-            // the first consumer's position in the chain. Driven here rather
-            // than from inside a stage so it does not depend on which of blur
-            // / background / overlay happens to be enabled — they all sample
-            // the same post-geometry `current`, and auto-framing needs the
-            // mask when none of them are on at all.
+            // The mask is taken at the first mask consumer's position in the
+            // chain. Driven here rather than from inside a stage so it does
+            // not depend on which of blur / background / overlay happens to be
+            // enabled — they all sample the same post-geometry `current`, and
+            // auto-framing needs the mask when none of them are on at all.
             if !segmentationDone, Self.maskConsumers.contains(stage.id) {
                 segmentationDone = true
-                let demanded = blurStage.isEnabled
-                    || backgroundStage.needsPersonMask
-                    || overlayStage.needsPersonMask
-                    || autoFrameNeedsMask
-                if demanded {
+                if visionDecision.demanded.contains(.person) {
                     segmenter.isDemanded = true
-                    segmenter.update(commandBuffer: commandBuffer, input: current)
-                } else if segmenter.isDemanded {
+                    segmenter.update(commandBuffer: commandBuffer, input: current,
+                                     capture: visionDecision.running == .person)
+                } else if visionDecision.ended.contains(.person) {
                     // Last consumer just went away: drop the mask so nothing
                     // re-enabled later composites against a stale subject.
                     segmenter.isDemanded = false
@@ -853,7 +928,8 @@ public final class VideoPipeline {
 
     private func ensureWorking(width: Int, height: Int) throws {
         stateLock.lock()
-        let frameRate = outputFormat.frameRate
+        let depth = resourcePlan.freezeDepth
+        ringStride = max(1, resourcePlan.freezeStride)
         stateLock.unlock()
         if width != workingWidth || height != workingHeight
             || intermediateA == nil || intermediateB == nil {
@@ -862,9 +938,10 @@ public final class VideoPipeline {
             workingWidth = width
             workingHeight = height
         }
-        // §5.2: the ring retains 500ms, so its capacity follows the frame
-        // rate; reconfigure early-returns when nothing changed.
-        try frameRing.reconfigure(width: width, height: height, frameRate: frameRate)
+        // §5.2/§7: how far back the ring reaches is the governor's call and
+        // moves with the format; reconfigure early-returns when nothing
+        // changed, so this costs a comparison per frame.
+        try frameRing.reconfigure(width: width, height: height, depth: depth)
     }
 
     private func ensureOutputScratch() throws -> MTLTexture {

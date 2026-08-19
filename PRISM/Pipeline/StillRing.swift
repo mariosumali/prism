@@ -11,11 +11,18 @@
 // their unretouched face when the call saw the retouched one. This ring
 // holds the output, which is the picture people actually saw.
 //
-// Why it holds so few. Each slot is a full output frame: ~8 MB at 1080p,
-// and the app's whole resident budget is 250 MB (§7). Six slots is a fifth
-// of a second at 30 fps — long enough to step over a blink, which is the
-// entire job — and it is only paid for while the "sharpest frame" setting
-// is on. Disarmed, the ring holds nothing and costs nothing.
+// Why it holds so few. Each slot is a full output frame: measured 7.9 MB at
+// 1080p and 31.7 MB at 4K, against a whole resident budget of 250 MB (§7).
+// Six slots is a fifth of a second at 30 fps — long enough to step over a
+// blink, which is the entire job — and it is only paid for while the
+// "sharpest frame" setting is on. Disarmed, the ring holds nothing and costs
+// nothing.
+//
+// How few is ResourceGovernor's call, between `minimumDepth` and
+// `maximumDepth`. Four slots still clears a blink; below that the ring is
+// paying full-frame prices for no real choice, so the governor gives it
+// nothing and `sharpest` returns nil — which the pipeline already handles by
+// saving the last frame, the honest answer to "save what I am looking at".
 //
 // Nothing is copied. The pipeline's output buffers come from a pool, and
 // holding a reference is what keeps one out of the free list; the pool
@@ -30,11 +37,17 @@ import Metal
 
 public final class StillRing {
 
-    /// Six output frames. See the file header for why this is not larger.
-    public static let capacity = 6
+    /// Six output frames — a fifth of a second at 30 fps. See the file header
+    /// for why this is not larger.
+    public static let maximumDepth = 6
+    /// Four is 133 ms at 30 fps: still wider than a blink, so there is still
+    /// something to choose between. See the file header for what happens
+    /// below it.
+    public static let minimumDepth = 4
 
     /// One Float per slot; prism_sharpness writes result[slot] on the GPU,
-    /// `sharpest` reads it on the CPU (storageModeShared).
+    /// `sharpest` reads it on the CPU (storageModeShared). Sized for
+    /// `maximumDepth` so a depth change never reallocates it.
     public let sharpnessBuffer: MTLBuffer
 
     private struct Slot {
@@ -47,23 +60,24 @@ public final class StillRing {
     private var slots: [Slot?]
     private var cursor = 0
     private var armed = false
+    private var depth = StillRing.maximumDepth
     private var width = 0
     private var height = 0
 
     public init(metal: MetalContext) throws {
         guard let buffer = metal.device.makeBuffer(
-            length: Self.capacity * MemoryLayout<Float>.stride,
+            length: Self.maximumDepth * MemoryLayout<Float>.stride,
             options: .storageModeShared) else {
             throw PipelineError.textureAllocationFailed
         }
         sharpnessBuffer = buffer
-        slots = [Slot?](repeating: nil, count: Self.capacity)
+        slots = [Slot?](repeating: nil, count: Self.maximumDepth)
     }
 
     public var isArmed: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return armed
+        return armed && depth > 0
     }
 
     /// Disarming releases every held frame immediately: a feature nobody has
@@ -78,6 +92,20 @@ public final class StillRing {
         }
     }
 
+    /// How many frames ResourceGovernor can afford here. Zero disables the
+    /// ring without disarming the setting: the user's preference is still
+    /// recorded, this format simply cannot pay for it.
+    public func setDepth(_ depth: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        let clamped = depth <= 0 ? 0 : min(Self.maximumDepth, max(1, depth))
+        guard clamped != self.depth else { return }
+        self.depth = clamped
+        // Shrinking would otherwise leave frames parked in slots the cursor
+        // no longer reaches, held for the life of the process.
+        clearLocked()
+    }
+
     /// Takes a reference to the finished frame and returns the slot whose
     /// sharpness the caller should encode, or -1 when there is nothing to do.
     ///
@@ -87,7 +115,7 @@ public final class StillRing {
     public func record(_ buffer: CVPixelBuffer, at hostSeconds: Double) -> Int {
         lock.lock()
         defer { lock.unlock() }
-        guard armed else { return -1 }
+        guard armed, depth > 0 else { return -1 }
 
         let bufferWidth = CVPixelBufferGetWidth(buffer)
         let bufferHeight = CVPixelBufferGetHeight(buffer)
@@ -99,7 +127,7 @@ public final class StillRing {
             height = bufferHeight
         }
 
-        let slot = cursor % Self.capacity
+        let slot = cursor % depth
         cursor += 1
         slots[slot] = Slot(buffer: buffer, hostSeconds: hostSeconds, valid: false)
         return slot
@@ -118,9 +146,9 @@ public final class StillRing {
     public func sharpest(now: Double, windowSeconds: Double) -> CVPixelBuffer? {
         lock.lock()
         defer { lock.unlock() }
-        guard armed else { return nil }
+        guard armed, depth > 0 else { return nil }
         let scores = sharpnessBuffer.contents().bindMemory(to: Float.self,
-                                                           capacity: Self.capacity)
+                                                           capacity: Self.maximumDepth)
         var best: (score: Float, buffer: CVPixelBuffer)?
         for (index, slot) in slots.enumerated() {
             guard let slot, slot.valid else { continue }
@@ -139,7 +167,7 @@ public final class StillRing {
         for index in slots.indices { slots[index] = nil }
         cursor = 0
         let scores = sharpnessBuffer.contents().bindMemory(to: Float.self,
-                                                           capacity: Self.capacity)
-        for index in 0..<Self.capacity { scores[index] = 0 }
+                                                           capacity: Self.maximumDepth)
+        for index in 0..<Self.maximumDepth { scores[index] = 0 }
     }
 }

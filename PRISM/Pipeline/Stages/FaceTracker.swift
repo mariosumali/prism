@@ -9,8 +9,13 @@
 //
 // Extracted from GazeStage, which used to own this outright and threw away
 // everything except the two eyes. The mechanics are unchanged: a
-// VNDetectFaceLandmarksRequest on a private serial queue, every other frame,
-// request input capped at 720p, largest face wins.
+// VNDetectFaceLandmarksRequest on a private serial queue, request input
+// capped at 720p, largest face wins.
+//
+// When it runs is not this file's decision. VisionCoordinator owns the duty
+// cycle — this tracker asks for every other frame and takes what it is given,
+// because a third modality competing for the same frames has to slow
+// everything proportionally rather than quietly displace one of them.
 //
 // Threading. `update` is called from the pipeline's frame queue at the eye
 // contact stage's position in the chain — pre-geometry, so the measurements
@@ -123,15 +128,23 @@ public final class FaceTracker {
         copyPipeline = try metal.computePipeline(function: "prism_copy")
     }
 
-    /// One tracking step for the frame: dispatches the frame captured into the
-    /// PREVIOUS command buffer (a frame interval has elapsed, so its GPU work
-    /// is done), captures this one for the next dispatch, and advances the
+    /// One tracking step for the frame: dispatches the frame captured into an
+    /// EARLIER command buffer (at least a frame interval has elapsed, so its
+    /// GPU work is done), captures this one for the next dispatch when the
+    /// coordinator says this is the tracker's frame, and advances the
     /// smoothing and the ramps. Call at most once per frame, on the frame
     /// queue.
-    public func update(commandBuffer: MTLCommandBuffer, input: MTLTexture) {
-        frameIndex &+= 1
+    ///
+    /// The smoothing runs whether or not this frame carries a capture: the
+    /// motion has to resolve at frame rate, not at detection rate, and that
+    /// is the whole reason eye contact survives being measured every other
+    /// frame — or, once a third modality is competing, rather less often.
+    public func update(commandBuffer: MTLCommandBuffer, input: MTLTexture,
+                       capture: Bool) {
         dispatchPending()
-        captureIfDue(commandBuffer: commandBuffer, input: input)
+        if capture {
+            captureFrame(commandBuffer: commandBuffer, input: input)
+        }
 
         stateLock.lock()
         let latest = faceSample
@@ -194,7 +207,6 @@ public final class FaceTracker {
     private var slotSize: (width: Int, height: Int) = (0, 0)
     private var pendingSlot: Int?
     private var busySlot: Int?
-    private var frameIndex: UInt64 = 0
 
     /// Written on visionQueue.
     private var faceSample: FaceSample?
@@ -270,10 +282,7 @@ public final class FaceTracker {
         }
     }
 
-    private func captureIfDue(commandBuffer: MTLCommandBuffer, input: MTLTexture) {
-        // Offset by one from PersonSegmenter's even-frame cadence so the two
-        // Vision requests do not land on the same frame.
-        guard frameIndex % 2 == 1 else { return }
+    private func captureFrame(commandBuffer: MTLCommandBuffer, input: MTLTexture) {
         let target = cappedSize(width: input.width, height: input.height)
 
         stateLock.lock()

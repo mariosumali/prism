@@ -1,13 +1,20 @@
 // FrameRing.swift
 // PRISM
 //
-// 500ms sharpest-frame buffer (§5.2): preallocated IOSurface-backed slots
-// sized to half a second at the active frame rate (15 at 30fps, 30 at
-// 60fps). record() blits the incoming frame into the next slot inside the
-// frame's command buffer; the pipeline writes each slot's Laplacian-variance
+// Sharpest-frame buffer (§5.2): preallocated IOSurface-backed slots holding
+// as much of the recent past as ResourceGovernor can afford at the negotiated
+// format — half a second where there is room for it, never less than 200ms.
+// record() blits the incoming frame into the next slot inside the frame's
+// command buffer; the pipeline writes each slot's Laplacian-variance
 // sharpness score into `sharpnessBuffer` via prism_sharpness and publishes
 // the slot after committing the buffer. On freeze, the sharpest frame within
 // the preceding window is read back CPU-side.
+//
+// The depth is a parameter rather than a rule of this file's own because it
+// was a rule of this file's own — half a second at the frame rate — and half
+// a second of raw 1080p60 measured 238 MB against a 250 MB ceiling (§7). The
+// ring cannot decide that on its own: it does not know what else is holding
+// frames.
 //
 // Licensed under the Apache License, Version 2.0.
 
@@ -17,7 +24,7 @@ import Foundation
 import Metal
 
 public final class FrameRing {
-    /// ~500ms of frames at the active rate: ceil(0.5 × fps), floor 15 (§5.2).
+    /// Slots currently held, as granted by ResourceGovernor.
     public private(set) var capacity: Int
     /// One Float per slot; prism_sharpness writes result[slot] on the GPU,
     /// sharpestFrame reads it on the CPU (storageModeShared). Sized for
@@ -25,10 +32,13 @@ public final class FrameRing {
     public let sharpnessBuffer: MTLBuffer
 
     /// Upper bound on slots (0.5s at 128fps — far above the §3.2 format set).
-    private static let maxCapacity = 64
+    private static let maxCapacity = ResourceGovernor.maximumFreezeDepth
 
-    private static func capacity(forFrameRate frameRate: Int) -> Int {
-        min(maxCapacity, max(15, Int((Double(max(1, frameRate)) * 0.5).rounded(.up))))
+    /// Clamped rather than trusted: a depth below the governor's own floor
+    /// would leave freeze picking from a ring with nothing in it to choose
+    /// between, which is the one thing the depth is allowed to cost.
+    private static func clamp(_ depth: Int) -> Int {
+        min(maxCapacity, max(ResourceGovernor.minimumFreezeDepth, depth))
     }
 
     private struct Slot {
@@ -47,9 +57,9 @@ public final class FrameRing {
     private var height = 0
 
     public init(metal: MetalContext, width: Int, height: Int,
-                frameRate: Int = 30) throws {
+                depth: Int) throws {
         self.metal = metal
-        self.capacity = Self.capacity(forFrameRate: frameRate)
+        self.capacity = Self.clamp(depth)
         guard let buffer = metal.device.makeBuffer(
             length: Self.maxCapacity * MemoryLayout<Float>.stride,
             options: .storageModeShared) else {
@@ -134,10 +144,10 @@ public final class FrameRing {
         return best?.buffer
     }
 
-    public func reconfigure(width: Int, height: Int, frameRate: Int = 30) throws {
+    public func reconfigure(width: Int, height: Int, depth: Int) throws {
         lock.lock()
         defer { lock.unlock() }
-        let newCapacity = Self.capacity(forFrameRate: frameRate)
+        let newCapacity = Self.clamp(depth)
         guard width != self.width || height != self.height
             || newCapacity != capacity else { return }
         capacity = newCapacity
