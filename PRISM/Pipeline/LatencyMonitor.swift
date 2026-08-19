@@ -247,17 +247,32 @@ public final class LatencyMonitor: ObservableObject {
         let held = Set(restoreHoldUntil.keys)
         lock.unlock()
 
-        let candidates = stages.filter {
+        // Two separate questions, and conflating them is what let the restore
+        // hold hand the room back. `sacrificeable` is what the engine is
+        // allowed to give up at all; `available` is what it may give up *this
+        // round*, once the just-restored stages are set aside.
+        let sacrificeable = stages.filter {
             $0.enabled && !$0.pinned && Self.disableCandidates.contains($0.id)
-            && !held.contains($0.id)
         }
+        let available = sacrificeable.filter { !held.contains($0.id) }
         // The last-resort stage is not weighed against the others at all —
         // cost-first with a later-chain-position tie-break would pick it
         // FIRST among the expensive stages, which is precisely backwards
-        // (§5.7: never reveal the room). It is considered only once the pool
-        // of ordinary looks is empty.
-        let ordinary = candidates.filter { !$0.id.isLastResort }
-        let pool = ordinary.isEmpty ? candidates : ordinary
+        // (§5.7: never reveal the room). It is considered only once there is
+        // no ordinary look left to give.
+        //
+        // "No ordinary look left" has to mean none is *enabled*, not none is
+        // available: a style inside its 30 s restore hold is still on air, and
+        // reading its absence from `available` as an empty pool made the
+        // virtual background the victim while an ordinary look kept running —
+        // the hysteresis quietly undoing the exemption it sits next to. When
+        // every ordinary look is merely held, the pool is empty on purpose and
+        // the round raises policy pressure instead, which is what the hold was
+        // always for.
+        let anyOrdinaryEnabled = sacrificeable.contains { !$0.id.isLastResort }
+        let pool = anyOrdinaryEnabled
+            ? available.filter { !$0.id.isLastResort }
+            : available
         // Highest cost first; tie broken by later chain position.
         if let target = pool.max(by: { a, b in
             if a.cost != b.cost { return a.cost < b.cost }

@@ -337,9 +337,15 @@ sum the shipped constants never added up to.
 
 ```swift
 public struct ResourceDemand: Equatable {
-    public var format: VideoFormat
+    public var format: VideoFormat                // negotiated output
+    public var sourceWidth: Int                   // 0 → not known yet
+    public var sourceHeight: Int                  // §3.2 physical size
     public var stillsWantSharpest: Bool           // §5.16 setting armed
     public var screenSourceActive: Bool           // §5.24 SCStream running
+    public var replayArmed: Bool                  // §5.9 rolling buffer
+    public var replaySeconds: Double
+    public var replayMaxHeight: Int
+    public var draftChainActive: Bool             // §5.5 preview second chain
 }
 
 public enum ResourceTier: String { case full, reduced, minimum, exceeded }
@@ -368,6 +374,11 @@ public enum ResourceGovernor {
     public static func preferredDepth(for: VideoFormat) -> Int
     public static func stride(depth: Int, frameRate: Int) -> Int
     public static func frameMB(for: VideoFormat) -> Double
+    /// One frame at the size the chain works in: the source's where known,
+    /// the output's before the first camera frame lands.
+    public static func workingFrameMB(for demand: ResourceDemand) -> Double
+    public static func replayMB(for demand: ResourceDemand) -> Double
+    public static func draftMB(for demand: ResourceDemand) -> Double
     public static func plan(for demand: ResourceDemand) -> ResourcePlan
 }
 ```
@@ -382,12 +393,29 @@ joins the *structural* frames rather than the order of service: PRISM cannot
 make ScreenCaptureKit's queue smaller, so it is spent before anything elastic
 is handed out.
 
-`styleFrames` (2) joins them too — StyleStage's motion history and its stack
-scratch (§5.29) — and is counted whether or not the stage is on. Costing them
-on demand would make the freeze window change length when the user picked an
-effect, and a window that reaches back four tenths of a second on Tuesday and
-three on Wednesday is worse to reason about than one permanently two slots
-shorter.
+`stageWorkingFrames` (4.5) joins them too — StyleStage's motion history and
+stack scratch (§5.29), OverlayStage's layer ping-pong pair (§5.26) and
+RetouchStage's two half-resolution scratches (§5.22, a quarter of a frame
+each) — and is counted whether or not the stage is on. Costing them on demand
+would make the freeze window change length when the user picked an effect, and
+a window that reaches back four tenths of a second on Tuesday and three on
+Wednesday is worse to reason about than one permanently a few slots shorter.
+
+`replayMB` and `draftMB` join them for the reason `screenDepth` does: the
+governor cannot shrink an armed §5.9 buffer or a §5.5 preview, so both are
+spent before anything elastic is handed out. Replay is priced as it is
+allocated — `ReplayBuffer.recordPoolDepth` raw slots at
+`ReplayBuffer.recordSize`, the compressed ring at `ReplayBuffer.bitRate` for
+the whole window, and one 32×18 luma thumbnail per recorded frame. The draft
+is priced as a second chain: two intermediates, the same
+`stageWorkingFrames`, `DraftRenderer.outputPoolDepth` output slots and
+`draftVisionMB` for the second segmenter and face tracker.
+
+**Sizes are not interchangeable.** `frameMB` (the negotiated output) prices
+the output pool, the fit scratch and the still ring. `workingFrameMB` (the
+source, per §3.2 — a 4:3 sensor serving a 16:9 call is strictly larger) prices
+`FrameRing`, the two intermediates and every stage-private texture. Pricing
+the second group at the first understated the ring by a third.
 
 ### VisionCoordinator (`PRISM/Pipeline/VisionCoordinator.swift`)
 
@@ -892,6 +920,20 @@ budget → among enabled, unpinned stages pick highest cost, tie → later
 Re-enable when mean < 60% budget for 120 consecutive frames (most recently
 auto-disabled first). If over budget and everything left is pinned →
 `onPolicyPressure()` at most once per 5s.
+
+Two filters sit on top of that pick, and they compose in one fixed order.
+A restored stage is **held** for 30s and cannot be sacrificed again inside it
+(without the hold, a chain over budget with a look on and under 60% with it
+off flickers that look on and off forever). The stage whose `isLastResort` is
+true — the virtual background — is considered only when **no ordinary look is
+enabled at all**, which is deliberately not the same test as "no ordinary look
+is available this round": a look inside its restore hold is still on air, and
+reading its absence from the round's candidates as an empty pool made the
+virtual background the victim while an ordinary look kept running, revealing
+the room to protect a style from flicker (§5.7). When every ordinary look is
+merely held, the round has nothing to give and raises `onPolicyPressure()`
+instead — which is what the hold was for. The exemption is not a veto: with no
+ordinary look left, the last-resort stage is the candidate and does go.
 
 ### PresetStore (`PRISM/Pipeline/PresetStore.swift`)
 

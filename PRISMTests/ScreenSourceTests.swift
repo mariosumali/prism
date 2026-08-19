@@ -130,7 +130,11 @@ final class ScreenSourceTests: XCTestCase {
     /// was already tight, and it is not elastic — so what gives is the freeze
     /// window, slot for slot, and never the floor underneath it.
     func testScreenCaptureIsPaidForOutOfTheElasticDemands() {
-        let format = VideoFormat(width: 1920, height: 1080, frameRate: 30)
+        // 720p60, because that is where there is still elastic room to take
+        // it out of: once every allocation is counted (§5.23), 1080p has none
+        // and the queue lands in `plannedMB` instead — which the next test
+        // is about.
+        let format = VideoFormat(width: 1280, height: 720, frameRate: 60)
         let without = ResourceGovernor.plan(for: ResourceDemand(format: format))
         let with = ResourceGovernor.plan(for: ResourceDemand(
             format: format, screenSourceActive: true))
@@ -163,13 +167,28 @@ final class ScreenSourceTests: XCTestCase {
         XCTAssertEqual(with.tier, .exceeded)
     }
 
-    /// Sharing a screen must not push a mainstream format over the ceiling.
-    func testMainstreamFormatsStillFitWhileSharingAScreen() {
-        for format in VideoFormat.defaultSet where format.width <= 1920 {
+    /// Sharing a screen fits at 720p and below. At 1080p it does not, and the
+    /// honest answer is the one the governor gives everywhere else: take
+    /// freeze's floor, refuse the still ring, report `exceeded` and name the
+    /// figure. The old assertion — that every mainstream format still fits —
+    /// only held while Overlay's scratch, Retouch's scratch and the camera's
+    /// real slot size were missing from the sum (§5.23, §7).
+    func testSharingAScreenFitsAt720pAndIsDeclaredOverAt1080p() {
+        for format in VideoFormat.defaultSet where format.width <= 1280 {
             let plan = ResourceGovernor.plan(for: ResourceDemand(
                 format: format, stillsWantSharpest: true, screenSourceActive: true))
             XCTAssertLessThanOrEqual(plan.plannedMB, ResourceGovernor.ceilingMB,
                                      "\(format.displayName) plans over the ceiling")
+            XCTAssertNotEqual(plan.tier, .exceeded, format.displayName)
+        }
+        for format in VideoFormat.defaultSet where format.width == 1920 {
+            let plan = ResourceGovernor.plan(for: ResourceDemand(
+                format: format, stillsWantSharpest: true, screenSourceActive: true))
+            XCTAssertEqual(plan.tier, .exceeded, format.displayName)
+            XCTAssertEqual(plan.stillDepth, 0, format.displayName)
+            XCTAssertEqual(plan.freezeDepth, ResourceGovernor.minimumFreezeDepth,
+                           format.displayName)
+            XCTAssertTrue(plan.summary.contains("250"), format.displayName)
         }
     }
 

@@ -320,6 +320,67 @@ final class LatencyMonitorTests: XCTestCase {
         XCTAssertFalse(disabledAgain, "a restored stage must not flicker back off")
     }
 
+    /// The two protections have to hold at the same time. The restore hold
+    /// takes a just-restored ordinary look out of this round's candidates,
+    /// and reading that absence as "no ordinary look is left" handed the
+    /// virtual background over while style was still running — the room comes
+    /// back to the call because a style was being protected from flicker
+    /// (§5.7). A held look is still on air, so the round has nothing to give
+    /// and asks for a bigger budget instead.
+    func testAHeldOrdinaryLookIsNeverPaidForWithTheVirtualBackground() {
+        let table = StageTable(enabled: [.style, .background],
+                               all: [(.style, .expensive),
+                                     (.background, .expensive)])
+        let monitor = makeMonitor(table: table)
+
+        let disabled = expectation(description: "style disabled, not the background")
+        monitor.onAutoDisable = { id in
+            table.enabled.remove(id)
+            XCTAssertEqual(id, .style, "the last resort must not go first")
+            disabled.fulfill()
+        }
+        feed(monitor, frames: 60, gpuMs: 12)
+        wait(for: [disabled], timeout: 2)
+
+        let restored = expectation(description: "style restored and held")
+        monitor.onAutoReenable = { id in
+            table.enabled.insert(id)
+            restored.fulfill()
+        }
+        feed(monitor, frames: 120, gpuMs: 2)
+        wait(for: [restored], timeout: 2)
+
+        // Over budget again inside style's 30 s hold. The only stage not held
+        // is the background — and it must still not be the one that goes.
+        var disabledAgain: [StageID] = []
+        monitor.onAutoDisable = { disabledAgain.append($0) }
+        let pressure = expectation(description: "policy pressure, not the room")
+        monitor.onPolicyPressure = { pressure.fulfill() }
+        feed(monitor, frames: 60, gpuMs: 12)
+        wait(for: [pressure], timeout: 2)
+        XCTAssertTrue(disabledAgain.isEmpty,
+                      "the virtual background went while an ordinary look was "
+                        + "merely inside its restore hold")
+    }
+
+    /// …and the exemption is not a veto. With no ordinary look left at all,
+    /// the last-resort stage IS the candidate — §3.4 sacrifices a look before
+    /// it drops a frame, and by then the background is the only look there is.
+    func testTheVirtualBackgroundStillGoesWhenItIsAllThatIsLeft() {
+        let table = StageTable(enabled: [.background],
+                               all: [(.background, .expensive)])
+        let monitor = makeMonitor(table: table)
+
+        let disabled = expectation(description: "background disabled last of all")
+        monitor.onAutoDisable = { id in
+            table.enabled.remove(id)
+            XCTAssertEqual(id, .background)
+            disabled.fulfill()
+        }
+        feed(monitor, frames: 60, gpuMs: 12)
+        wait(for: [disabled], timeout: 2)
+    }
+
     // MARK: (d) All-pinned chain over budget → policy pressure, rate-limited
 
     func testAllPinnedOverBudgetFiresPolicyPressureExactlyOnceWithin5s() {

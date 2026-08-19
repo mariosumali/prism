@@ -3527,11 +3527,17 @@ public final class AppState: ObservableObject {
         // while the first draft frame renders (draft == live at begin).
         draftPreviewBox.store(previewBox.take())
         draftRendererBox.set(renderer)
+        // §5.23: a second chain is resident from here until teardown — its
+        // own intermediates, stage scratch, output pool and Vision requests.
+        // The memory plan has to be told, or it keeps reporting the figure it
+        // reported with the pane shut.
+        pipeline?.setDraftChainActive(true)
         return renderer
     }
 
     private func teardownDraftRenderer() {
         draftRendererBox.set(nil)
+        pipeline?.setDraftChainActive(false)
         // Disable (not just clear): a completed draft frame landing after
         // this teardown must be dropped, not retained.
         draftPreviewBox.setEnabled(false)

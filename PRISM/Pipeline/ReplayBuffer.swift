@@ -66,6 +66,12 @@ public final class ReplayBuffer {
     public static let thumbnailHeight = 18
     private static let thumbnailCount = thumbnailWidth * thumbnailHeight
 
+    /// Slots the record pool is created with — enough to cover the frames the
+    /// encoder holds in flight without the pool blocking the frame path.
+    /// Named because §5.23 has to charge for them: six raw BGRA slots at
+    /// 1080p is 47.5 MB that used to appear in no plan at all.
+    static let recordPoolDepth = 6
+
     // MARK: - Public state
 
     /// Set by the pipeline from live configuration each frame.
@@ -357,8 +363,16 @@ public final class ReplayBuffer {
     /// Record dimensions: aspect preserved, height capped, both even (the
     /// encoder requires it).
     private func recordSize(width: Int, height: Int) -> (width: Int, height: Int) {
+        Self.recordSize(width: width, height: height, maxHeight: maxHeight)
+    }
+
+    /// The same rule as a pure function, so §5.23 can price an armed buffer
+    /// without building one. A memory plan that guesses at the record size
+    /// is a plan that is wrong by whatever the cap actually does.
+    static func recordSize(width: Int, height: Int,
+                           maxHeight: Int) -> (width: Int, height: Int) {
         guard width > 0, height > 0 else { return (640, 360) }
-        let scale = min(1.0, Double(maxHeight) / Double(height))
+        let scale = min(1.0, Double(max(180, maxHeight)) / Double(height))
         let w = max(16, Int((Double(width) * scale).rounded()) & ~1)
         let h = max(16, Int((Double(height) * scale).rounded()) & ~1)
         return (w, h)
@@ -376,7 +390,7 @@ public final class ReplayBuffer {
             // Enough slots to cover the frames the encoder holds in flight
             // without the pool blocking on the frame path.
             let poolAttrs: [String: Any] = [
-                kCVPixelBufferPoolMinimumBufferCountKey as String: 6,
+                kCVPixelBufferPoolMinimumBufferCountKey as String: Self.recordPoolDepth,
             ]
             guard CVPixelBufferPoolCreate(kCFAllocatorDefault,
                                           poolAttrs as CFDictionary,

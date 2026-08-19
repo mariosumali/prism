@@ -56,6 +56,12 @@ final class DraftRenderer {
     private let outputFitStage: OutputFitStage
     private let userStages: [EffectStage]
 
+    /// Slots in the draft's own output pool. Named because §5.23 charges for
+    /// them: a draft on screen is a whole second chain resident, and until it
+    /// was priced the plan read exactly the same with the settings pane open
+    /// as with it shut.
+    static let outputPoolDepth = 3
+
     /// Mirrors VideoPipeline.maskConsumers — the chain position where the
     /// draft's own segmentation runs.
     private static let maskConsumers: Set<StageID> = [.blur, .background, .overlay]
@@ -297,7 +303,7 @@ final class DraftRenderer {
         let bufferAttrs = prismPixelBufferAttributes(width: format.width,
                                                      height: format.height)
         let poolAttrs: [String: Any] = [
-            kCVPixelBufferPoolMinimumBufferCountKey as String: 3,
+            kCVPixelBufferPoolMinimumBufferCountKey as String: Self.outputPoolDepth,
         ]
         guard CVPixelBufferPoolCreate(kCFAllocatorDefault,
                                       poolAttrs as CFDictionary,

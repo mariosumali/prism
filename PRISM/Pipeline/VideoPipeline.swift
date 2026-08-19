@@ -269,6 +269,25 @@ public final class VideoPipeline {
     /// §5.24 — a ScreenCaptureKit session is running, so its frame queue is
     /// spoken for in the memory plan.
     private var screenSourceActive = false
+    /// §5.9's rolling buffer, as the memory plan sees it: armed, how far back
+    /// it records and the height it caps recording at. Remembered for the
+    /// same reason `stillsWantSharpest` is — a format change has to re-plan
+    /// against the settings without waiting for the next applyStudio.
+    private var replayArmed = false
+    private var replaySeconds: Double = 0
+    private var replayMaxHeight = 1080
+    /// §5.5 — a draft preview is on screen, so DraftRenderer's second chain
+    /// is resident and the plan has to see it.
+    private var draftChainActive = false
+    /// The size the source actually delivers (§3.2: the smallest native
+    /// format at least as large as the output, which on a 4:3 sensor is
+    /// bigger than the call). Every ring slot and intermediate is this size,
+    /// so the plan is priced from it — taken from real camera frames only,
+    /// because the no-camera heartbeat's dark texture is the output's size
+    /// and re-planning against it would make the window flap whenever the
+    /// camera paused. stateLock-guarded.
+    private var sourceWidth = 0
+    private var sourceHeight = 0
     /// Counts camera frames past the freeze ring, and the stride it is
     /// counted against — read off the plan once per frame in ensureWorking so
     /// the hot path never takes stateLock for it. Both frameQueue-confined.
@@ -495,7 +514,13 @@ public final class VideoPipeline {
         stateLock.lock()
         let demand = ResourceDemand(format: outputFormat,
                                     stillsWantSharpest: stillsWantSharpest,
-                                    screenSourceActive: screenSourceActive)
+                                    screenSourceActive: screenSourceActive,
+                                    sourceWidth: sourceWidth,
+                                    sourceHeight: sourceHeight,
+                                    replayArmed: replayArmed,
+                                    replaySeconds: replaySeconds,
+                                    replayMaxHeight: replayMaxHeight,
+                                    draftChainActive: draftChainActive)
         let plan = ResourceGovernor.plan(for: demand)
         let changed = plan != resourcePlan
         resourcePlan = plan
@@ -686,8 +711,29 @@ public final class VideoPipeline {
         // it may hold is §7's call, not the setting's.
         stateLock.lock()
         stillsWantSharpest = settings.capture.prefersSharp
+        // §5.23: an armed buffer is the largest thing one switch allocates —
+        // a six-slot record pool, the compressed ring and its thumbnails —
+        // so the plan reads the settings rather than the defaults.
+        replayArmed = settings.replay.isArmed
+        replaySeconds = settings.replay.clampedBufferSeconds
+        replayMaxHeight = settings.replay.maxHeight
         stateLock.unlock()
         stillRing.setArmed(settings.capture.prefersSharp)
+        replan()
+    }
+
+    /// §5.5/§5.23 — a draft preview is on screen, so DraftRenderer's second
+    /// chain is resident. Separate from `apply` for the same reason
+    /// `setScreenSourceActive` is: it is not a look, it is an allocation, and
+    /// the plan has to see it before it hands the rest of the ceiling out.
+    public func setDraftChainActive(_ active: Bool) {
+        stateLock.lock()
+        guard active != draftChainActive else {
+            stateLock.unlock()
+            return
+        }
+        draftChainActive = active
+        stateLock.unlock()
         replan()
     }
 
@@ -855,6 +901,14 @@ public final class VideoPipeline {
         }
 
         guard let pool else { throw PipelineError.textureAllocationFailed }
+        // §5.23: the ring and the intermediates are allocated at the size the
+        // source delivers, so the plan has to be made against that size —
+        // before ensureWorking spends the depth it grants. Camera frames
+        // only; the heartbeat's dark texture is the output's size and would
+        // make the window flap every time the camera paused.
+        if cameraBuffer != nil {
+            noteSourceSize(width: source.width, height: source.height)
+        }
         try ensureWorking(width: source.width, height: source.height)
         guard let commandBuffer = metal.commandQueue.makeCommandBuffer() else {
             throw PipelineError.encodingFailed("Could not create command buffer")
@@ -1135,6 +1189,20 @@ public final class VideoPipeline {
     }
 
     // MARK: Resource management
+
+    /// Re-plans when the source's dimensions move. A comparison per frame in
+    /// the common case; `replan` is arithmetic and publishes only on change.
+    private func noteSourceSize(width: Int, height: Int) {
+        stateLock.lock()
+        let changed = width != sourceWidth || height != sourceHeight
+        if changed {
+            sourceWidth = width
+            sourceHeight = height
+        }
+        stateLock.unlock()
+        guard changed else { return }
+        replan()
+    }
 
     private func ensureWorking(width: Int, height: Int) throws {
         stateLock.lock()

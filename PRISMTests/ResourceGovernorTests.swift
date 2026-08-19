@@ -164,6 +164,142 @@ final class ResourceGovernorTests: XCTestCase {
         }
     }
 
+    // MARK: - Everything is counted (§5.23)
+
+    /// The sum has to contain every full-frame allocation the chain makes,
+    /// itemised here with literal counts rather than by reading the
+    /// governor's own constants back — a term dropped from both sides proves
+    /// nothing. Overlay's layer ping-pong pair and Retouch's half-resolution
+    /// pair were outside this sum while the plan reported that 1080p fitted.
+    func testEveryFullFrameAllocationOfTheChainIsInTheSum() {
+        let format = VideoFormat(width: 1920, height: 1080, frameRate: 30)
+        let plan = ResourceGovernor.plan(for: ResourceDemand(format: format))
+        let frame = ResourceGovernor.frameMB(for: format)
+        // 4 output pool + 1 fit scratch + 2 intermediates + 2 style
+        // + 2 overlay, then Retouch's two half-resolution scratches (a
+        // quarter of a frame each), then the ring the plan just granted.
+        let wholeFrames = 4 + 1 + 2 + 2 + 2 + plan.freezeDepth
+        let expected = ResourceGovernor.reservedMB
+            + ResourceGovernor.visionStagingMB
+            + (Double(wholeFrames) + 0.5) * frame
+        XCTAssertEqual(plan.plannedMB, expected, accuracy: 0.01,
+                       "an allocation is missing from the plan")
+    }
+
+    /// §3.2 picks the smallest native camera format at least as large as the
+    /// output in BOTH dimensions, so a 4:3 sensor serving a 16:9 call is
+    /// strictly larger — a Continuity Camera hands over 1920×1440 for 1080p.
+    /// FrameRing, the intermediates and every stage texture are allocated at
+    /// that size, and pricing them at the output's understated the ring by a
+    /// third while the plan reported that it fitted.
+    func testTheWorkingSetIsPricedAtTheSourceResolutionNotTheOutputs() {
+        let format = VideoFormat(width: 1920, height: 1080, frameRate: 30)
+        let asOutput = ResourceGovernor.plan(for: ResourceDemand(format: format))
+        let continuity = ResourceGovernor.plan(for: ResourceDemand(
+            format: format, sourceWidth: 1920, sourceHeight: 1440))
+
+        XCTAssertGreaterThan(continuity.plannedMB, asOutput.plannedMB,
+                             "a 4:3 sensor costs more per slot than the call does")
+        let slot = ResourceGovernor.workingFrameMB(
+            for: ResourceDemand(format: format,
+                                sourceWidth: 1920, sourceHeight: 1440))
+        XCTAssertEqual(slot, Double(1920 * 1440 * 4) / (1024 * 1024), accuracy: 0.01)
+        // 6.5 working textures plus the ring, all a third larger than the
+        // plan used to think — enough that 1080p no longer fits, and the
+        // plan has to say so rather than spend memory it does not have.
+        XCTAssertEqual(continuity.tier, .exceeded)
+        XCTAssertEqual(continuity.freezeDepth, ResourceGovernor.minimumFreezeDepth)
+    }
+
+    /// §5.9's rolling buffer is the largest thing one user switch allocates —
+    /// a six-slot raw record pool, the compressed ring and its thumbnails —
+    /// and none of it was in the plan. Arming it changed nothing the
+    /// diagnostics pane showed while resident memory went up by a third.
+    func testArmingTheRollingReplayBufferMovesThePlan() {
+        let format = VideoFormat(width: 1280, height: 720, frameRate: 30)
+        let idle = ResourceGovernor.plan(for: ResourceDemand(format: format))
+        let armed = ResourceGovernor.plan(for: ResourceDemand(
+            format: format, replayArmed: true, replaySeconds: 10,
+            replayMaxHeight: 1080))
+
+        let cost = ResourceGovernor.replayMB(for: ResourceDemand(
+            format: format, replayArmed: true, replaySeconds: 10,
+            replayMaxHeight: 1080))
+        XCTAssertGreaterThan(cost, Double(ReplayBuffer.recordPoolDepth)
+                                * ResourceGovernor.frameMB(for: format),
+                             "the pool alone is six raw slots")
+        XCTAssertEqual(armed.plannedMB, idle.plannedMB + cost, accuracy: 0.01)
+        XCTAssertEqual(ResourceGovernor.replayMB(for: ResourceDemand(format: format)), 0,
+                       "disarmed, it holds nothing and is charged nothing")
+
+        // A longer window costs more compressed ring and more thumbnails.
+        let longer = ResourceGovernor.replayMB(for: ResourceDemand(
+            format: format, replayArmed: true, replaySeconds: 30,
+            replayMaxHeight: 1080))
+        XCTAssertGreaterThan(longer, cost)
+    }
+
+    /// At 1080p the buffer is recorded uncapped, and the plan that used to
+    /// read the same with it on and off now goes over the ceiling and says so.
+    func testArmingReplayAt1080pTakesThePlanOverTheCeilingOutLoud() {
+        let format = VideoFormat(width: 1920, height: 1080, frameRate: 30)
+        let armed = ResourceGovernor.plan(for: ResourceDemand(
+            format: format, replayArmed: true, replaySeconds: 10,
+            replayMaxHeight: 1080))
+        XCTAssertEqual(armed.tier, .exceeded)
+        XCTAssertGreaterThan(armed.plannedMB, ResourceGovernor.ceilingMB)
+        XCTAssertEqual(armed.freezeDepth, ResourceGovernor.minimumFreezeDepth,
+                       "freeze keeps its floor and takes nothing above it")
+        XCTAssertTrue(armed.summary.contains("250"))
+    }
+
+    /// §5.5's draft preview runs a complete second chain — its own
+    /// intermediates, stage scratch, output pool, segmenter and face tracker.
+    /// Opening the settings pane to stage a look used to add all of it with
+    /// `plannedMB`, `tier` and the diagnostics pane reporting exactly what
+    /// they reported before.
+    func testStagingADraftIsChargedForTheSecondChainItRuns() {
+        let format = VideoFormat(width: 1280, height: 720, frameRate: 30)
+        let alone = ResourceGovernor.plan(for: ResourceDemand(format: format))
+        let staging = ResourceGovernor.plan(for: ResourceDemand(
+            format: format, draftChainActive: true))
+
+        let cost = ResourceGovernor.draftMB(for: ResourceDemand(
+            format: format, draftChainActive: true))
+        let frame = ResourceGovernor.frameMB(for: format)
+        XCTAssertGreaterThan(cost, Double(DraftRenderer.outputPoolDepth) * frame
+                                + ResourceGovernor.draftVisionMB,
+                             "the second chain is more than its output pool")
+        XCTAssertGreaterThan(staging.plannedMB, alone.plannedMB)
+        XCTAssertLessThan(staging.freezeDepth, alone.freezeDepth,
+                          "a second chain has to come out of something")
+        XCTAssertGreaterThanOrEqual(staging.freezeDepth,
+                                    ResourceGovernor.minimumFreezeDepth,
+                                    "and never out of freeze's floor")
+        XCTAssertEqual(ResourceGovernor.draftMB(for: ResourceDemand(format: format)), 0,
+                       "no draft, no charge")
+    }
+
+    /// Whatever else moves, the floor does not — every demand this file knows
+    /// about, all at once, and freeze still holds a choice.
+    func testEverythingAtOnceStillLeavesFreezeItsFloor() {
+        for format in VideoFormat.defaultSet {
+            let plan = ResourceGovernor.plan(for: ResourceDemand(
+                format: format, stillsWantSharpest: true,
+                screenSourceActive: true,
+                sourceWidth: 1920, sourceHeight: 1440,
+                replayArmed: true, replaySeconds: 30, replayMaxHeight: 1080,
+                draftChainActive: true))
+            XCTAssertEqual(plan.freezeDepth, ResourceGovernor.minimumFreezeDepth,
+                           format.displayName)
+            XCTAssertEqual(plan.stillDepth, 0, format.displayName)
+            XCTAssertEqual(plan.tier, .exceeded, format.displayName)
+            XCTAssertGreaterThanOrEqual(plan.freezeSpanSeconds,
+                                        ResourceGovernor.minimumFreezeSeconds - 1e-9,
+                                        format.displayName)
+        }
+    }
+
     // MARK: - Predictability
 
     /// A policy whose answer depends on when you asked is one nobody can
