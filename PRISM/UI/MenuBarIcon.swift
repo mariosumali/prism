@@ -14,10 +14,17 @@ import SwiftUI
 struct MenuBarIcon: View {
     let state: MenuBarState
 
-    /// Asset check runs once; the assets are template PDFs so they inherit
-    /// menu bar tinting and dark mode automatically.
-    private static let hasCustomGlyphs: Bool =
-        NSImage(named: "PrismGlyph") != nil && NSImage(named: "PrismGlyphFilled") != nil
+    /// Asset check: custom glyphs inherit menu bar tinting and dark mode
+    /// automatically as template images. Check on every render to catch
+    /// asset unloading under memory pressure (and ensure both exist before
+    /// using either).
+    private var hasCustomGlyphs: Bool {
+        guard NSImage(named: "PrismGlyph") != nil &&
+              NSImage(named: "PrismGlyphFilled") != nil else {
+            return false
+        }
+        return true
+    }
 
     var body: some View {
         baseImage
