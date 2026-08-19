@@ -99,6 +99,57 @@ final class SessionLogTests: XCTestCase {
         XCTAssertTrue(text.hasSuffix("\n"))
     }
 
+    // MARK: - What an export may say (§5.21)
+
+    /// The log is a file people attach to a support thread. A window's title
+    /// is a document name — "Q3 layoffs (confidential).xlsx" — and every
+    /// sentence that names a shared source used to carry it verbatim. The
+    /// application survives, because "what was I sharing" still needs an
+    /// answer; the title does not.
+    func testAnExportedLogNamesTheApplicationAndNeverTheWindowTitle() {
+        let shared = ScreenSourceInfo(id: "window:7", kind: .window,
+                                      name: "Q3 layoffs (confidential).xlsx",
+                                      applicationName: "Microsoft Excel")
+        XCTAssertEqual(shared.displayName,
+                       "Microsoft Excel — Q3 layoffs (confidential).xlsx",
+                       "the picker still says exactly what it is")
+
+        let log = SessionLog()
+        log.record(.device, "Source: \(shared.logName)")
+        log.record(.device, ScreenCaptureStop(
+            message: "\(shared.displayName) stopped sharing: it closed",
+            logMessage: "\(shared.logName) stopped sharing: it closed").logMessage)
+
+        let text = log.exportText()
+        XCTAssertFalse(text.localizedCaseInsensitiveContains("layoffs"),
+                       "a document name reached a file the user sends to strangers")
+        XCTAssertTrue(text.contains("a Microsoft Excel window"))
+    }
+
+    /// A window with no owning application loses its title all the same —
+    /// the title is the sensitive half, not the attribution.
+    func testAnUnattributedWindowStillLosesItsTitle() {
+        let shared = ScreenSourceInfo(id: "window:7", kind: .window,
+                                      name: "Divorce settlement draft")
+        XCTAssertEqual(shared.logName, "a shared window")
+    }
+
+    /// A display's name is a device name, which is exactly what the log
+    /// promises it may hold — nothing is redacted that did not need to be.
+    func testADisplayIsNamedTheSameWayEverywhere() {
+        let display = ScreenSourceInfo(id: "display:1", kind: .display,
+                                       name: "Studio Display")
+        XCTAssertEqual(display.logName, display.displayName)
+        XCTAssertEqual(display.logName, "Studio Display")
+    }
+
+    /// A stop with nothing to redact says the same thing twice rather than
+    /// leaving the log blank.
+    func testAStopWithNoRedactionLogsItsOwnSentence() {
+        let stop = ScreenCaptureStop(message: "That screen is no longer available.")
+        XCTAssertEqual(stop.logMessage, stop.message)
+    }
+
     func testDurationReadsAsADuration() {
         let start = Date()
         XCTAssertEqual(SessionLog.duration(from: start, to: start + 42), "42 s")

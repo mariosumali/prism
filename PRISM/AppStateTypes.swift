@@ -288,6 +288,33 @@ public struct ScreenSourceInfo: Identifiable, Equatable, Hashable {
         guard let applicationName, !applicationName.isEmpty else { return name }
         return "\(applicationName) — \(name)"
     }
+
+    /// How the §5.21 session log may name it, which is not how a picker may.
+    ///
+    /// A display's name is a device name — the log's standing promise. A
+    /// window's name is its *title*, which is a document, a spreadsheet, a
+    /// browser tab: "Q3 layoffs (confidential).xlsx". The log is a plain-text
+    /// file people export and attach to a support thread, so the title never
+    /// reaches it. The owning application does, because "what was I sharing
+    /// when the stream died" needs an answer and "a Microsoft Excel window"
+    /// is that answer without being the document's name.
+    public var logName: String {
+        Self.logName(kind: kind, name: name, applicationName: applicationName)
+    }
+
+    /// The same rule where only the parts are to hand — ScreenCapture names
+    /// its running stream from an `SCWindow`, not from a picker row.
+    public static func logName(kind: VideoSourceKind, name: String,
+                               applicationName: String?) -> String {
+        guard kind == .window else {
+            guard let applicationName, !applicationName.isEmpty else { return name }
+            return "\(applicationName) — \(name)"
+        }
+        guard let applicationName, !applicationName.isEmpty else {
+            return "a shared window"
+        }
+        return "a \(applicationName) window"
+    }
 }
 
 /// The user's source pick, persisted.

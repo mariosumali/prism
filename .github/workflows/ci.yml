@@ -58,9 +58,16 @@ jobs:
         # framework actually links, which every Foundation-provided path
         # (URLSession lives in Foundation, getaddrinfo in libSystem) walks
         # straight past. Catch the call site instead.
+        #
+        # Every directory that ends up inside a shipped binary is scanned, not
+        # just the three top-level app targets. PRISMShared is compiled into
+        # the app, the audio plug-in and the tests (project.yml), it is C on
+        # the RT audio path, and a BSD socket there linked nothing but
+        # libSystem — so it walked past both tripwires. A check with a hole in
+        # it is worse than no check, because it is quoted as evidence.
         run: |
-          if grep -rnE 'URLSession|NWConnection|NWBrowser|CFNetwork|dnssd|getaddrinfo' \
-               PRISM PRISMCameraExtension PRISMAudioPlugIn; then
+          if grep -rnE 'URLSession|NSURLConnection|NWConnection|NWBrowser|NWListener|NWPathMonitor|NWEndpoint|import Network|CFNetwork|CFStream|NSStream|NSTask|Process\(\)|dnssd|getaddrinfo|sys/socket\.h|socket\(|sendto\(|recvfrom\(|contentsOf: *URL' \
+               PRISM PRISMShared PRISMKernels PRISMCameraExtension PRISMAudioPlugIn; then
             echo "::error::Networking API referenced in source"; exit 1
           fi
 

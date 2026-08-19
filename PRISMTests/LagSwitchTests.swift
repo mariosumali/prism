@@ -2,9 +2,12 @@
 // PRISMTests
 //
 // The deliberate delay line (§5.12): its settings arithmetic, the
-// forward-compatibility contract it inherits, and the reporting rule that
-// keeps the latency meter honest while several seconds of requested delay
-// are in flight.
+// forward-compatibility contract it inherits, the reporting rule that keeps
+// the latency meter honest while several seconds of requested delay are in
+// flight, and — the part with teeth — what the line is holding when the
+// microphone goes off air. Several seconds of not-yet-sent speech is what
+// this feature is, so a mute that leaves it in the buffer is a mute that
+// transmits afterwards.
 //
 // Licensed under the Apache License, Version 2.0.
 
@@ -180,6 +183,103 @@ final class LagSwitchTests: XCTestCase {
         XCTAssertEqual(rebased.base, 108, accuracy: 1e-9,
                        "never ahead of the newest buffered frame")
         XCTAssertEqual(rebased.lag, 0, accuracy: 1e-9)
+    }
+
+    // MARK: - The audio delay line (§5.12)
+
+    /// A line sized like the real one but small enough to fill in a test:
+    /// 480 frames of delay (10 ms at 48 kHz) behind 64-frame slices.
+    private func line(delayFrames: Int = 480, slice: Int = 64) -> AudioDelayLine {
+        let line = AudioDelayLine()
+        line.allocate(maxDelayFrames: delayFrames, headroomFrames: slice)
+        return line
+    }
+
+    /// Pushes one slice of a constant value and returns what would reach the
+    /// ring: the stall's silence first, then the frames the window names.
+    private func emit(_ line: AudioDelayLine, value: Float,
+                      frames: Int = 64, delayFrames: Int = 480) -> [Float] {
+        var slice = [Float](repeating: value, count: frames * 2)
+        let window = slice.withUnsafeBufferPointer {
+            line.push($0.baseAddress!, frameCount: frames, delayFrames: delayFrames)
+        }
+        var out = [Float](repeating: 0, count: window.silenceFrames * 2)
+        var cursor = window.start
+        var remaining = window.frames
+        while remaining > 0 {
+            let chunk = min(remaining, line.capacityFrames - cursor)
+            let base = line.base(at: cursor)!
+            out.append(contentsOf: UnsafeBufferPointer(start: base, count: chunk * 2))
+            cursor = (cursor + chunk) % line.capacityFrames
+            remaining -= chunk
+        }
+        return out
+    }
+
+    /// The whole point of the line: what comes out is what went in, one
+    /// delay ago. Guards the arithmetic every test below depends on.
+    func testTheLineEmitsWhatWasPushedOneDelayAgo() {
+        let line = self.line()
+        // 480 frames of delay plus the slice itself is 8.5 slices, so the
+        // first seven emit nothing but silence and the eighth is half and
+        // half — the moment the line starts delivering.
+        for _ in 0..<7 {
+            XCTAssertTrue(emit(line, value: 1).allSatisfy { $0 == 0 },
+                          "the line stalls with silence until it has filled")
+        }
+        let eighth = emit(line, value: 1)
+        XCTAssertEqual(eighth.count, 128, "64 frames of interleaved stereo")
+        XCTAssertTrue(eighth.prefix(64).allSatisfy { $0 == 0 })
+        XCTAssertTrue(eighth.suffix(64).allSatisfy { $0 == 1 },
+                      "the tail of the window is the audio pushed a delay ago")
+    }
+
+    /// The one that matters. A user with the lag switch engaged mutes
+    /// mid-sentence to say something private in the room, then unmutes. The
+    /// seconds they said before the mute were still sitting in the line,
+    /// never sent — and they must never be sent. Transmitting them is the
+    /// single worst thing this feature could do.
+    func testAnUnmuteNeverTransmitsWhatWasPendingWhenTheMuteBegan() {
+        let line = self.line()
+        // Speaking on air, at full depth: the line fills and delivers.
+        for _ in 0..<12 { _ = emit(line, value: 1) }
+        XCTAssertTrue(emit(line, value: 1).allSatisfy { $0 == 1 },
+                      "precondition: the line is full of the private speech")
+
+        // Mute. The RT path stops feeding the line and empties it on resume.
+        line.reset()
+
+        // Unmute, and say nothing for a while. Not one frame of the audio
+        // captured before the mute may appear.
+        for _ in 0..<20 {
+            XCTAssertFalse(emit(line, value: 0).contains(1),
+                           "audio captured before a mute was put on air after it")
+        }
+    }
+
+    /// Same rule from the other end: releasing the switch zeroes the depth,
+    /// and the frames left in the line belong to a session that has ended.
+    /// A re-engage that read them would open with something said minutes ago.
+    func testAReEngageStartsFromTheStallRatherThanTheLastSession() {
+        let line = self.line()
+        for _ in 0..<12 { _ = emit(line, value: 1) }
+
+        // Release: the RT path resets whenever the depth is zero.
+        line.reset()
+
+        // Re-engage. The first slices are silence, exactly as a first engage.
+        XCTAssertTrue(emit(line, value: 0).allSatisfy { $0 == 0 })
+        XCTAssertEqual(line.writtenFrames, 64,
+                       "the cursor restarts rather than carrying the old session")
+    }
+
+    /// A depth the line cannot honour is clamped rather than allowed to read
+    /// into the frames this callback is writing.
+    func testTheRequestedDepthIsClampedToWhatTheLineHolds() {
+        let line = self.line()
+        XCTAssertEqual(line.clampedDelayFrames(1_000_000), 480)
+        XCTAssertEqual(line.clampedDelayFrames(-5), 0)
+        XCTAssertFalse(line.canHold(frameCount: line.capacityFrames + 1))
     }
 
     // MARK: - Transport exclusivity

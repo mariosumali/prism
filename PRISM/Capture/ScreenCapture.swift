@@ -34,6 +34,38 @@ import CoreVideo
 import Foundation
 import ScreenCaptureKit
 
+/// A stop, in the two forms it has to exist in.
+///
+/// `message` is the sentence the user is shown verbatim, and it names the
+/// source — "that window has closed" is only useful if you know which. But
+/// the same sentence goes in the §5.21 session log, which is a plain-text
+/// file people export and attach to a support thread, and a window's name is
+/// its title: a document, a spreadsheet, a browser tab. So `logMessage`
+/// carries the sentence with the title left out. The two are built together,
+/// at the one place a stop is raised, because a redaction applied later by
+/// whoever remembers is a redaction that stops being applied.
+public struct ScreenCaptureStop: Equatable {
+    public let message: String
+    public let logMessage: String
+
+    public init(message: String, logMessage: String? = nil) {
+        self.message = message
+        self.logMessage = logMessage ?? message
+    }
+}
+
+/// Anything that can name the application behind it, and tell one running
+/// copy from another. Exists so the display filter's exclusion rule can be
+/// exercised without a live ScreenCaptureKit session: that rule is the whole
+/// of PRISM's promise never to film itself, and it is the kind of promise
+/// that is only ever checked by whoever notices it broke.
+public protocol ScreenCaptureApplication {
+    var bundleIdentifier: String { get }
+    var processID: pid_t { get }
+}
+
+extension SCRunningApplication: ScreenCaptureApplication {}
+
 public final class ScreenCapture: NSObject {
 
     // MARK: - Public surface (CONTRACTS.md)
@@ -42,13 +74,21 @@ public final class ScreenCapture: NSObject {
     /// `CameraCapture.onFrame`.
     public var onFrame: ((CVPixelBuffer, CMTime) -> Void)?
     /// The source went away, or the stream could not be built. Delivered on
-    /// the main thread with a sentence the user can be shown verbatim.
-    public var onStopped: ((String) -> Void)?
+    /// the main thread.
+    public var onStopped: ((ScreenCaptureStop) -> Void)?
 
     /// Name of the display or window being captured; nil when stopped.
     public private(set) var currentSourceName: String? {
         get { stateLock.lock(); defer { stateLock.unlock() }; return _currentSourceName }
         set { stateLock.lock(); _currentSourceName = newValue; stateLock.unlock() }
+    }
+
+    /// The same source named the way the §5.21 session log may name it: a
+    /// window's title is a document name, and the log is a file the user
+    /// exports and sends to strangers. nil when stopped.
+    public private(set) var currentSourceLogName: String? {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _currentSourceLogName }
+        set { stateLock.lock(); _currentSourceLogName = newValue; stateLock.unlock() }
     }
 
     /// True from start() until stop() or a stop the system reported. Flipped
@@ -125,6 +165,7 @@ public final class ScreenCapture: NSObject {
         generation &+= 1
         stateLock.unlock()
         currentSourceName = nil
+        currentSourceLogName = nil
         let stream = takeStream()
         stopRepeatTimer()
         captureQueue.async { [weak self] in self?.lastBuffer = nil }
@@ -152,6 +193,7 @@ public final class ScreenCapture: NSObject {
     private let stateLock = NSLock()
     private var _isRunning = false
     private var _currentSourceName: String?
+    private var _currentSourceLogName: String?
 
     /// Stream handle, guarded because start/stop run off any thread.
     private var streamLock = NSLock()
@@ -207,6 +249,7 @@ public final class ScreenCapture: NSObject {
         let filter: SCContentFilter
         let sourceSize: CGSize
         let name: String
+        let logName: String
         switch selection.kind {
         case .camera:
             return                          // not this class's business
@@ -218,13 +261,24 @@ public final class ScreenCapture: NSObject {
             }
             // Everything on the display except PRISM itself: a window showing
             // the preview of what is being captured is the one thing that
-            // cannot be in the capture.
-            let ownWindows = content.windows.filter {
-                $0.owningApplication?.bundleIdentifier == Bundle.main.bundleIdentifier
+            // cannot be in the capture — and the prompter pane is a window
+            // holding the script the user is reading from (§5.27).
+            let ownApps = await ownApplications(in: content)
+            guard !ownApps.isEmpty else {
+                // Never guess. A display capture with no exclusion is one
+                // that films the prompter the moment the user opens it, and
+                // a share that does not start is recoverable in a way a
+                // script read out to the call is not.
+                fail(gen: gen, "PRISM could not confirm its own windows would be "
+                     + "left out of the capture, so it did not start one.")
+                return
             }
-            filter = SCContentFilter(display: display, excludingWindows: ownWindows)
+            filter = SCContentFilter(display: display,
+                                     excludingApplications: ownApps,
+                                     exceptingWindows: [])
             sourceSize = CGSize(width: display.width, height: display.height)
             name = await MainActor.run { Self.displayNames()[id] } ?? "Screen"
+            logName = name              // a display's name is a device name
         case .window:
             guard let id = Self.windowID(from: selection.sourceID),
                   let window = content.windows.first(where: { $0.windowID == id }) else {
@@ -234,6 +288,9 @@ public final class ScreenCapture: NSObject {
             filter = SCContentFilter(desktopIndependentWindow: window)
             sourceSize = window.frame.size
             name = window.title ?? "Window"
+            logName = ScreenSourceInfo.logName(
+                kind: .window, name: name,
+                applicationName: window.owningApplication?.applicationName)
         }
 
         let size = Self.captureSize(source: sourceSize, within: outputFormat)
@@ -252,7 +309,8 @@ public final class ScreenCapture: NSObject {
             try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
             try await stream.startCapture()
         } catch {
-            fail(gen: gen, "PRISM could not capture \(name): \(error.localizedDescription)")
+            fail(gen: gen, "PRISM could not capture \(name): \(error.localizedDescription)",
+                 log: "PRISM could not capture \(logName): \(error.localizedDescription)")
             return
         }
         guard isCurrent(gen) else {
@@ -263,7 +321,63 @@ public final class ScreenCapture: NSObject {
         self.stream = stream
         streamLock.unlock()
         currentSourceName = name
+        currentSourceLogName = logName
         startRepeatTimer(frameRate: outputFormat.frameRate)
+    }
+
+    /// PRISM's own `SCRunningApplication`s, for the display filter.
+    ///
+    /// The on-screen snapshot lists an application only while it has a window
+    /// on screen, and a menu bar app sharing a display from a chord — with
+    /// its main window never opened and the menu bar itself hidden behind
+    /// somebody else's full-screen window — can have none. That is exactly
+    /// the launch this used to leak from, so the off-screen snapshot is the
+    /// fallback: one extra round trip at stream build against the risk of
+    /// compositing PRISM's own windows into the call.
+    private func ownApplications(in content: SCShareableContent) async
+        -> [SCRunningApplication] {
+        let bundleID = Bundle.main.bundleIdentifier
+        let own = Self.ownApplications(applications: content.applications,
+                                       windowOwners: content.windows.map(\.owningApplication),
+                                       bundleID: bundleID)
+        guard own.isEmpty else { return own }
+        guard let all = try? await SCShareableContent.excludingDesktopWindows(
+            false, onScreenWindowsOnly: false) else { return [] }
+        return Self.ownApplications(applications: all.applications,
+                                    windowOwners: all.windows.map(\.owningApplication),
+                                    bundleID: bundleID)
+    }
+
+    /// The exclusion rule itself, as a function of bundle identifier.
+    ///
+    /// Excluding by *application* rather than by a list of windows is the
+    /// whole of the guarantee. `SCShareableContent` is a snapshot taken when
+    /// the stream is built, and PRISM's windows are made lazily — the main
+    /// window on first open, the prompter pane inside it, the popover's
+    /// window on demand — while the filter is never rebuilt (a selection or
+    /// format change is what restarts the stream, not a window appearing).
+    /// A filter built from that snapshot therefore composites every PRISM
+    /// window opened afterwards into the outgoing camera, the pane holding
+    /// the user's script included. An application exclusion covers windows
+    /// that do not exist yet, which is the only version of this that is
+    /// actually true.
+    ///
+    /// Window owners are folded in because a content snapshot may list only
+    /// applications it already matched a window to; the two together mean
+    /// the exclusion is never empty for a reason that is not "PRISM is not
+    /// running".
+    static func ownApplications<App: ScreenCaptureApplication>(
+        applications: [App],
+        windowOwners: [App?],
+        bundleID: String?) -> [App] {
+        guard let bundleID, !bundleID.isEmpty else { return [] }
+        var seen = Set<pid_t>()
+        var result: [App] = []
+        for app in applications + windowOwners.compactMap({ $0 })
+        where app.bundleIdentifier == bundleID && seen.insert(app.processID).inserted {
+            result.append(app)
+        }
+        return result
     }
 
     private func takeStream() -> SCStream? {
@@ -277,15 +391,17 @@ public final class ScreenCapture: NSObject {
     /// One exit for every way a stream can fail to be, or stop being, a
     /// source. Marks the request dead so reconciliation can start a fresh
     /// one, and hands the sentence up.
-    private func fail(gen: UInt64, _ message: String) {
+    private func fail(gen: UInt64, _ message: String, log: String? = nil) {
         guard isCurrent(gen) else { return }
         stateLock.lock()
         _isRunning = false
         stateLock.unlock()
         currentSourceName = nil
+        currentSourceLogName = nil
         stopRepeatTimer()
+        let stop = ScreenCaptureStop(message: message, logMessage: log)
         if let onStopped {
-            DispatchQueue.main.async { onStopped(message) }
+            DispatchQueue.main.async { onStopped(stop) }
         }
     }
 
@@ -420,7 +536,9 @@ extension ScreenCapture: SCStreamOutput, SCStreamDelegate {
         let gen = generation
         stateLock.unlock()
         let name = currentSourceName ?? "That screen"
-        fail(gen: gen, "\(name) stopped sharing: \(error.localizedDescription)")
+        let logName = currentSourceLogName ?? "That screen"
+        fail(gen: gen, "\(name) stopped sharing: \(error.localizedDescription)",
+             log: "\(logName) stopped sharing: \(error.localizedDescription)")
     }
 
     private static func isComplete(_ sampleBuffer: CMSampleBuffer) -> Bool {

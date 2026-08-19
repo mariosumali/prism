@@ -40,7 +40,14 @@ in the repo — read them before writing code:
   `PresenceSettings` (§5.28); `isActive` is the demand gate for the detector
 - `PRISM/System/Hotkeys.swift` — `ShortcutAction`, `Hotkeys`
 - `PRISM/System/HotkeyBindings.swift` — `HotkeyBindings`, `ShortcutConflict` (§5.19)
-- `PRISM/System/SessionLog.swift` — `SessionEvent`, `SessionLog` (§5.21)
+- `PRISM/System/SessionLog.swift` — `SessionEvent`, `SessionLog` (§5.21).
+  Rows may name devices and applications; they may not name the contents of
+  anything, and specifically not a shared window's title — an export is a
+  file the user attaches to a support thread. `ScreenSourceInfo.logName` is
+  the redaction, and it is applied at the call site rather than by the log
+- `PRISM/Capture/AudioDelayLine.swift` — `AudioDelayLine`, the §5.12
+  circular PCM line. RT-safe, and `reset()` is the one that matters: it is
+  what makes going off air a complete forgetting
 - `PRISMKernels/KernelTypes.h` — kernel parameter structs (bridged to Swift)
 
 Language: Swift 5.9, macOS 13.0 deployment target. No Swift 6 concurrency
@@ -987,10 +994,14 @@ public final class ScreenCapture: NSObject {
     /// Called on the dedicated .userInteractive capture queue, exactly like
     /// CameraCapture.onFrame — and fed to the same pipeline entry point.
     public var onFrame: ((CVPixelBuffer, CMTime) -> Void)?
-    /// The source went away, or the stream could not be built. Main thread,
-    /// with a sentence the user may be shown verbatim.
-    public var onStopped: ((String) -> Void)?
+    /// The source went away, or the stream could not be built. Main thread.
+    /// Carries two sentences: `message`, which the user may be shown
+    /// verbatim and names the source, and `logMessage`, the same sentence
+    /// with a window's title replaced by its application — the §5.21 log is
+    /// exported to a file and a title is a document name.
+    public var onStopped: ((ScreenCaptureStop) -> Void)?
     public private(set) var currentSourceName: String?
+    public private(set) var currentSourceLogName: String?
     public var isRunning: Bool { get }
 
     /// Empty without the Screen Recording grant — enumerating would raise
@@ -1009,15 +1020,39 @@ public final class ScreenCapture: NSObject {
     /// dimensions, never scaled up.
     public static func captureSize(source: CGSize,
                                    within: VideoFormat) -> (width: Int, height: Int)
+    /// Which applications a display filter excludes: everything running
+    /// under `bundleID`, found in the content's application list or as the
+    /// owner of one of its windows. Generic over `ScreenCaptureApplication`
+    /// so the rule can be tested without a live SCK session.
+    static func ownApplications<App: ScreenCaptureApplication>(
+        applications: [App], windowOwners: [App?], bundleID: String?) -> [App]
+}
+
+public protocol ScreenCaptureApplication {
+    var bundleIdentifier: String { get }
+    var processID: pid_t { get }
+}
+
+public struct ScreenCaptureStop: Equatable {
+    public let message: String                     // shown to the user
+    public let logMessage: String                  // safe for an exported log
+    public init(message: String, logMessage: String? = nil)
 }
 ```
 
 Source ids are namespaced (`"display:1"`, `"window:1"`) because the window
-server numbers the two separately and they collide. PRISM's own windows are
-excluded from a display capture. Frames the stream reports as anything but
-`.complete` are skipped and the last real frame is re-sent at the configured
-rate — a still screen is still a screen, and a virtual camera with no frames
-is a placeholder (§3.2).
+server numbers the two separately and they collide. PRISM is excluded from a
+display capture **by application** — the `excludingApplications:` filter,
+never `excludingWindows:` — because the content is a snapshot taken when the
+stream is built and the filter is never rebuilt, so a window list excludes
+only the windows that existed then. PRISM
+makes its windows lazily (the main window on first open, the prompter pane
+inside it, the popover's window on demand), and every one of them would
+otherwise be composited into the outgoing camera. A build that cannot find
+PRISM in the content at all fails the stream rather than starting one with no
+exclusion. Frames the stream reports as anything but `.complete` are skipped
+and the last real frame is re-sent at the configured rate — a still screen is
+still a screen, and a virtual camera with no frames is a placeholder (§3.2).
 
 ### LiveFeeds (`PRISM/Media/LiveFeeds.swift`)
 
@@ -1053,6 +1088,11 @@ public final class AudioCapture {
     /// While clip audio owns the ring, live capture stands down.
     public var isSuppressed: Bool { get set }      // atomic flag
     public private(set) var effectiveBufferFrames: Int   // 256 requested (§4.4)
+    /// §5.12 deliberate delay, 0–10 s. Setting it to 0 does not merely stop
+    /// delaying: it empties the line, so a later engage starts from the
+    /// stall rather than from the previous session's audio.
+    public var delaySeconds: Double { get set }
+    public static let maxDelaySeconds: Double      // 10
     public var addedLatencyMs: Double { get }      // buffer/48k*1000 + ring estimate
                                                    // + voiceChanger.reportedLatencyMs
                                                    // + voiceCleanup.reportedLatencyMs (0)
@@ -1084,8 +1124,16 @@ Render callback: pull from HALOutput input scope, meter the raw slice
 (§5.17, ahead of mute so the level stays true while muted), convert to 48kHz
 stereo float interleaved (AudioConverter when needed), process through
 cleanup then the voice changer (§5.17 before §5.13; mono duplicated after),
-then `sink.write(...)`. **The callback body must be free of ObjC/Swift
-allocation; preallocate all conversion buffers in `start`.**
+then through the §5.12 delay line, then `sink.write(...)`. **The callback
+body must be free of ObjC/Swift allocation; preallocate all conversion
+buffers in `start`.**
+
+Going off air empties every buffer holding audio that has not been sent.
+Mute and clip suppression both take an early return, and the first slice
+back clears the voice chains' delay lines *and* resets `AudioDelayLine`
+(`PRISM/Capture/AudioDelayLine.swift`) — a line holding up to ten seconds of
+speech would otherwise put the seconds immediately before the mute on air at
+the unmute, which is the opposite of what muting means.
 
 ### VoiceChanger (`PRISM/Capture/VoiceChanger.swift`)
 

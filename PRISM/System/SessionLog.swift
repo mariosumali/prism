@@ -11,6 +11,13 @@
 // never written to disk unless the user exports it, never sent anywhere.
 // Quitting PRISM is how you delete it.
 //
+// And strictly unrevealing, because "unless the user exports it" is the
+// whole risk: an exported log is a plain-text file that gets attached to a
+// support thread. Rows may name devices and applications — what the pickers
+// already show — and may not name the *contents* of anything. A shared
+// window's title is a document name; callers redact it before it gets here
+// (`ScreenSourceInfo.logName`).
+//
 // Licensed under the Apache License, Version 2.0.
 
 import Foundation
@@ -152,9 +159,15 @@ public final class SessionLog: ObservableObject {
         // every drop since launch as if it had just happened.
     }
 
-    /// Plain text, produced only when the user picks Export. Nothing here
-    /// identifies a machine or a person beyond the device names the user
-    /// already sees in the Devices pane.
+    /// Plain text, produced only when the user picks Export.
+    ///
+    /// Nothing here identifies a machine or a person beyond the names of the
+    /// devices and applications the user already sees in the pickers — and
+    /// specifically not the title of a window they shared, which is a
+    /// document name or a browser tab and is the one thing in this app's
+    /// reach that would genuinely embarrass someone who attached the file to
+    /// a support thread. Callers name a window by its application
+    /// (`ScreenSourceInfo.logName`); the title never gets this far.
     public func exportText(now: Date = Date()) -> String {
         let stamp = DateFormatter()
         stamp.dateFormat = "HH:mm:ss"

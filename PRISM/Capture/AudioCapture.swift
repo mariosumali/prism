@@ -167,11 +167,13 @@ public final class AudioCapture {
 
     /// RT-private: set on the muted and suppressed early-outs, consumed just
     /// before the voice hook. While muted (or while clip audio owns the
-    /// ring) the voice chain does not run, so its delay lines freeze holding
-    /// pre-mute audio; clearing them on resume keeps a mute acoustically
-    /// clean in both directions — an unmute must never replay the echo tail
-    /// of the last thing said before the mute. Only the RT callback touches
-    /// this flag.
+    /// ring) neither the voice chain nor the deliberate delay line runs, so
+    /// their buffers freeze holding pre-mute audio; clearing them on resume
+    /// keeps a mute acoustically clean in both directions — an unmute must
+    /// never replay the echo tail of the last thing said before the mute,
+    /// and with the lag switch engaged that tail is seconds of speech the
+    /// user muted in order to keep off the call. Only the RT callback
+    /// touches this flag.
     private var voicePathInterrupted = false
 
     // MARK: Mic check tap (§5.13)
@@ -284,11 +286,11 @@ public final class AudioCapture {
     // here, while video is delayed by trailing the compressed rolling buffer
     // (§5.9). Preallocated in start(); the RT callback only indexes it.
 
-    /// Interleaved stereo, `delayCapacityFrames` frames. Allocated once.
-    private var delayData: UnsafeMutablePointer<Float>?
-    private var delayCapacityFrames = 0
-    /// Write cursor in frames, monotonic; wrapped on use.
-    private var delayWritten: UInt64 = 0
+    /// Interleaved stereo circular buffer, allocated once in start(). A
+    /// `let` for the same reason the voice chains are: the RT path may call
+    /// methods on a constant reference the class owns for its whole lifetime
+    /// without ARC traffic.
+    private let delayLine = AudioDelayLine()
     /// Target delay in frames. Same single-writer/lock-on-set-only discipline
     /// as isMuted: the setter serializes writers, the RT callback reads raw.
     private var _delayFrames = 0
@@ -562,22 +564,18 @@ public final class AudioCapture {
         // thrown — would mean swapping a pointer the RT callback is reading.
         // Sized with one extra slice of headroom so the read window can never
         // overlap the frames being written this callback.
-        delayCapacityFrames = Int(Self.maxDelaySeconds * 48_000) + Self.maxSliceFrames
-        delayData = UnsafeMutablePointer<Float>.allocate(capacity: delayCapacityFrames * 2)
-        delayData?.initialize(repeating: 0, count: delayCapacityFrames * 2)
-        delayWritten = 0
+        delayLine.allocate(maxDelayFrames: Int(Self.maxDelaySeconds * 48_000),
+                           headroomFrames: Self.maxSliceFrames)
     }
 
     private func freeBuffers() {
         renderData?.deallocate(); renderData = nil
         convertData?.deallocate(); convertData = nil
         stereoData?.deallocate(); stereoData = nil
-        delayData?.deallocate(); delayData = nil
+        delayLine.deallocate()
         renderCapacityBytes = 0
         convertCapacityFrames = 0
         stereoCapacityFrames = 0
-        delayCapacityFrames = 0
-        delayWritten = 0
     }
 
     // MARK: Real-time render path
@@ -691,6 +689,14 @@ public final class AudioCapture {
             // RT-safe: bounded memsets of preallocated buffers.
             voiceCleanup.clearDSPState()
             voiceChanger.clearDSPState()
+            // The §5.12 line is emptied by the same rule and for a sharper
+            // reason than the echo tails above. It carries up to ten seconds
+            // of speech that has not gone out yet, so a user who muted
+            // mid-sentence to say something private and unmuted afterwards
+            // would have exactly those seconds read out of the line and put
+            // on the call. Whatever was pending when we went off air is not
+            // ours to send once we are back.
+            delayLine.reset()
         }
         if clientChannels == 1 {
             voiceCleanup.processMono(samples, frameCount: frames)
@@ -734,57 +740,43 @@ public final class AudioCapture {
     private func rtEmit(ring: UnsafeMutablePointer<PRISMRingBuffer>,
                         samples: UnsafePointer<Float>,
                         frameCount: Int) {
-        let capacity = delayCapacityFrames
-        // Clamp against what the line actually has, leaving a slice of
-        // headroom so the read window never overlaps this callback's write.
-        let delay = min(_delayFrames, max(0, capacity - AudioCapture.maxSliceFrames))
-        guard delay > 0, let delayData, capacity > 0, frameCount <= capacity else {
+        let delay = delayLine.clampedDelayFrames(_delayFrames)
+        guard delay > 0, delayLine.canHold(frameCount: frameCount) else {
+            // Nothing is being delayed, so nothing may be left sitting in the
+            // line: releasing the lag switch sets the depth to zero, and a
+            // line that kept its cursor across the release would open the
+            // *next* engage with up to ten seconds recorded during the last
+            // one — minutes or hours stale by then. Emptying it here means an
+            // engage always starts from the stall, exactly as a first engage
+            // does.
+            delayLine.reset()
             PRISMRingBufferWrite(ring, samples, UInt32(frameCount))
             return
         }
-
-        // Append this slice to the circular buffer.
-        var cursor = Int(delayWritten % UInt64(capacity))
-        var remaining = frameCount
-        var source = samples
-        while remaining > 0 {
-            let chunk = min(remaining, capacity - cursor)
-            memcpy(delayData + cursor * 2, source,
-                   chunk * 2 * MemoryLayout<Float>.size)
-            cursor = (cursor + chunk) % capacity
-            source += chunk * 2
-            remaining -= chunk
+        let window = delayLine.push(samples, frameCount: frameCount, delayFrames: delay)
+        // The stall at the start of a delay: silence is the honest thing to
+        // send, and video does exactly the same by holding its engage frame.
+        if window.silenceFrames > 0 {
+            rtWriteSilence(ring: ring, frameCount: window.silenceFrames)
         }
-        delayWritten &+= UInt64(frameCount)
-
-        // Emit the slice sitting `delay` frames behind the new write cursor.
-        let start = Int64(delayWritten) - Int64(delay) - Int64(frameCount)
-        guard start >= 0 else {
-            // The line has not filled yet — this is the stall at the start of
-            // a delay, and silence is the honest thing to send. Video does
-            // exactly the same by holding its engage frame.
-            let missing = min(frameCount, Int(-start))
-            rtWriteSilence(ring: ring, frameCount: missing)
-            let rest = frameCount - missing
-            if rest > 0 {
-                rtWriteDelayed(ring: ring, from: 0, count: rest)
-            }
-            return
+        if window.frames > 0 {
+            rtWriteDelayed(ring: ring, from: window.start, count: window.frames)
         }
-        rtWriteDelayed(ring: ring, from: Int(start % Int64(capacity)), count: frameCount)
     }
 
     /// Writes `count` frames from the delay line starting at frame index
     /// `from`, split across the wrap point. RT-safe.
     private func rtWriteDelayed(ring: UnsafeMutablePointer<PRISMRingBuffer>,
                                 from: Int, count: Int) {
-        guard let delayData, delayCapacityFrames > 0 else { return }
+        let capacity = delayLine.capacityFrames
+        guard capacity > 0 else { return }
         var cursor = from
         var remaining = count
         while remaining > 0 {
-            let chunk = min(remaining, delayCapacityFrames - cursor)
-            PRISMRingBufferWrite(ring, delayData + cursor * 2, UInt32(chunk))
-            cursor = (cursor + chunk) % delayCapacityFrames
+            guard let base = delayLine.base(at: cursor) else { return }
+            let chunk = min(remaining, capacity - cursor)
+            PRISMRingBufferWrite(ring, base, UInt32(chunk))
+            cursor = (cursor + chunk) % capacity
             remaining -= chunk
         }
     }

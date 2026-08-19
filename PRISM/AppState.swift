@@ -649,8 +649,8 @@ public final class AppState: ObservableObject {
             pipeline.submitCameraFrame(buffer, at: time)
             draftRendererBox.get()?.submit(buffer)
         }
-        screenCapture.onStopped = { [weak self] message in
-            Task { @MainActor [weak self] in self?.handleScreenCaptureStopped(message) }
+        screenCapture.onStopped = { [weak self] stop in
+            Task { @MainActor [weak self] in self?.handleScreenCaptureStopped(stop) }
         }
         cameraCapture.onRuntimeError = { [weak self] message in
             Task { @MainActor [weak self] in
@@ -2553,7 +2553,7 @@ public final class AppState: ObservableObject {
         updatePresenceWatching()
         // §5.31: and there are no hands in a screen share either.
         updateGestureWatching()
-        sessionLog.record(.device, "Source: \(videoSourceName)")
+        sessionLog.record(.device, "Source: \(videoSourceLogName)")
         updateMenuBarState()
     }
 
@@ -2641,6 +2641,19 @@ public final class AppState: ObservableObject {
             ?? videoSource.kind.displayName
     }
 
+    /// The same name for the §5.21 session log, which the user exports as a
+    /// file and sends to strangers. A window's title is the document they
+    /// had open, so the log gets the application and not the title — see
+    /// `ScreenSourceInfo.logName`.
+    public var videoSourceLogName: String {
+        guard videoSource.kind != .camera else {
+            return cameraCapture.currentDeviceName ?? "Camera"
+        }
+        return screenSources.first { $0.id == videoSource.sourceID }?.logName
+            ?? screenCapture.currentSourceLogName
+            ?? videoSource.kind.displayName
+    }
+
     /// Returns whether a screen may be captured, asking for the grant the
     /// first time and pointing at System Settings after that. The prompt is
     /// only ever raised from here — that is, only from an intent the user
@@ -2673,11 +2686,13 @@ public final class AppState: ObservableObject {
     /// built. §3.2's placeholder rule is the precedent: never a black frame.
     /// The camera is the only source that exists without a grant, so it is
     /// where a lost screen lands.
-    private func handleScreenCaptureStopped(_ message: String) {
+    private func handleScreenCaptureStopped(_ stop: ScreenCaptureStop) {
+        let message = stop.message
         screenCaptureBlocked = true
         activeScreenRequest = nil
         pipeline?.liveFeeds.clear(.screen)
-        sessionLog.record(.device, message)
+        // The user is shown the window's own title; the log is not (§5.21).
+        sessionLog.record(.device, stop.logMessage)
         warning = WarningMessage(
             text: message,
             action: permissions.screenRecording == .granted

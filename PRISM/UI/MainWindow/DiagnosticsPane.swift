@@ -96,7 +96,9 @@ struct DiagnosticsPane: View {
                         .disabled(state.sessionLog.events.isEmpty)
                     Spacer()
                 }
-                Text("Kept in memory only, never sent anywhere, and gone when PRISM quits.")
+                Text("Kept in memory only, never sent anywhere, and gone when PRISM quits. "
+                     + "An export names devices and applications, never the title of a "
+                     + "window you shared.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

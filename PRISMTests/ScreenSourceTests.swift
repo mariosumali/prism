@@ -76,6 +76,54 @@ final class ScreenSourceTests: XCTestCase {
                        selection)
     }
 
+    // MARK: - Never filming ourselves (§5.24, §5.27)
+
+    /// Stands in for `SCRunningApplication`, which has no initializer.
+    private struct FakeApp: ScreenCaptureApplication, Equatable {
+        var bundleIdentifier: String
+        var processID: pid_t
+    }
+
+    private static let ownID = "horse.prism.PRISM"
+
+    /// The failure this exists to make unstateable: a display capture built
+    /// while PRISM had no window on screen used to exclude nothing, and the
+    /// user then opened the main window, typed their script into the
+    /// prompter pane, and sent it to the call. The exclusion is by
+    /// application precisely so it covers windows that do not exist yet —
+    /// so the rule must name PRISM off an empty window list.
+    func testTheDisplayExclusionNamesPrismWithNoPrismWindowOnScreen() {
+        let excluded = ScreenCapture.ownApplications(
+            applications: [FakeApp(bundleIdentifier: Self.ownID, processID: 501),
+                           FakeApp(bundleIdentifier: "us.zoom.xos", processID: 733)],
+            windowOwners: [],
+            bundleID: Self.ownID)
+        XCTAssertEqual(excluded, [FakeApp(bundleIdentifier: Self.ownID, processID: 501)],
+                       "PRISM is excluded whether or not it has a window right now")
+    }
+
+    /// A snapshot that lists only applications it already matched a window
+    /// to still has to yield PRISM, so the owners of the windows count too.
+    func testWindowOwnersCountTowardsTheExclusion() {
+        let own = FakeApp(bundleIdentifier: Self.ownID, processID: 501)
+        let excluded = ScreenCapture.ownApplications(
+            applications: [FakeApp(bundleIdentifier: "com.apple.Safari", processID: 90)],
+            windowOwners: [nil, own, own],
+            bundleID: Self.ownID)
+        XCTAssertEqual(excluded, [own], "one entry per process, however it was found")
+    }
+
+    /// Nothing to match on excludes nothing, which is what makes the empty
+    /// result meaningful: `build()` refuses to start a display capture on it
+    /// rather than starting one that films the prompter.
+    func testAnUnknownBundleIdentifierExcludesNothing() {
+        let apps = [FakeApp(bundleIdentifier: Self.ownID, processID: 501)]
+        XCTAssertTrue(ScreenCapture.ownApplications(
+            applications: apps, windowOwners: [], bundleID: nil).isEmpty)
+        XCTAssertTrue(ScreenCapture.ownApplications(
+            applications: apps, windowOwners: [], bundleID: "").isEmpty)
+    }
+
     // MARK: - Capture sizing
 
     /// Fitted, never filled: whatever is left over is OutputFitStage's to
