@@ -149,7 +149,7 @@ OSStatus PRISM_Device_EndIOOperation(UInt32 inOperationID,
 // Stream object property dispatch (PRISM_Stream.cpp)
 // ---------------------------------------------------------------------------
 
-// The single supported format: 48 kHz, 2 ch, 32-bit float, non-interleaved.
+// The single supported format: 48 kHz, 2 ch, 32-bit float, interleaved.
 AudioStreamBasicDescription PRISM_Stream_Format(void);
 
 Boolean  PRISM_Stream_HasProperty(const AudioObjectPropertyAddress* inAddress);

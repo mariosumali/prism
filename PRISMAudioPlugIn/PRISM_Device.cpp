@@ -757,10 +757,14 @@ OSStatus PRISM_Device_DoIOOperation(AudioObjectID inStreamObjectID,
     }
 
     for (UInt32 i = 0; i < frameCount; ++i) {
-        const int64_t rel = stBase + (int64_t)i;
+        // stBase is in samples; frame 0 of this cycle starts at sample stBase.
+        // The sample time for frame i is stBase + i*PRISM_CHANNELS.
+        // Convert to frame index by dividing by PRISM_CHANNELS.
+        const int64_t sampleTime = stBase + (int64_t)i * (int64_t)kPRISM_ChannelCount;
+        const int64_t frameTime = sampleTime / (int64_t)kPRISM_ChannelCount;
         const float* src = nullptr;
-        if (rel >= 0) {
-            const uint64_t pos = anchor + (uint64_t)rel;
+        if (frameTime >= 0) {
+            const uint64_t pos = anchor + (uint64_t)frameTime;
             if (pos >= lowBound && pos < wr) {
                 const uint32_t idx = (uint32_t)(pos & (PRISM_RING_CAPACITY - 1));
                 src = &gDevice_Ring->data[(size_t)idx * kPRISM_ChannelCount];
