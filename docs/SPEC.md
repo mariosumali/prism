@@ -484,7 +484,7 @@ The layer cap is a memory constraint, not a GPU one: each layer is one compute p
 
 Layers composite bottom-up in array order. Dropping an image or video onto the Scene pane adds it as a layer, the same affordance as dropping a `.cube` to import a LUT.
 
-A `.live` layer is the second running capture rather than a file — §5.25 is what it is for, and why it holds when the picture does.
+A `.live` layer is the second running capture rather than a file — §5.25 is what it is for, and why it holds when the picture does. A `.text` layer is a string rasterised by Core Text rather than a file — §5.26 is what it is for, why it is placed by pixel instead of fitted, and why it costs no decoder.
 
 **Face-anchored layers.** A layer pinned to `.face` rides the head instead of the frame: a hat above it, glasses on the eye line, a moustache under the nose, or a mask over the whole of it. It is driven by the shared `FaceTracker` (§3.3), which the overlay stage demands **only when a layer is actually face-anchored** — a frame-anchored lower third costs no Vision, however many of them there are, and removing the last face-anchored layer drops the demand again.
 
@@ -898,7 +898,7 @@ A display or a single window in place of the camera, so the thing you are talkin
 
 **The pick is stored as an id and re-resolved at launch.** A display id survives a reboot; a window id does not. `VideoSourceSelection` therefore persists the kind and the id and nothing else, and the app asks the window server whether the id still means anything before starting any capture against it. One that does not resolve reverts to the camera and says so in the session log — quietly, because this happens on every launch after a reboot for anyone who shared a window, and a warning that fires on a schedule is one people stop reading.
 
-**The capture is fitted, not filled.** A 6K display at native size is three `IOSurface` slots of roughly 100 MB each, to produce pixels `OutputFitStage` is about to throw away. The stream is configured at the largest size that fits inside the negotiated format with the source's own aspect preserved, so ScreenCaptureKit is never asked to pad — the letterboxing is decided once, by the same stage that decides it for every other source. PRISM's own windows are excluded from a display capture, because a preview of the capture cannot be in the capture.
+**The capture is fitted, not filled.** A 6K display at native size is three `IOSurface` slots of roughly 100 MB each, to produce pixels `OutputFitStage` is about to throw away. The stream is configured at the largest size that fits inside the negotiated format with the source's own aspect preserved, so ScreenCaptureKit is never asked to pad — the letterboxing is decided once, by the same stage that decides it for every other source. PRISM's own windows are excluded from a display capture, because a preview of the capture cannot be in the capture — which also takes the teleprompter panel out of PRISM's own screen source, on top of the system-wide exclusion §5.27 relies on.
 
 **The grant is demanded by the feature, not by the app.** Screen Recording is not requested at first launch: the feature ships off, and a permission dialog for something nobody has asked for is how an app loses that grant for good. Choosing a screen raises the prompt; until then the picker offers the camera and a sentence. The setup banner grows a fourth row exactly while something is asking for a screen (§9), and macOS applies the grant when PRISM is next opened — which the copy says, rather than leaving the user to wonder why the screen is still not on air.
 
@@ -923,6 +923,65 @@ You over your screen, or your screen over you.
 The snapshot is a copy rather than a retained reference. Capture pools are shallow — three slots for ScreenCaptureKit — and a freeze can last minutes; holding one of their buffers that long starves the session that owns it. The copy costs one private texture per held feed, paid only while held, which is the trade `FreezeStage` already makes for the same reason. A feed with nothing on screen when the hold engages stays empty: handing it the next frame that arrives would be the same failure one beat later.
 
 The decision is taken at the layers' own position in the chain walk, once every substituting stage has had its say. `ChainRegistrationTests` asserts that the substituting set is complete and that every member of it runs before `.overlay` — a stage added later that replaces the picture and forgets to join the set would be exactly the bug this paragraph exists to prevent, and it would not show up until it happened on someone's call.
+
+### 5.26 Text layers and lower thirds
+
+Words in the picture: a caption, a handle, or a name banner in two fields.
+
+| Property | Specification |
+|---|---|
+| Mechanism | a `.text` overlay layer (§5.8), through `prism_overlay` |
+| Rasteriser | Core Text → `CGBitmapContext` → `MTLTexture` (`TextRasterizer`) |
+| Content | a line and an optional second line (`OverlayTextStyle`) |
+| Style | family, size, weight, colour, alignment, plate, padding |
+| Plates | none, a solid rounded slab, or a blurred halo |
+| Size | points at 1080p, scaled by the frame's own height |
+| Cost | one rasterisation per change; one compute pass per frame |
+| Cap | a total slot, never a `maxVideoLayers` slot — text has no decoder |
+| Default | off; no layer exists until one is added |
+
+**It is not a stage.** `prism_overlay` already places, rotates, mirrors, fades and depth-gates a layer against the person mask, and it already honours a PNG's alpha. A caption is a bitmap with alpha. So text arrives as a layer and inherits all of it — including standing *behind* the subject, which is how a caption ends up painted on the wall you are sitting in front of. The kernel is unchanged and does not know text exists.
+
+**The cache is the design.** Laying out and drawing a paragraph costs milliseconds, and §3.4 budgets the entire chain in single digits — a rasterisation on the frame path would blow the budget on the frame it happened, and this app does not drop frames to preserve an effect. So the bitmap is redrawn only when the string, the style, or the pixel size it will occupy actually changes, and even then on a private queue. The frame queue asks for a texture and takes whatever is currently drawn: a brand-new caption is invisible for a frame or two, and a caption being retyped keeps showing its previous spelling rather than blinking on every keystroke. A caption that arrives one frame late is invisible. A frame that arrives one frame late is not.
+
+**Placement is by pixel, not by fit.** Every other layer kind is *fitted* into the frame at scale 1, aspect preserved. Text is the one exception, and it has to be: the rasteriser has already sized the caption for this exact frame, so fitting it would blow two words up to the width of the picture and make the point size mean nothing. A text layer is placed at its own pixel size instead. That is also what makes the size honest across formats — the point size is quoted at 1080p and scaled by the frame's own height, so the same preset draws the same fraction of the picture at 720p and at 4K.
+
+**Alignment pins an edge.** The canvas is tight to the words, so it grows as they are typed. Anchoring its *centre* would slide a name banner sideways with every letter — so for text, alignment decides which edge the horizontal offset holds: leading pins the left, trailing the right, centre keeps the centre. A lower third therefore grows rightward from a fixed left margin, which is what a lower third does. Inside the canvas the same setting is the paragraph alignment, so the two meanings agree.
+
+**Straight alpha, and no dark rim.** The kernel mixes the layer's RGB into the base by its alpha, exactly as it does for a PNG, so the bitmap is un-premultiplied after drawing. Fully transparent pixels are then *coloured* rather than left at zero, because the kernel samples bilinearly and a transparent black neighbour would drag a dark halo around every glyph on the way out.
+
+**The blurred plate is a halo, not frosted glass.** Frosted glass means sampling the base twice with a blur between, inside a kernel every layer in the app shares — a text-only branch through `prism_overlay` would be paid for by hats and green screens forever. A soft halo hugging the letterforms is what actually buys legibility over a busy picture, it is baked into the layer's own alpha, and it costs nothing at composite time.
+
+**A lower third is a preset shape, not a second feature.** It is a text layer with the plate, the alignment, the size and the height already decided, so setting one up is typing a name and a job. Everything underneath is the same generic layer, and every knob stays reachable.
+
+**A caption pays a total slot and never a video one.** The five-layer cap is about compute passes and the three-video cap is about decoders (§5.8). Text has no decoder — that is precisely why the total was allowed above three — and the canvas is bounded at 94% of the frame in each axis so a pasted essay cannot allocate a texture larger than the picture it is drawn into.
+
+### 5.27 Teleprompter
+
+Your script, on your screen, where nobody else can read it.
+
+| Property | Specification |
+|---|---|
+| Mechanism | a floating `NSPanel` over the user's own desktop — **not** a layer |
+| Capture | `sharingType = .none`: excluded from every screen recorder, system-wide |
+| Trigger | the Prompter section, the Prompter pane, and ⌃⌥⌘T |
+| Controls | speed in lines per minute, size, opacity, mirrored, start / hold / top |
+| Position | dragged; opens at top, middle or bottom of the display |
+| Persistence | in `StudioSettings`, never in a preset; the open state is never restored |
+| Default | off |
+
+**A prompter is for the person reading it.** Drawn into the outgoing frame it would be a prompter everyone on the call can read, which is not a feature. So it is a panel on the reader's own screen, positioned by them next to their lens — which is exactly what makes it compose with eye contact (§5.6): read from just under the camera and the correction closes the last few degrees. Nothing on the frame path knows the prompter exists. `PrompterSettings` lives in `StudioSettings`, no stage reads it, and there is no code path from a script to a texture.
+
+**Screen sharing cannot capture it either, and that is the harder half.** Somebody prompting is very likely also sharing a screen, and PRISM cannot ask Zoom to leave a window out. `sharingType = .none` takes the panel out of the window server's capture surface entirely: Zoom, Teams, QuickTime, ScreenCaptureKit and PRISM's own screen source all receive the desktop with a prompter-shaped hole in it, because the refusal is made below all of them. PRISM's display capture already excludes every window PRISM owns (§5.24), so the one screen source this app does control refuses it twice.
+
+**The chord holds the script; it does not dismiss it.** ⌃⌥⌘T opens the panel if it is closed and otherwise runs or holds the scroll, because the thing worth reaching for mid-sentence is "stop, I've lost my place" — never "make it go away". Putting the prompter away is a click on a panel you are already looking at, or the switch in either surface. Rebinding follows §5.19 like every other chord.
+
+**Lines a minute, not pixels a second.** The scroll rate is derived from the font's own line height, so changing the size changes how much fits on the panel and not how fast the reader is being pushed. The script comes to rest with its last line a third of the way up rather than scrolling away into an empty panel, and editing the script returns the reader to the top — a position measured in lines means nothing once the lines have changed.
+
+**Nothing about it opens itself.** PRISM launches at login for most people; a panel that restored last week's script over whatever they actually sat down to do would be a private document appearing with no visible cause. The words are persisted, the decision to show them is not. The script is also not part of any preset — switching from Meeting to Studio changes a look, and it must never load somebody else's words onto the screen.
+
+**The panel stays out of the way.** Non-activating and floating, so clicking it does not pull focus off the call in front of it and it stays visible over a full-screen meeting window on any space. Its controls — hold, back to the top, close — appear only under the pointer, because this thing sits in the reader's eyeline while they are on camera and a permanent row of buttons there is a row of buttons everyone watches them look at. Mirroring flips the words, not the panel, for a beam-splitter rig where the script is read off glass in front of the lens.
+
 
 ---
 

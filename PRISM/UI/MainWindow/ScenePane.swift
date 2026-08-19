@@ -185,13 +185,23 @@ struct ScenePane: View {
                 }
                 .disabled(state.editingConfig.overlay.layers.count
                           >= OverlaySettings.maxLayers)
+                // A menu rather than two more buttons: a lower third is a
+                // text layer that has already answered its own questions
+                // (§5.26), so the two belong under one word.
+                Menu("Add text") {
+                    Button("Plain text") { state.addTextLayer() }
+                    Button("Lower third") { state.addLowerThird() }
+                }
+                .fixedSize()
+                .disabled(state.editingConfig.overlay.layers.count
+                          >= OverlaySettings.maxLayers)
                 Button("Add layer…") { chooseLayer() }
                     .disabled(state.editingConfig.overlay.layers.count
                               >= OverlaySettings.maxLayers)
             }
 
             if state.editingConfig.overlay.layers.isEmpty {
-                Text("Drop an image or video anywhere on this pane, or use Add layer. A PNG with alpha composites as-is; a green-screen clip gets keyed. Put a layer behind you and you are standing in front of it, or pin it to your face and it rides along — a hat above your head, glasses on the eye line, a moustache under your nose. The other button puts whichever feed is not on air into the corner of the one that is.")
+                Text("Drop an image or video anywhere on this pane, or use Add layer. A PNG with alpha composites as-is; a green-screen clip gets keyed. Put a layer behind you and you are standing in front of it, or pin it to your face and it rides along — a hat above your head, glasses on the eye line, a moustache under your nose. Add text writes straight into the picture — a caption, or a name banner in two fields. The other button puts whichever feed is not on air into the corner of the one that is.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
@@ -320,6 +330,9 @@ private struct LayerEditor: View {
                 if layer.sourceKind == .live {
                     liveFeedControls
                 }
+                if layer.sourceKind == .text {
+                    textControls
+                }
                 Picker("Placement", selection: binding(\.placement)) {
                     ForEach(LayerPlacement.allCases, id: \.self) { placement in
                         Text(placement.displayName).tag(placement)
@@ -327,34 +340,39 @@ private struct LayerEditor: View {
                 }
                 .pickerStyle(.segmented)
 
-                Picker("Key", selection: binding(\.keyMode)) {
-                    ForEach(KeyMode.allCases, id: \.self) { mode in
-                        Text(mode.displayName).tag(mode)
+                // Text arrives with real alpha from the rasteriser, so there
+                // is nothing to key — and a chroma key over antialiased
+                // glyphs would eat their edges.
+                if layer.sourceKind != .text {
+                    Picker("Key", selection: binding(\.keyMode)) {
+                        ForEach(KeyMode.allCases, id: \.self) { mode in
+                            Text(mode.displayName).tag(mode)
+                        }
                     }
-                }
-                .pickerStyle(.segmented)
+                    .pickerStyle(.segmented)
 
-                switch layer.keyMode {
-                case .none:
-                    Text("Composited using the file's own alpha channel.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                case .chroma:
-                    ColorPicker("Key colour", selection: keyColorBinding, supportsOpacity: false)
-                    PrismSliderRow(label: "Similarity", value: binding(\.similarity),
-                                   range: 0...1, defaultValue: 0.2, fractionDigits: 2)
-                    PrismSliderRow(label: "Softness", value: binding(\.smoothness),
-                                   range: 0.001...1, defaultValue: 0.1, fractionDigits: 2)
-                    PrismSliderRow(label: "Despill", value: binding(\.spill),
-                                   range: 0...1, defaultValue: 0.5, fractionDigits: 2)
-                    Text("Despill pulls what is left of the key colour out of the edges, so a green screen stops tinting your hair.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                case .luma:
-                    PrismSliderRow(label: "Black point", value: binding(\.lumaLow),
-                                   range: 0...1, defaultValue: 0.05, fractionDigits: 2)
-                    PrismSliderRow(label: "White point", value: binding(\.lumaHigh),
-                                   range: 0.001...1, defaultValue: 0.25, fractionDigits: 2)
+                    switch layer.keyMode {
+                    case .none:
+                        Text("Composited using the file's own alpha channel.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    case .chroma:
+                        ColorPicker("Key colour", selection: keyColorBinding, supportsOpacity: false)
+                        PrismSliderRow(label: "Similarity", value: binding(\.similarity),
+                                       range: 0...1, defaultValue: 0.2, fractionDigits: 2)
+                        PrismSliderRow(label: "Softness", value: binding(\.smoothness),
+                                       range: 0.001...1, defaultValue: 0.1, fractionDigits: 2)
+                        PrismSliderRow(label: "Despill", value: binding(\.spill),
+                                       range: 0...1, defaultValue: 0.5, fractionDigits: 2)
+                        Text("Despill pulls what is left of the key colour out of the edges, so a green screen stops tinting your hair.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    case .luma:
+                        PrismSliderRow(label: "Black point", value: binding(\.lumaLow),
+                                       range: 0...1, defaultValue: 0.05, fractionDigits: 2)
+                        PrismSliderRow(label: "White point", value: binding(\.lumaHigh),
+                                       range: 0.001...1, defaultValue: 0.25, fractionDigits: 2)
+                    }
                 }
 
                 Divider()
@@ -410,7 +428,7 @@ private struct LayerEditor: View {
                     .accessibilityLabel("\(layer.name) enabled")
                 Image(systemName: Self.symbol(for: layer.sourceKind))
                     .foregroundStyle(.secondary)
-                Text(layer.name)
+                Text(rowTitle)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer()
@@ -423,6 +441,17 @@ private struct LayerEditor: View {
         }
     }
 
+    /// A file layer is named after its file; a text layer has no file, so it
+    /// is named after what it says — otherwise two captions in a list would
+    /// both read "Text".
+    private var rowTitle: String {
+        guard layer.sourceKind == .text else { return layer.name }
+        let said = layer.text.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !said.isEmpty { return said }
+        let subtitle = layer.text.subtitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        return subtitle.isEmpty ? layer.name : subtitle
+    }
+
     private static func symbol(for kind: LayerSourceKind) -> String {
         switch kind {
         case .image: return "photo"
@@ -431,6 +460,88 @@ private struct LayerEditor: View {
         case .live: return "pip"
         }
     }
+
+    /// §5.26 — what a text layer says and how it is set. Two fields lead,
+    /// because a name banner is a name and a job, and the rest of the panel
+    /// is styling somebody may never open.
+    @ViewBuilder
+    private var textControls: some View {
+        TextField("Text", text: textBinding(\.string), axis: .vertical)
+            .lineLimit(1...4)
+            .accessibilityLabel("Layer text")
+        TextField("Second line", text: textBinding(\.subtitle))
+            .accessibilityLabel("Layer subtitle")
+
+        PrismSliderRow(label: "Size", value: textBinding(\.fontSize),
+                       range: 12...160, defaultValue: 48,
+                       fractionDigits: 0, unit: " pt", snap: 1)
+        Text("Points at 1080p. The same number is the same fraction of the picture at every format, so a caption does not change size when the output does.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+
+        Picker("Typeface", selection: textBinding(\.fontFamily)) {
+            Text("System").tag("")
+            ForEach(Self.fontFamilies, id: \.self) { family in
+                Text(family).tag(family)
+            }
+        }
+        Picker("Weight", selection: textBinding(\.weight)) {
+            ForEach(OverlayTextWeight.allCases, id: \.self) { weight in
+                Text(weight.displayName).tag(weight)
+            }
+        }
+        .pickerStyle(.segmented)
+        ColorPicker("Colour", selection: textColorBinding, supportsOpacity: false)
+
+        Picker("Aligned", selection: textBinding(\.alignment)) {
+            ForEach(OverlayTextAlignment.allCases, id: \.self) { alignment in
+                Text(alignment.displayName).tag(alignment)
+            }
+        }
+        .pickerStyle(.segmented)
+        Text("Alignment pins that edge of the text where Horizontal puts it, so a name banner grows to the right as you type instead of sliding across the frame.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+
+        Picker("Plate", selection: textBinding(\.plate)) {
+            ForEach(TextPlate.allCases, id: \.self) { plate in
+                Text(plate.displayName).tag(plate)
+            }
+        }
+        .pickerStyle(.segmented)
+        if layer.text.plate != .none {
+            ColorPicker("Plate colour", selection: plateColorBinding, supportsOpacity: false)
+            PrismSliderRow(label: "Plate", value: textBinding(\.plateOpacity),
+                           range: 0...1, defaultValue: 0.6, fractionDigits: 2)
+        }
+        if layer.text.plate == .solid {
+            PrismSliderRow(label: "Padding", value: textBinding(\.padding),
+                           range: 0...2, defaultValue: 0.35, fractionDigits: 2)
+        }
+        Text(plateCaption)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var plateCaption: String {
+        switch layer.text.plate {
+        case .none:
+            return "Bare glyphs. Legible over a plain wall and not much else."
+        case .solid:
+            return "A slab behind the words. The broadcast answer, and the one that survives any background."
+        case .blur:
+            return "A soft halo hugging the letters, so they stay readable over a busy picture without a rectangle in the way."
+        }
+    }
+
+    /// Every family installed on this machine. A preset carries the name
+    /// rather than the font, so one that travels to a Mac without it falls
+    /// back to the system face instead of failing the layer.
+    private static let fontFamilies: [String] =
+        NSFontManager.shared.availableFontFamilies.sorted()
 
     /// §5.25 — what a live layer is looking at, and which screen that means.
     /// The feed picker is here rather than beside the source picker because
@@ -506,6 +617,47 @@ private struct LayerEditor: View {
             },
             set: { value in
                 state.updateOverlayLayer(layer.id) { $0[keyPath: keyPath] = value }
+            })
+    }
+
+    private func textBinding<Value>(
+        _ keyPath: WritableKeyPath<OverlayTextStyle, Value>
+    ) -> Binding<Value> {
+        Binding(
+            get: {
+                state.editingConfig.overlay.layers
+                    .first { $0.id == layer.id }?.text[keyPath: keyPath]
+                    ?? layer.text[keyPath: keyPath]
+            },
+            set: { value in
+                state.updateOverlayText(layer.id) { $0[keyPath: keyPath] = value }
+            })
+    }
+
+    private var textColorBinding: Binding<Color> {
+        textColorBinding(\.color, fallback: RGBColor(red: 1, green: 1, blue: 1))
+    }
+
+    private var plateColorBinding: Binding<Color> {
+        textColorBinding(\.plateColor, fallback: .prismSlate)
+    }
+
+    private func textColorBinding(
+        _ keyPath: WritableKeyPath<OverlayTextStyle, RGBColor>,
+        fallback: RGBColor
+    ) -> Binding<Color> {
+        let value = textBinding(keyPath)
+        return Binding(
+            get: {
+                let rgb = value.wrappedValue
+                return Color(red: rgb.red, green: rgb.green, blue: rgb.blue)
+            },
+            set: { color in
+                let components = NSColor(color).usingColorSpace(.sRGB)
+                value.wrappedValue = RGBColor(
+                    red: components.map { Double($0.redComponent) } ?? fallback.red,
+                    green: components.map { Double($0.greenComponent) } ?? fallback.green,
+                    blue: components.map { Double($0.blueComponent) } ?? fallback.blue)
             })
     }
 

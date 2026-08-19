@@ -1,10 +1,17 @@
 // LayerSource.swift
 // PRISM
 //
-// A file on disk as a Metal texture, per frame: a still image loaded once, or
-// a video decoded on a loop. Backs both the virtual background (§5.7) and
-// every green-screen overlay layer (§5.8), which need exactly the same thing
-// and differ only in what they composite it against.
+// One layer's pixels as a Metal texture, per frame: a still image loaded
+// once, a video decoded on a loop, or a string rasterised by Core Text
+// (§5.26). Backs both the virtual background (§5.7) and every green-screen
+// overlay layer (§5.8), which need exactly the same thing and differ only in
+// what they composite it against.
+//
+// Text arrives through this door rather than beside it deliberately. The
+// overlay stage already keeps one source per layer id, reconciles them when
+// settings change, and releases them when a layer is removed; a caption that
+// carried its own parallel lifetime would be a second copy of all of that,
+// and the first thing to fall out of step.
 //
 // This is deliberately not ClipPlayer. ClipPlayer owns transport (play,
 // pause, scrub, position publishing), routes audio into the shared ring, and
@@ -341,6 +348,7 @@ final class LayerSource {
     private let metal: MetalContext
     private let loader: MTKTextureLoader
     private let video: LoopingVideoSource
+    private let text: TextRasterizer
     private let lock = NSLock()
 
     // lock-guarded
@@ -353,12 +361,18 @@ final class LayerSource {
         self.metal = metal
         loader = MTKTextureLoader(device: metal.device)
         video = LoopingVideoSource(metal: metal, label: label)
+        text = TextRasterizer(metal: metal, label: label)
     }
 
     /// Main-thread configuration. Passing nil unloads. Keyed on (url, kind)
     /// so re-applying an unchanged configuration — which happens on every
-    /// slider drag — never restarts a running video.
-    func configure(url: URL?, kind: LayerSourceKind) {
+    /// slider drag — never restarts a running video. The style is handed on
+    /// unconditionally because the rasteriser keys on it in the same way,
+    /// and only a text layer has one worth reacting to.
+    func configure(url: URL?, kind: LayerSourceKind,
+                   style: OverlayTextStyle = OverlayTextStyle()) {
+        text.configure(kind == .text ? style : OverlayTextStyle())
+
         lock.lock()
         guard url != currentURL || kind != currentKind else {
             lock.unlock()
@@ -378,9 +392,9 @@ final class LayerSource {
         case .video:
             _ = video.load(url: url)
         case .text, .live:
-            // Not file-backed: a text layer is rasterised from its style and a
-            // live layer comes from a running capture session, so this source
-            // holds nothing for them and reports no texture.
+            // Not file-backed: a text layer is drawn from its style and a
+            // live layer comes from a running capture session, so neither
+            // has a URL to open here.
             break
         }
     }
@@ -389,8 +403,10 @@ final class LayerSource {
         video.setDemandActive(active)
     }
 
-    /// Frame-queue entry point.
-    func currentTexture(at hostTime: CMTime) -> MTLTexture? {
+    /// Frame-queue entry point. `frameSize` is the picture the layer is about
+    /// to be composited into, in pixels — the size a text layer rasterises
+    /// against, and ignored by every other kind.
+    func currentTexture(at hostTime: CMTime, frameSize: CGSize = .zero) -> MTLTexture? {
         lock.lock()
         let kind = currentKind
         let texture = imageTexture
@@ -398,7 +414,8 @@ final class LayerSource {
         switch kind {
         case .image: return texture
         case .video: return video.currentTexture(at: hostTime)
-        case .text, .live, nil: return nil
+        case .text: return text.texture(frameSize: frameSize)
+        case .live, nil: return nil
         }
     }
 
@@ -411,7 +428,8 @@ final class LayerSource {
         switch kind {
         case .image: return size
         case .video: return video.contentSize
-        case .text, .live, nil: return nil
+        case .text: return text.contentSize
+        case .live, nil: return nil
         }
     }
 

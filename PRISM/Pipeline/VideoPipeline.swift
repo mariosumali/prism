@@ -785,7 +785,10 @@ public final class VideoPipeline {
         let visionDecision = vision.beginFrame()
         // The face is measured pre-Geometry and the layers land post-Geometry,
         // so the overlay stage needs this frame's crop to put a prop back on
-        // the head it was measured on.
+        // the head it was measured on. The working resolution goes with it:
+        // a caption is quoted in points and has to be drawn against the
+        // picture it will land in (§5.26).
+        overlayStage.frameSize = CGSize(width: source.width, height: source.height)
         overlayStage.faceSpaceTransform = geometryStage.appliedUVTransform(
             inputSize: CGSize(width: source.width, height: source.height))
         for stage in userStages {

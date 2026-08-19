@@ -565,18 +565,23 @@ entire loop before the first frame returned — a gigabyte of 1080p frames.
 
 ### LayerSource (`PRISM/Media/LayerSource.swift`)
 
-A file on disk as a Metal texture, per frame — a still loaded once or a
-video decoded on a loop. Backs both the virtual background and every overlay
-layer. Deliberately not ClipPlayer: no transport, no audio, and a 4-frame
-decode-ahead rather than 30, because a scene can hold a background plus
-three overlay layers and resident memory is the binding constraint (§7).
+One layer's pixels as a Metal texture, per frame — a still loaded once, a
+video decoded on a loop, or a string rasterised by Core Text (§5.26). Backs
+both the virtual background and every overlay layer. Deliberately not
+ClipPlayer: no transport, no audio, and a 4-frame decode-ahead rather than
+30, because a scene can hold a background plus three overlay layers and
+resident memory is the binding constraint (§7).
 
 ```swift
 final class LayerSource {
     init(metal: MetalContext, label: String)
-    func configure(url: URL?, kind: LayerSourceKind)   // main thread; keyed on (url, kind)
+    // main thread; keyed on (url, kind), and the style is forwarded to the
+    // rasteriser, which keys on it the same way
+    func configure(url: URL?, kind: LayerSourceKind, style: OverlayTextStyle = .init())
     func setDemandActive(_ active: Bool)
-    func currentTexture(at hostTime: CMTime) -> MTLTexture?   // frame queue only
+    // frame queue only; frameSize is what a `.text` layer rasterises against
+    // and is ignored by every other kind
+    func currentTexture(at hostTime: CMTime, frameSize: CGSize = .zero) -> MTLTexture?
     var contentSize: CGSize? { get }
 }
 ```
@@ -584,6 +589,47 @@ final class LayerSource {
 Reloading is keyed on `(url, kind)` so re-applying an unchanged
 configuration — which happens on every slider drag — never restarts a
 running video layer.
+
+Text arrives through this door rather than beside it: the overlay stage
+already keeps one source per layer id, reconciles them on settings changes
+and releases them on removal, and a caption with its own parallel lifetime
+would be a second copy of all of that.
+
+### TextRasterizer (`PRISM/Media/TextRasterizer.swift`)
+
+A string as a Metal texture (§5.26): Core Text lays out, a
+`CGBitmapContext` draws, and `prism_overlay` composites the result like any
+other layer. The kernel is unmodified and does not know text exists.
+
+```swift
+final class TextRasterizer {
+    static let referenceHeight: CGFloat            // 1080 — where fontSize is quoted
+    static let maxWidthFraction: CGFloat           // 0.94 of the frame
+    static let maxHeightFraction: CGFloat          // 0.94 of the frame
+    init(metal: MetalContext, label: String)
+    func configure(_ style: OverlayTextStyle)              // main thread; drops no-ops
+    func texture(frameSize: CGSize) -> MTLTexture?         // frame queue only; never blocks
+    var contentSize: CGSize? { get }
+    struct Layout { canvas, padding, cornerRadius, haloRadius, text, textRect,
+                    haloColor, haloAlpha, fringe }
+    static func layout(style: OverlayTextStyle, frameSize: CGSize) -> Layout
+    static func render(style: OverlayTextStyle, frameSize: CGSize,
+                       device: MTLDevice) -> MTLTexture?   // nil for empty text or a zero frame
+}
+```
+
+`texture(frameSize:)` returns whatever is currently drawn and schedules a
+redraw on a private queue when the string, the style or the pixel size has
+changed — it never rasterises on the frame queue, because a paragraph costs
+milliseconds against a §3.4 budget measured in single digits, and PRISM does
+not drop frames to preserve an effect. A brand-new caption is therefore
+invisible for a frame or two, and one being retyped keeps its previous
+spelling rather than blinking per keystroke.
+
+The bitmap is un-premultiplied before upload, because the kernel mixes RGB
+into the base by alpha exactly as it does for a PNG; fully transparent pixels
+are coloured rather than cleared, so bilinear sampling has no black to bleed
+into the glyph edges.
 
 ### FormatManager (`PRISM/Pipeline/FormatManager.swift`)
 
@@ -1154,7 +1200,16 @@ public final class OverlayStage: EffectStage {      // id .overlay, cost .modera
     /// is built in the tracker's space and composed with this, so a prop
     /// survives zoom, pan, rotation, mirror and auto-framing exactly.
     public var faceSpaceTransform: simd_float3x3
+    /// §5.26. The picture about to be composited into, in pixels, pushed once
+    /// per frame beside the transform above. Read in wantsEncode(), before
+    /// any destination texture exists, because a caption quoted in points has
+    /// to be rasterised against the frame it will land in.
+    public var frameSize: CGSize
     public func setDemandActive(_ active: Bool)
+    /// Fitted, aspect preserved, at scale 1 — except for `.text`, which is
+    /// placed at its own pixel size (the rasteriser already sized it for this
+    /// frame) and whose `alignment` pins an edge rather than the centre, so a
+    /// name banner grows sideways instead of sliding (§5.26).
     static func placement(layer: OverlayLayer, contentSize: CGSize,
                           outputSize: CGSize) -> simd_float3x3
     /// §5.8. Span is the face box width × scale (size 1 = as wide as the
@@ -1492,6 +1547,10 @@ public final class AppState: ObservableObject {
     public func updateOverlayLayer(_ id: UUID, _ mutate: (inout OverlayLayer) -> Void)
     public func removeOverlayLayer(_ id: UUID)
     public func moveOverlayLayers(fromOffsets: IndexSet, toOffset: Int)
+    // Text layers (§5.26)
+    public func addTextLayer()                         // a caption, seeded so it draws
+    public func addLowerThird()                        // the name banner, as two fields
+    public func updateOverlayText(_ id: UUID, _ mutate: (inout OverlayTextStyle) -> Void)
     // Moments (§5.9–§5.11)
     public func startReplay()
     public func stopReplay()
@@ -1559,11 +1618,27 @@ public final class AppState: ObservableObject {
     public func cancelCountdown()
     public func setCaptureFolder(_ url: URL?)              // nil = ~/Movies/PRISM
     public func dismissNotice()
-    // Reached by ⌥⌘D / ⌃⌥⌘T. Each says, in the warning row, that it is not
-    // built yet: a global chord that no-ops silently is indistinguishable
-    // from PRISM having died.
-    public func toggleScreenSource()
+    public func toggleScreenSource()                       // ⌥⌘D
+    // Teleprompter (§5.27). Nothing here reaches a stage: the script is a
+    // floating panel over the user's own desktop, never a layer.
+    /// Installed by the app delegate, which owns the panel — AppState may not
+    /// reference the UI layer (PRISMTests excludes UI/**).
+    public var prompterPanelHandler: ((Bool) -> Void)?
+    @Published public private(set) var prompterRunning: Bool      // transient
+    @Published public private(set) var prompterResetToken: Int    // bumped → back to line one
+    /// ⌃⌥⌘T. Opens the panel if closed, otherwise runs or holds the scroll:
+    /// the chord you reach for mid-sentence is "stop", never "dismiss".
     public func togglePrompter()
+    public func setPrompterEnabled(_ enabled: Bool)        // the one show/hide path
+    public func startPrompter()                            // no-op without a script
+    public func stopPrompter()
+    public func resetPrompter()
+    public func setPrompterScript(_ script: String)        // editing returns to the top
+    public func setPrompterSpeed(_ linesPerMinute: Double)
+    public func setPrompterFontSize(_ points: Double)
+    public func setPrompterOpacity(_ opacity: Double)
+    public func setPrompterMirrored(_ mirrored: Bool)
+    public func setPrompterAnchor(_ anchor: PrompterAnchor)
     // Control surface (§5.19, §5.20)
     @Published public var hotkeyBindings: HotkeyBindings
     @Published public var externalControlEnabled: Bool      // default off
@@ -1633,6 +1708,19 @@ intent announced.
   Shortcuts pane and the Settings General tab so the two cannot disagree.
 - `MainWindow/ShortcutsPane.swift`, `MainWindow/DiagnosticsPane.swift` —
   §5.19/§5.20 and §5.21 respectively.
+- `PrompterSection.swift` / `MainWindow/PrompterPane.swift` — §5.27. The
+  dropdown carries show / start / top, which are the controls you want while
+  you are talking; the pane carries the script, speed, size, opacity, the
+  mirrored mode and the standing sentence that nobody else can see any of it.
+- `PrompterPanel.swift` — `PrompterPanelController` (an `NSPanel`, owned by
+  the app delegate and created on first use so it remembers where it was
+  dragged) plus `PrompterPanelView`. Non-activating, floating, on all spaces,
+  chrome-free, controls only under the pointer. `sharingType = .none` is the
+  load-bearing line: the window server refuses these pixels to every screen
+  recorder, including other apps' screen shares and PRISM's own screen source
+  (§5.24 already excludes PRISM-owned windows as well). Closing the panel
+  calls `setPrompterEnabled(false)`, so the panel and the switch cannot
+  disagree.
 - `MenuBarIcon.swift` — maps `MenuBarState` → glyph. Uses asset PDFs
   `PrismOutline` / `PrismFilled` (template) with overlay badges; falls back
   to SF Symbols if assets missing.
@@ -1641,7 +1729,10 @@ intent announced.
 
 `@main struct PRISMApp: App` — `MenuBarExtra` (`.window` style) hosting
 `PopoverView`, `Settings` scene hosting `SettingsView`, app delegate
-adaptor for lifecycle (start AppState, register login item, hotkeys).
+adaptor for lifecycle (start AppState, register login item, hotkeys). The
+delegate also owns the two AppKit windows AppState can only reach through a
+closure: `MainWindowController` (`openMainWindowHandler`) and
+`PrompterPanelController` (`prompterPanelHandler`, §5.27).
 
 ---
 

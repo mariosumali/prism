@@ -319,6 +319,19 @@ public final class AppState: ObservableObject {
     /// Installed by the app delegate at launch; AppState cannot reference the
     /// window controller directly (the UI layer is excluded from PRISMTests).
     public var openMainWindowHandler: (() -> Void)?
+    /// §5.27 — puts the teleprompter panel on screen, or takes it away. Same
+    /// arrangement as the main window, for the same reason: the panel is an
+    /// NSPanel the app delegate owns, and nothing in the tested half of the
+    /// app is allowed to know it exists.
+    public var prompterPanelHandler: ((Bool) -> Void)?
+    /// §5.27 — the script is scrolling. Deliberately transient: a prompter
+    /// that resumed by itself on the next launch would start reading over
+    /// whatever the user opened PRISM to do.
+    @Published public private(set) var prompterRunning = false
+    /// Bumped to send the panel's scroll back to the first line. A token
+    /// rather than a position because the position lives in the panel, where
+    /// the font metrics that define it are.
+    @Published public private(set) var prompterResetToken = 0
 
     public var previewTextureProvider: (() -> MTLTexture?) = { nil }
     public var draftPreviewTextureProvider: (() -> MTLTexture?) = { nil }
@@ -1608,6 +1621,66 @@ public final class AppState: ObservableObject {
         }
     }
 
+    // MARK: - Intents: text layers (§5.26)
+
+    /// A caption, centred, at the size the style quotes. Seeded with a word
+    /// rather than left blank: an empty text layer draws nothing at all
+    /// (`isRenderable`), so a new one would appear in the list and change
+    /// nothing on air, which is the one thing a control must never do.
+    public func addTextLayer() {
+        var style = OverlayTextStyle()
+        style.string = "Text"
+        style.plate = .blur
+        addTextLayer(named: "Text", style: style, offsetY: 0)
+    }
+
+    /// §5.26 — the name banner, as two fields. Everything else about it is
+    /// decided here, because "lower third" already names the plate, the
+    /// alignment and the height; asking someone to rebuild that out of a
+    /// generic layer every time is asking them to do the app's job.
+    public func addLowerThird() {
+        var style = OverlayTextStyle()
+        style.string = "Your Name"
+        style.subtitle = "What you do"
+        style.plate = .solid
+        style.alignment = .leading
+        style.fontSize = 44
+        // Left edge a twentieth of the way in, and the plate sitting in the
+        // lower third of the frame — which is what the name means.
+        addTextLayer(named: "Lower third", style: style,
+                     offsetX: -0.9, offsetY: 0.55)
+    }
+
+    private func addTextLayer(named name: String,
+                              style: OverlayTextStyle,
+                              offsetX: Double = 0,
+                              offsetY: Double) {
+        guard editingConfig.overlay.layers.count < OverlaySettings.maxLayers else {
+            warning = WarningMessage(
+                text: "PRISM composites up to \(OverlaySettings.maxLayers) layers at once")
+            return
+        }
+        // No key: the rasteriser hands the compositor real alpha, and a
+        // chroma key over antialiased glyphs would eat their edges.
+        let layer = OverlayLayer(name: name,
+                                 sourceKind: .text,
+                                 keyMode: .none,
+                                 offsetX: offsetX,
+                                 offsetY: offsetY,
+                                 text: style)
+        updateEditing { cfg in
+            cfg.overlay.layers.append(layer)
+            var flags = cfg.flags(for: .overlay)
+            flags.enabled = true
+            cfg.flags[.overlay] = flags
+        }
+    }
+
+    public func updateOverlayText(_ id: UUID,
+                                  _ mutate: (inout OverlayTextStyle) -> Void) {
+        updateOverlayLayer(id) { mutate(&$0.text) }
+    }
+
     // MARK: - Intents: instant replay (§5.9)
 
     /// Rewinds to the start of the rolling buffer and plays forward at the
@@ -2464,10 +2537,88 @@ public final class AppState: ObservableObject {
         selectVideoSource(.camera)
     }
 
-    // MARK: - Intents: prompter
+    // MARK: - Intents: prompter (§5.27)
 
+    /// ⌃⌥⌘T. Opens the panel if it is closed, and otherwise runs or holds the
+    /// scroll — because the thing you need a chord for is the one you reach
+    /// for mid-sentence, and that is "stop, I've lost my place", never
+    /// "dismiss". Putting the prompter away is a click on a panel you are
+    /// already looking at.
     public func togglePrompter() {
-        warning = WarningMessage(text: "The prompter isn't built yet.")
+        guard studio.prompter.isEnabled else {
+            setPrompterEnabled(true)
+            return
+        }
+        if prompterRunning {
+            stopPrompter()
+        } else {
+            startPrompter()
+        }
+    }
+
+    /// The one place the panel appears and disappears. Turning it on rewinds
+    /// to the first line and starts reading; turning it off stops the scroll
+    /// so a prompter reopened later never resumes mid-paragraph into a
+    /// meeting that has moved on.
+    ///
+    /// Deliberately absent from the session log (§5.21): that history answers
+    /// "what could the other people see", and the answer here is nothing.
+    public func setPrompterEnabled(_ enabled: Bool) {
+        guard enabled != studio.prompter.isEnabled else { return }
+        studio.prompter.isEnabled = enabled
+        if enabled {
+            resetPrompter()
+            if studio.prompter.isActive { startPrompter() }
+        } else {
+            stopPrompter()
+            resetPrompter()
+        }
+        prompterPanelHandler?(enabled)
+    }
+
+    public func startPrompter() {
+        guard studio.prompter.isActive, !prompterRunning else { return }
+        prompterRunning = true
+    }
+
+    public func stopPrompter() {
+        guard prompterRunning else { return }
+        prompterRunning = false
+    }
+
+    public func resetPrompter() {
+        prompterResetToken &+= 1
+    }
+
+    /// Editing the script puts the reader back at the top. A scroll position
+    /// measured in lines means nothing once the lines have changed, and
+    /// landing mid-sentence in a script you have just rewritten is worse than
+    /// starting over.
+    public func setPrompterScript(_ script: String) {
+        guard script != studio.prompter.script else { return }
+        studio.prompter.script = script
+        resetPrompter()
+        if !studio.prompter.isActive { stopPrompter() }
+    }
+
+    public func setPrompterSpeed(_ linesPerMinute: Double) {
+        studio.prompter.speed = linesPerMinute
+    }
+
+    public func setPrompterFontSize(_ points: Double) {
+        studio.prompter.fontSize = points
+    }
+
+    public func setPrompterOpacity(_ opacity: Double) {
+        studio.prompter.opacity = opacity
+    }
+
+    public func setPrompterMirrored(_ mirrored: Bool) {
+        studio.prompter.isMirrored = mirrored
+    }
+
+    public func setPrompterAnchor(_ anchor: PrompterAnchor) {
+        studio.prompter.anchor = anchor
     }
 
     // MARK: - Intents: app rules

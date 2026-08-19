@@ -112,16 +112,8 @@ struct PopoverView: View {
     private static let metaModules: Set<PopoverModule> = [.preview, .status,
                                                           .latencyMeter, .inUse]
 
-    /// Modules whose section does not exist yet. They are listed in the Menu
-    /// Bar pane — hiding them there would hide that the row is coming, and
-    /// reorder it under the user later — but the dropdown skips them, because
-    /// a row that renders nothing still costs a section gap and two blank
-    /// bands read as a broken popover. Delete an entry the moment its section
-    /// draws anything.
-    private static let unbuiltModules: Set<PopoverModule> = [.prompter]
-
     private var moduleRows: [ModuleRow] {
-        let visible = state.visiblePopoverModules.filter { !Self.unbuiltModules.contains($0) }
+        let visible = state.visiblePopoverModules
         var rows: [ModuleRow] = []
         var index = 0
         while index < visible.count {

@@ -214,6 +214,7 @@ final class DraftRenderer {
         var segmentationDone = false
         var faceTrackingDone = false
         let visionDecision = vision.beginFrame()
+        overlayStage.frameSize = CGSize(width: source.width, height: source.height)
         overlayStage.faceSpaceTransform = geometryStage.appliedUVTransform(
             inputSize: CGSize(width: source.width, height: source.height))
         for stage in userStages {

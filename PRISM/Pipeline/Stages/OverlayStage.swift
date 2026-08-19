@@ -2,10 +2,10 @@
 // PRISM
 //
 // Green-screen compositing (§5.8, .moderate): a handful of placed, keyed
-// layers over the finished frame. Each layer is an image or a looping video
-// with an optional chroma or luma key, placed with scale/offset/rotation/
-// mirror, and composited either in front of everything or behind the subject
-// (using the shared person mask).
+// layers over the finished frame. Each layer is an image, a looping video, a
+// live feed or a rasterised caption (§5.26), with an optional chroma or luma
+// key, placed with scale/offset/rotation/mirror, and composited either in
+// front of everything or behind the subject (using the shared person mask).
 //
 // This is the stage that turns PRISM from a camera filter into a stage.
 // An animated hat, a fire border, a lower third, a picture-in-picture of a
@@ -61,6 +61,15 @@ public final class OverlayStage: EffectStage {
     /// the face in camera space and whatever the camera transform does to the
     /// face it does to the prop.
     public var faceSpaceTransform: simd_float3x3 = matrix_identity_float3x3
+
+    /// The picture this stage is about to composite into, in pixels, pushed
+    /// by the pipeline each frame alongside the transform above.
+    ///
+    /// Only text layers read it, and they read it in `wantsEncode()` — before
+    /// any destination texture exists — because a caption quoted in points
+    /// has to be rasterised against the frame it will land in, or the same
+    /// preset would draw a different size of text at 720p and at 4K (§5.26).
+    public var frameSize: CGSize = .zero
 
     private let metal: MetalContext
     private let overlayPipeline: MTLComputePipelineState
@@ -159,8 +168,9 @@ public final class OverlayStage: EffectStage {
 
     /// Where a layer's pixels come from this frame. A file-backed layer has
     /// its own decoder; a live one is looking at a capture session that
-    /// already exists, which is exactly why it costs no decoder and no cap
-    /// slot of the tighter kind (§5.8).
+    /// already exists, and a text one at a bitmap that was drawn once — which
+    /// is exactly why neither costs a decoder or a cap slot of the tighter
+    /// kind (§5.8).
     ///
     /// A live layer asking for the feed that is already driving the pipeline
     /// gets nothing, because nothing is published for it: a picture-in-
@@ -170,7 +180,8 @@ public final class OverlayStage: EffectStage {
             guard let feed = layer.liveFeed else { return nil }
             return liveFeeds?.texture(for: feed)
         }
-        return source(for: layer.id)?.currentTexture(at: hostTime)
+        return source(for: layer.id)?.currentTexture(at: hostTime,
+                                                     frameSize: frameSize)
     }
 
     /// A face-anchored layer needs a pose to hang off. Below the ramp's floor
@@ -299,6 +310,14 @@ public final class OverlayStage: EffectStage {
     /// own aspect preserved, so dropping in a square PNG gives a square, not
     /// a stretched rectangle. Rotation is applied in an aspect-corrected
     /// space so a rotated layer does not shear.
+    ///
+    /// Text is the one exception, and it has to be: a text layer's texture is
+    /// already exactly as big as the caption should be in this frame (§5.26),
+    /// so fitting it would blow two words up to the width of the picture and
+    /// make the point size mean nothing. It is placed at its own pixel size
+    /// instead, and its alignment pins an edge rather than the centre —
+    /// otherwise a name banner would creep sideways with every letter typed
+    /// into it, because the canvas grows around the words.
     static func placement(layer: OverlayLayer,
                           contentSize: CGSize,
                           outputSize: CGSize) -> simd_float3x3 {
@@ -311,14 +330,24 @@ public final class OverlayStage: EffectStage {
         let ratio = contentAspect / frameAspect
 
         let scale = Float(min(max(layer.scale, 0.05), 4))
-        // Fit, then scale.
-        var span = ratio >= 1
-            ? SIMD2<Float>(1, 1 / ratio)
-            : SIMD2<Float>(ratio, 1)
+        let isText = layer.sourceKind == .text
+        // Fit (or take the natural size), then scale.
+        var span = isText
+            ? SIMD2<Float>(Float(contentSize.width / outputSize.width),
+                           Float(contentSize.height / outputSize.height))
+            : (ratio >= 1 ? SIMD2<Float>(1, 1 / ratio) : SIMD2<Float>(ratio, 1))
         span *= scale
         span = SIMD2<Float>(max(span.x, 1e-4), max(span.y, 1e-4))
 
-        let center = SIMD2<Float>(0.5 + Float(min(max(layer.offsetX, -1), 1)) * 0.5,
+        var centerX = 0.5 + Float(min(max(layer.offsetX, -1), 1)) * 0.5
+        if isText {
+            switch layer.text.alignment {
+            case .leading: centerX += span.x * 0.5
+            case .trailing: centerX -= span.x * 0.5
+            case .center: break
+            }
+        }
+        let center = SIMD2<Float>(centerX,
                                   0.5 + Float(min(max(layer.offsetY, -1), 1)) * 0.5)
         return transform(center: center, span: span, radians: layerRadians(layer),
                          mirrored: layer.mirrored, frameAspect: frameAspect)
@@ -464,7 +493,7 @@ public final class OverlayStage: EffectStage {
     private func reconcileSources(previous: OverlaySettings) {
         let live = settings.mediaLayers
         var kept = Set<UUID>()
-        var toConfigure: [(LayerSource, URL?, LayerSourceKind)] = []
+        var toConfigure: [(LayerSource, URL?, LayerSourceKind, OverlayTextStyle)] = []
 
         sourcesLock.lock()
         for layer in live {
@@ -478,7 +507,7 @@ public final class OverlayStage: EffectStage {
                 sources[layer.id] = source
             }
             toConfigure.append((source, layer.isEnabled ? layer.assetURL : nil,
-                                layer.sourceKind))
+                                layer.sourceKind, layer.text))
         }
         // Dropping a source releases its decoder and frame FIFO.
         for id in sources.keys where !kept.contains(id) {
@@ -488,8 +517,8 @@ public final class OverlayStage: EffectStage {
 
         // Opening media is slow; do it outside the lock so the frame queue is
         // never blocked behind a file read.
-        for (source, url, kind) in toConfigure {
-            source.configure(url: url, kind: kind)
+        for (source, url, kind, style) in toConfigure {
+            source.configure(url: url, kind: kind, style: style)
         }
         _ = previous
     }

@@ -48,6 +48,9 @@ final class PRISMAppDelegate: NSObject, NSApplicationDelegate {
     @MainActor static var pendingState: AppState?
     /// Created lazily on first open and kept for the process lifetime.
     @MainActor private var mainWindowController: MainWindowController?
+    /// §5.27 — created the first time the prompter is asked for and kept
+    /// afterwards, so the panel remembers where the user dragged it.
+    @MainActor private var prompterPanelController: PrompterPanelController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Task { @MainActor in
@@ -60,6 +63,18 @@ final class PRISMAppDelegate: NSObject, NSApplicationDelegate {
                     self.mainWindowController = MainWindowController(state: state)
                 }
                 self.mainWindowController?.show()
+            }
+            state.prompterPanelHandler = { [weak self, weak state] visible in
+                guard let self else { return }
+                guard visible else {
+                    self.prompterPanelController?.hide()
+                    return
+                }
+                guard let state else { return }
+                if self.prompterPanelController == nil {
+                    self.prompterPanelController = PrompterPanelController(state: state)
+                }
+                self.prompterPanelController?.show()
             }
             state.start()
         }
