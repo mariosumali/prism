@@ -100,7 +100,7 @@ struct VoicePane: View {
                     state.toggleVoice()
                 }
                 Spacer()
-                Text("⌃⌥⌘V")
+                Text(state.shortcutLabel(.voice))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

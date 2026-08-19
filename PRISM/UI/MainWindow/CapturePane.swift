@@ -33,7 +33,7 @@ struct CapturePane: View {
                 Button("Save now") { state.saveLastSeconds() }
                     .disabled(!state.studio.replay.isArmed)
                 Spacer()
-                Text("⌥⌘S")
+                Text(state.shortcutLabel(.saveClip))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -86,7 +86,7 @@ struct CapturePane: View {
                     state.takeSnapshot()
                 }
                 Spacer()
-                Text("⌥⌘⇧S")
+                Text(state.shortcutLabel(.snapshot))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

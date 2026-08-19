@@ -782,7 +782,7 @@ public struct Preset: Codable, Equatable, Identifiable {
 }
 
 /// A global hotkey: Carbon-style keycode plus modifier flags.
-public struct HotkeyCombo: Codable, Equatable {
+public struct HotkeyCombo: Codable, Equatable, Hashable {
     public var keyCode: UInt16
     public var option: Bool
     public var command: Bool
@@ -798,6 +798,20 @@ public struct HotkeyCombo: Codable, Equatable {
         self.control = control
     }
 
+    /// The modifiers tolerate absence; the keycode deliberately does not.
+    /// A combo defaulting its keycode would silently become ⌥⌘A — binding a
+    /// user to a chord they never chose is worse than dropping the binding
+    /// and falling back to the default, which is what a throw here does at
+    /// the enclosing tolerant level.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        keyCode = try c.decode(UInt16.self, forKey: .keyCode)
+        option = c.tolerant(.option, false)
+        command = c.tolerant(.command, false)
+        shift = c.tolerant(.shift, false)
+        control = c.tolerant(.control, false)
+    }
+
     public var displayString: String {
         var s = ""
         if control { s += "⌃" }
@@ -806,26 +820,5 @@ public struct HotkeyCombo: Codable, Equatable {
         if command { s += "⌘" }
         s += KeyCodeNames.name(for: keyCode)
         return s
-    }
-}
-
-public enum KeyCodeNames {
-    public static func name(for keyCode: UInt16) -> String {
-        switch keyCode {
-        case 0: return "A"; case 1: return "S"; case 2: return "D"
-        case 3: return "F"; case 4: return "H"; case 5: return "G"
-        case 6: return "Z"; case 7: return "X"; case 8: return "C"
-        case 9: return "V"; case 11: return "B"; case 12: return "Q"
-        case 13: return "W"; case 14: return "E"; case 15: return "R"
-        case 16: return "Y"; case 17: return "T"; case 32: return "U"
-        case 31: return "O"; case 34: return "I"; case 35: return "P"
-        case 37: return "L"; case 38: return "J"; case 40: return "K"
-        case 45: return "N"; case 46: return "M"
-        case 18: return "1"; case 19: return "2"; case 20: return "3"
-        case 21: return "4"; case 23: return "5"; case 22: return "6"
-        case 26: return "7"; case 28: return "8"; case 25: return "9"
-        case 29: return "0"
-        default: return "key\(keyCode)"
-        }
     }
 }

@@ -76,12 +76,17 @@ PRISM/
 │   │   ├── FormatSection.swift     # resolution, fps, framing
 │   │   ├── LatencyMeter.swift      # live readout + per-stage breakdown
 │   │   ├── PresetBar.swift
+│   │   ├── HotkeyRecorder.swift    # chord recorder + shared list, §5.19
 │   │   ├── OnboardingView.swift
 │   │   └── DesignSystem.swift      # tokens, §8.1
 │   ├── System/
 │   │   ├── ExtensionInstaller.swift  # OSSystemExtensionManager
 │   │   ├── LoginItem.swift           # SMAppService
-│   │   ├── Hotkeys.swift             # CGEventTap
+│   │   ├── Hotkeys.swift             # CGEventTap, ShortcutAction + defaults
+│   │   ├── HotkeyBindings.swift      # the user's rebindings, §5.19
+│   │   ├── KeyCodeNames.swift        # keycode → glyph via the active layout
+│   │   ├── PrismIntents.swift        # App Intents, §5.20
+│   │   ├── SessionLog.swift          # in-memory session history, §5.21
 │   │   └── Permissions.swift         # AVCaptureDevice authorization
 │   └── Resources/
 │       ├── Assets.xcassets
@@ -741,6 +746,58 @@ An ordered list of rules, each naming one app by signing ID and optionally a pre
 - Removing PRISM removes the embedded extension, and every block with it.
 
 Rules live in `AppRulesSettings`, inside `StudioSettings` rather than in a preset: a preset captures a look, and "Zoom gets the Meeting look" is a rule *about* presets. A preset that carried rules could apply itself. The full editor lives in the main window's Apps pane (§8.3 puts deeper controls in the roomier surface); the consequences — which preset a rule chose, and who is being refused — appear in both surfaces.
+### 5.19 Keyboard shortcuts
+
+Every action in the table below is bindable; the defaults are the chords §5.2–§5.16 document.
+
+| Property | Specification |
+|---|---|
+| Actions | `ShortcutAction` (Hotkeys.swift), all fourteen: freeze, mute, freeze and mute, instant replay, away loop, panic, eye contact, lag switch, bad connection, voice changer, save the last seconds, take a still, share a screen, prompter |
+| Editing | Shortcuts pane (main window) and Settings → General, both built from one `ShortcutsList`; a recorder captures the real key-down |
+| Rules | A binding needs ⌥ or ⌃; function keys may stand alone; a modifier key alone is never a binding |
+| Conflicts | A chord has one owner. Assigning one that is taken takes it, leaves the previous owner unbound, and says so in the warning row |
+| Reset | Per row and globally; a reset is an assignment and goes through the same conflict check |
+| Storage | `HotkeyBindings` (HotkeyBindings.swift) under `PRISM.hotkeys`, string-keyed and tolerant per field |
+
+**⌥ or ⌃, because PRISM never swallows the keystroke.** The tap is listen-only (§5.2), so a ⌘-only or bare-key binding would fire PRISM's action *and* whatever the front app does with that chord — freeze the camera while quitting Pages. ⌥ and ⌃ chords are rare in menus, and function keys type nothing at all, so those are the two shapes a global binding may take.
+
+**Stealing beats refusing.** Refusing a taken chord leaves the user to hunt for the owner; allowing a duplicate leaves two actions on one chord with match order deciding which fires. Taking it, naming the loser, and leaving "Reset all" one click away is the only option where the keyboard's state is always legible. Preset chords (§5.5) are in the same namespace and checked the same way — they go through the same tap.
+
+**Keys are named through the active layout.** `KeyCodeNames` resolves a keycode with `UCKeyTranslate` against `TISCopyCurrentKeyboardLayoutInputSource`, falling back to the ASCII-capable source when an input method has no layout data, and caches per layout with the cache dropped on `kTISNotifySelectedKeyboardInputSourceChanged`. Layout-independent keys (function keys, arrows, the editing block, the keypad) come from a fixed table so they read the way macOS menus print them; an ANSI table is the last resort for contexts where no layout is available at all. Bindings are recorded rather than picked from a list, so naming the key back correctly is the whole contract: a fixed 26-entry table names A–Z on a US layout and prints `key57` for everything else.
+
+**Recording stops the tap.** Otherwise binding a key to Panic panics while you bind it.
+
+### 5.20 External control
+
+Local hardware — a Stream Deck, a Focus filter, a Shortcuts automation — can drive PRISM through App Intents. Off by default (`PRISM.externalControl`).
+
+| Property | Specification |
+|---|---|
+| Mechanism | App Intents (`PrismIntents.swift`); no `AppShortcutsProvider`, so no Siri phrases |
+| Verbs | Freeze, mute, panic, away loop, instant replay, eye contact, voice changer, background blur, apply preset — each on/off/toggle |
+| Gate | Every invocation checks the master switch and fails with what to turn on |
+| Returns | Confirmation only. No intent returns video, audio, frames, buffer contents, or the session log |
+
+**A URL scheme was rejected.** `open prism://panic` from any local process — any script, any page that can talk someone into a click — is an unauthenticated RPC endpoint into a camera. For an app whose entire trust argument is that it phones nobody, an unauthenticated local endpoint is worse than a telemetry ping. App Intents run through the system's own permission and attribution machinery, and the user opts in once.
+
+**What is not exposed is the specification.** No device selection ("switch to the other camera" is a surveillance verb). No published-format change — that is a reconnect boundary that would drop every client mid-call (§3.2). No clip, LUT, background or overlay loading, which would make an automation a file-read primitive aimed at an arbitrary path. No quit, which would take the virtual camera down under a live call. Nothing that edits the shortcut table or this switch, so an automation can never widen its own surface. And no Siri phrases, because "Hey Siri, panic" is a phrase meetings say out loud.
+
+### 5.21 Session diagnostics
+
+PRISM already computes every auto-disable, every device change, every dropped frame and every per-stage GPU cost, and then discards them. The Diagnostics pane keeps them for the life of the process so "why did my effects turn off?" has an answer after the warning row has moved on.
+
+| Property | Specification |
+|---|---|
+| Contents | Degradation events (§3.4), device arrivals/removals and capture failures, dropped-frame bursts, client apps starting and stopping, format changes, and every change of what clients can see (the §8.2 glyph) |
+| Numbers | Session duration, dropped frames, added latency now and at its peak, per-stage GPU cost now and at its peak |
+| Storage | `SessionLog`, in memory, 300 rows, consecutive repeats coalesced with a count |
+| Export | Plain text, written only when the user picks Export |
+
+**Recording is not optional, because the point is the past tense.** A default-off history answers the question it exists for with "we didn't record that". What makes it safe is not a switch but the storage: a bounded array in this process, no file, no network, gone when PRISM quits.
+
+**Repeats coalesce rather than scroll.** A camera that reconnects forty times is one story; forty rows would push the auto-disable that actually explains the session off the end of a bounded list.
+
+**The menu bar glyph is the recording point for what is on air.** It already summarises freeze, mute, panic, away, replay, lag and bad connection with the right precedence, and it changes exactly when that answer changes — so one call there beats a call at every intent.
 
 ---
 
@@ -973,7 +1030,7 @@ actually hiding a room.
 Height fits content up to the visible screen height, then scrolls. A dropdown
 whose bottom is off the display is worse than one that scrolls.
 
-**Progressive disclosure is what keeps this from reading as a control panel.** Default state on first launch: preview, status, tiles, and presets expanded; Framing, Effects, and Format collapsed. A user who only wants freeze and mute never sees a slider. A user who wants to rebuild their camera has everything one disclosure away. Deeper controls — pan, crop aspect, orientation, per-adjustment sliders, published format set editing, hotkey bindings — live in Settings, not the popover.
+**Progressive disclosure is what keeps this from reading as a control panel.** Default state on first launch: preview, status, tiles, and presets expanded; Framing, Effects, and Format collapsed. A user who only wants freeze and mute never sees a slider. A user who wants to rebuild their camera has everything one disclosure away. Deeper controls — pan, crop aspect, orientation, per-adjustment sliders, published format set editing, shortcut binding (§5.19), external control (§5.20), session diagnostics (§5.21) — live in Settings and the main window, not the popover. None of the three is a live control over the picture, so none of them is worth a row in a dropdown you open to freeze your camera.
 
 Every slider has a discrete numeric field beside it. Option-drag gives fine adjustment; double-click resets to default.
 

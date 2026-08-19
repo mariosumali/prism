@@ -19,6 +19,9 @@ in the repo — read them before writing code:
   `StageStatus`, `PopoverSection`
 - `PRISM/Pipeline/Settings/AppRuleSettings.swift` — `AppAccess`, `AppRule`,
   `AppRulesSettings`, `AppRuleMatch`, `AppRuleResolver`, `AccessPolicy` (§5.18)
+- `PRISM/System/Hotkeys.swift` — `ShortcutAction`, `Hotkeys`
+- `PRISM/System/HotkeyBindings.swift` — `HotkeyBindings`, `ShortcutConflict` (§5.19)
+- `PRISM/System/SessionLog.swift` — `SessionEvent`, `SessionLog` (§5.21)
 - `PRISMKernels/KernelTypes.h` — kernel parameter structs (bridged to Swift)
 
 Language: Swift 5.9, macOS 13.0 deployment target. No Swift 6 concurrency
@@ -1023,28 +1026,81 @@ public enum LoginItem {
 
 /// Every global chord PRISM owns, as one table: the binding is data, so
 /// matching is a lookup and rebinding is possible at all.
-public enum ShortcutAction: String, Codable, CaseIterable {
+public enum ShortcutAction: String, Codable, CaseIterable, Identifiable {
     case freeze, mute, freezeAndMute       // ⌥⌘F, ⌥⌘M, ⌥⌘⇧F
     case replay, away, panic               // ⌥⌘R, ⌥⌘A, ⌥⌘P
     case eyeContact, lag, badConnection    // ⌥⌘E, ⌥⌘L, ⌥⌘B
     case voice                             // ⌃⌥⌘V (§5.13)
     case saveClip, snapshot                // ⌥⌘S, ⌥⌘⇧S
     case screenSource, prompter            // ⌥⌘D, ⌃⌥⌘T
+    /// Defaults, not constants — §5.19 lets the user rebind every one.
     public var defaultCombo: HotkeyCombo { get }
     public var displayName: String { get }
+    public var isMomentary: Bool { get }             // .lag only
 }
 
 public final class Hotkeys {
+    /// A bound chord went down (§5.19). Hotkeys knows nothing about meaning.
     public var onAction: ((ShortcutAction) -> Void)?
-    /// Releases, reported only for actions that are held rather than
-    /// toggled — today only `.lag` (§5.12), matched on the *bound* keycode.
+    /// Fires only for `isMomentary` actions — §5.12's lag switch, the one
+    /// chord whose key release is observed. Matched on the *bound* keycode.
     public var onActionRelease: ((ShortcutAction) -> Void)?
     public var onPreset: ((UUID) -> Void)?
-    /// Actions absent from the map keep their default combo.
+    /// Taken as given: an action the user unbound is absent, and it stays
+    /// absent — no back-filling with defaults (§5.19).
     public func setBindings(_ bindings: [ShortcutAction: HotkeyCombo])
     public func setPresetBindings(_ bindings: [(UUID, HotkeyCombo)])
     public func start()   // CGEventTap listen-only; NSEvent global monitor fallback
     public func stop()
+}
+
+/// The user's deviations from those defaults (§5.19), persisted whole under
+/// `PRISM.hotkeys`. String-keyed so an action a build has never heard of
+/// survives a downgrade instead of being deleted on the next save.
+public struct HotkeyBindings: Codable, Equatable {
+    public func combo(for action: ShortcutAction) -> HotkeyCombo?   // nil = unbound
+    public func isDefault(_ action: ShortcutAction) -> Bool
+    public var isDefaultEverywhere: Bool { get }
+    public var resolved: [ShortcutAction: HotkeyCombo] { get }
+    public mutating func set(_ combo: HotkeyCombo?, for action: ShortcutAction)
+    public mutating func reset(_ action: ShortcutAction)
+    public mutating func resetAll()
+    public func conflict(for combo: HotkeyCombo,
+                         excluding action: ShortcutAction?) -> ShortcutAction?
+    /// ⌥ or ⌃ required; bare function keys allowed; modifier keys never.
+    public static func isBindable(_ combo: HotkeyCombo) -> Bool
+}
+
+/// Which existing binding a candidate chord would take (§5.19). Presets are
+/// in the same namespace — they go through the same tap.
+public enum ShortcutConflict: Equatable {
+    case action(ShortcutAction)
+    case preset(id: UUID, name: String)
+    public var ownerName: String { get }
+}
+
+public enum KeyCodeNames {
+    /// Layout-aware (§5.19): UCKeyTranslate against the current keyboard
+    /// layout, a fixed table for layout-independent keys, ANSI as last resort.
+    public static func name(for keyCode: UInt16) -> String
+    public static func isFunctionKey(_ keyCode: UInt16) -> Bool
+    public static func isModifier(_ keyCode: UInt16) -> Bool
+}
+
+/// §5.21 — in memory, bounded, never written unless the user exports.
+@MainActor
+public final class SessionLog: ObservableObject {
+    public static let capacity: Int                       // 300
+    @Published public private(set) var events: [SessionEvent]
+    @Published public private(set) var peakAddedMs: Double
+    @Published public private(set) var peakStageMs: [StageID: Double]
+    @Published public private(set) var droppedFrames: Int
+    public let startedAt: Date
+    public func record(_ kind: SessionEvent.Kind, _ text: String, at: Date = Date())
+    public func observe(_ report: LatencyReport, at: Date = Date())
+    public func clear()
+    public func exportText(now: Date = Date()) -> String
+    public static func duration(from: Date, to: Date) -> String
 }
 
 @MainActor
@@ -1057,9 +1113,20 @@ public final class Permissions: ObservableObject {
 }
 ```
 
-Key codes (ANSI): F = 3, M = 46, R = 15, A = 0, P = 35, E = 14, L = 37,
-B = 11, V = 9, S = 1, D = 2, T = 17. Matching is exact over {⌥, ⌘, ⇧, ⌃},
-so ⌥⌘F and ⌥⌘⇧F — and ⌥⌘S and ⌥⌘⇧S — are distinct chords.
+App Intents (`PRISM/System/PrismIntents.swift`, §5.20) — `FreezeIntent`,
+`MuteIntent`, `PanicIntent`, `AwayLoopIntent`, `InstantReplayIntent`,
+`EyeContactIntent`, `VoiceChangerIntent`, `BackgroundBlurIntent`, each taking
+a `PrismSwitchAction` (on/off/toggle), plus `ApplyPresetIntent` (preset by
+name). Every `perform` resolves `AppState.current`, refuses while
+`externalControlEnabled` is false, and returns confirmation only — no intent
+returns video, audio, frames, buffer contents, or the session log. There is
+no `AppShortcutsProvider` and no URL scheme; see §5.20 for why.
+
+Default key codes (ANSI): F = 3, M = 46, R = 15, A = 0, P = 35, E = 14,
+L = 37, B = 11, V = 9, S = 1, D = 2, T = 17. Matching is exact over
+{⌥, ⌘, ⇧, ⌃}, so ⌥⌘F and ⌥⌘⇧F — and ⌥⌘S and ⌥⌘⇧S — are distinct chords.
+They are defaults, not constants: `ShortcutAction.defaultCombo` owns them
+and the user may rebind any of them (§5.19).
 
 ### AppState (`PRISM/AppState.swift`) — written in the integration phase
 
@@ -1232,6 +1299,28 @@ public final class AppState: ObservableObject {
     // from PRISM having died.
     public func toggleScreenSource()
     public func togglePrompter()
+    // Control surface (§5.19, §5.20)
+    @Published public var hotkeyBindings: HotkeyBindings
+    @Published public var externalControlEnabled: Bool      // default off
+    public let sessionLog: SessionLog                        // §5.21
+    /// The one place a bindable action becomes behaviour — the tap and the
+    /// App Intents both come through here, exhaustively.
+    public func perform(_ action: ShortcutAction)
+    public func shortcut(for action: ShortcutAction) -> HotkeyCombo?
+    public func shortcutConflict(for combo: HotkeyCombo,
+                                 excluding action: ShortcutAction?) -> ShortcutConflict?
+    /// Assigns, taking the chord from whoever had it and saying so.
+    public func setShortcut(_ combo: HotkeyCombo?, for action: ShortcutAction)
+    public func setPresetShortcut(_ combo: HotkeyCombo?, for presetID: UUID)
+    public func resetShortcut(_ action: ShortcutAction)
+    public func resetAllShortcuts()
+    /// Stops/starts the tap around recording, so binding a key to Panic does
+    /// not also panic.
+    public func beginShortcutRecording()
+    public func endShortcutRecording()
+    /// The running instance, for App Intents — which the system constructs
+    /// and so cannot be handed a reference.
+    @MainActor public private(set) static weak var current: AppState?
     public func quit()
 }
 ```
@@ -1272,7 +1361,13 @@ intent announced.
   `OnboardingView.swift` (three-step state machine
   §9 + persistent setup banner), `SettingsView.swift` (deeper controls:
   pan, crop aspect, orientation, per-adjustment sliders, published format
-  set editor, hotkey list, login item toggle, LUT management).
+  set editor, shortcut recorder + external control switch, login item
+  toggle, LUT management).
+- `HotkeyRecorder.swift` — `HotkeyRecorderField` (§5.19; records a real key-down;
+  ⎋ cancels, ⌫ clears) and `ShortcutsList`, shared by the main window's
+  Shortcuts pane and the Settings General tab so the two cannot disagree.
+- `MainWindow/ShortcutsPane.swift`, `MainWindow/DiagnosticsPane.swift` —
+  §5.19/§5.20 and §5.21 respectively.
 - `MenuBarIcon.swift` — maps `MenuBarState` → glyph. Uses asset PDFs
   `PrismOutline` / `PrismFilled` (template) with overlay badges; falls back
   to SF Symbols if assets missing.

@@ -68,7 +68,7 @@ struct CaptureSection: View {
         let sharp = state.studio.capture.prefersSharp
             ? "the sharpest of the last few frames"
             : "the picture on air"
-        return "Save \(sharp) as \(format) · ⌥⌘⇧S"
+        return "Save \(sharp) as \(format)" + state.shortcutSuffix(.snapshot)
     }
 
     private var clipTile: some View {
@@ -78,7 +78,8 @@ struct CaptureSection: View {
                     accessibilityValue: clipAccessibilityValue) {
             state.saveLastSeconds()
         }
-        .help("Write the last \(Int(state.studio.replay.clampedBufferSeconds)) seconds of raw camera to a file · ⌥⌘S")
+        .help("Write the last \(Int(state.studio.replay.clampedBufferSeconds)) seconds of raw camera to a file"
+              + state.shortcutSuffix(.saveClip))
     }
 
     private var clipAccessibilityValue: String {

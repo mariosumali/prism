@@ -77,6 +77,30 @@ public enum MenuBarState: Equatable {
     case muted         // filled + slash
     case panicked      // filled + raised hand, red tint
     case error         // filled, red tint
+
+    /// How this state reads in the session log (§5.21), in the past tense a
+    /// history wants rather than the label a live badge wants.
+    ///
+    /// Exhaustive rather than defaulted: a new glyph state that logged a
+    /// blank row would be invisible in exactly the history that exists to
+    /// explain it.
+    public var sessionDescription: String {
+        switch self {
+        case .idle: return "No app is using PRISM Camera"
+        case .live: return "Passing the camera through"
+        case .effects: return "Effects on air"
+        case .sharingScreen: return "Sharing a screen"
+        case .replaying: return "Replay on air"
+        case .away: return "Away loop on air"
+        case .badConnection: return "Bad connection on air"
+        case .lagging: return "Deliberate delay engaged"
+        case .frozen: return "Output frozen"
+        case .mutedTalking: return "Talking while muted"
+        case .muted: return "Microphone muted"
+        case .panicked: return "Panic engaged"
+        case .error: return "PRISM stopped working"
+        }
+    }
 }
 
 public enum PermissionState: Equatable {

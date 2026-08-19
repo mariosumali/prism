@@ -220,6 +220,27 @@ public final class AppState: ObservableObject {
     @Published public var popoverLayout: [PopoverModuleItem] = PopoverModuleItem.defaultLayout {
         didSet { persistPopoverLayout() }
     }
+    /// §5.19 — the user's global chords. Written through setShortcut and
+    /// friends, which resolve collisions first; the didSet is what keeps the
+    /// tap and the stored copy in step no matter which surface wrote.
+    @Published public var hotkeyBindings = HotkeyBindings() {
+        didSet {
+            guard hotkeyBindings != oldValue else { return }
+            hotkeys.setBindings(hotkeyBindings.resolved)
+            persistHotkeyBindings()
+        }
+    }
+    /// §5.20 — whether App Intents may drive PRISM. Off until asked for:
+    /// every other process on the machine can see the intents, and the point
+    /// of the switch is that seeing them is not the same as being able to
+    /// use them.
+    @Published public var externalControlEnabled = false {
+        didSet {
+            guard externalControlEnabled != oldValue else { return }
+            UserDefaults.standard.set(externalControlEnabled,
+                                      forKey: DefaultsKey.externalControl)
+        }
+    }
     /// Non-nil while "preview edits before applying" is on: the pending
     /// look, rendered privately by DraftRenderer and pushed to the live
     /// pipeline only by applyDraft(). The draft owns the *visual*
@@ -261,6 +282,8 @@ public final class AppState: ObservableObject {
     /// §5.13 mic check — record a few seconds of the processed microphone
     /// and play it back, the only way to hear your own voice effect.
     public let micCheck: MicCheck
+    /// §5.21 — this session's history, in memory only.
+    public let sessionLog = SessionLog()
 
     // MARK: - Components
 
@@ -312,6 +335,9 @@ public final class AppState: ObservableObject {
     private var lastNegotiatedFormat: VideoFormat?
     private var lastSinkDroppedFrames = 0
     private var started = false
+    /// How many shortcut recorders are armed (§5.19); the tap is off while
+    /// any of them is.
+    private var shortcutRecorders = 0
 
     /// Configuration snapshot taken when panic engaged, restored on release.
     /// Panic mutates `config` so every surface shows what is actually on air,
@@ -347,6 +373,11 @@ public final class AppState: ObservableObject {
         static let hotkeys = "PRISM.hotkeys"
         static let externalControl = "PRISM.externalControl"
     }
+
+    /// The running instance, for App Intents (§5.20) — which are constructed
+    /// by the system and so cannot be handed a reference. Weak and
+    /// single-writer: AppState is created once, by the app.
+    @MainActor public private(set) static weak var current: AppState?
 
     // MARK: - Init
 
@@ -399,6 +430,7 @@ public final class AppState: ObservableObject {
                 self?.pushPresetHotkeyBindings(list)
             }
             .store(in: &cancellables)
+        AppState.current = self
     }
 
     /// Called once from the app delegate after launch.
@@ -461,6 +493,7 @@ public final class AppState: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.warning = WarningMessage(text: message)
+                self.sessionLog.record(.device, message)
                 self.updateMenuBarState()
                 // A fatal error cleared cameraCapture.isRunning; while demand
                 // holds, reconciliation restarts the camera (fresh ladder).
@@ -496,6 +529,12 @@ public final class AppState: ObservableObject {
             self.stageStatus[id] = status
             self.warning = WarningMessage(
                 text: "\(id.displayName) turned off to keep video smooth")
+            // §5.21: the warning row is transient and the next event replaces
+            // it, so this is the only place the answer to "why did my effects
+            // turn off?" survives past the next minute.
+            self.sessionLog.record(.degradation, String(
+                format: "%@ turned off — %.1f ms over a %.1f ms budget",
+                id.displayName, self.latency.stages[id] ?? 0, self.latency.budgetMs))
             self.updateMenuBarState()
         }
         monitor.onAutoReenable = { [weak self] id in
@@ -510,18 +549,24 @@ public final class AppState: ObservableObject {
             if self.warning?.text.hasSuffix("to keep video smooth") == true {
                 self.warning = nil
             }
+            self.sessionLog.record(.degradation, "\(id.displayName) came back on")
             self.updateMenuBarState()
         }
         monitor.onPolicyPressure = { [weak self] in
-            self?.warning = WarningMessage(
+            guard let self else { return }
+            self.warning = WarningMessage(
                 text: "Effects are exceeding your latency budget",
                 action: .raiseBudget)
+            self.sessionLog.record(.degradation, String(
+                format: "Chain over budget — %.1f ms against %.1f ms",
+                self.latency.totalAddedMs, self.latency.budgetMs))
         }
         monitor.$report
             .receive(on: DispatchQueue.main)
             .sink { [weak self] report in
                 guard let self else { return }
                 self.latency = report
+                self.sessionLog.observe(report)
                 for id in StageID.allCases {
                     var status = self.stageStatus[id] ?? StageStatus()
                     status.measuredMs = report.stages[id] ?? 0
@@ -568,6 +613,9 @@ public final class AppState: ObservableObject {
     private func wireDeviceMonitor() {
         deviceMonitor.onCamerasChanged = { [weak self] list in
             guard let self else { return }
+            self.logDeviceChange(kind: "Camera",
+                                 before: self.cameras.map(\.name),
+                                 after: list.map(\.name))
             self.cameras = list
             self.handleSelectedDeviceRemoval(cameraList: list, micList: nil)
             // Arrival is a reconciliation trigger too: a capture whose retry
@@ -576,6 +624,9 @@ public final class AppState: ObservableObject {
         }
         deviceMonitor.onMicrophonesChanged = { [weak self] list in
             guard let self else { return }
+            self.logDeviceChange(kind: "Microphone",
+                                 before: self.microphones.map(\.name),
+                                 after: list.map(\.name))
             self.microphones = list
             self.handleSelectedDeviceRemoval(cameraList: nil, micList: list)
             self.reconcileCaptures()
@@ -599,9 +650,35 @@ public final class AppState: ObservableObject {
         }
     }
 
+    /// §5.21. The device lists arrive whole, so the story ("the Logitech
+    /// came back") only exists as the difference between two of them — which
+    /// is why this runs before the published list is replaced.
+    private func logDeviceChange(kind: String, before: [String], after: [String]) {
+        guard !before.isEmpty || !after.isEmpty else { return }
+        for name in after where !before.contains(name) {
+            sessionLog.record(.device, "\(kind) connected: \(name)")
+        }
+        for name in before where !after.contains(name) {
+            sessionLog.record(.device, "\(kind) disconnected: \(name)")
+        }
+    }
+
     private func wireSink() {
         cmioSink.onClientsChanged = { [weak self] list in
             guard let self else { return }
+            // §5.21: the arrival and the departure are only visible as the
+            // difference between two whole lists, so both are read off before
+            // the published one is replaced.
+            // Matched on the signing ID, which is the identity, but reported
+            // by display name, which is what the user recognises.
+            for client in list where !self.clients.contains(client) {
+                self.sessionLog.record(
+                    .clients, "\(client.displayName) started using PRISM Camera")
+            }
+            for client in self.clients where !list.contains(client) {
+                self.sessionLog.record(
+                    .clients, "\(client.displayName) stopped using PRISM Camera")
+            }
             self.clients = list
             self.updateMenuBarState()
             self.reconcileCaptures()       // a first client starts capture
@@ -623,13 +700,16 @@ public final class AppState: ObservableObject {
             self?.handleLagKey(pressed: false)
         }
         hotkeys.onPreset = { [weak self] id in self?.selectPreset(id) }
+        hotkeys.setBindings(hotkeyBindings.resolved)
         pushPresetHotkeyBindings(presetStore.presets)
     }
 
-    /// The one place a chord becomes an intent. Exhaustive on purpose: a
-    /// shortcut cannot be added without the compiler making someone say what
-    /// it does, which is the failure mode a table of callbacks invited.
-    private func perform(_ action: ShortcutAction) {
+    /// The one place a chord becomes an intent — the tap, the App Intents
+    /// (§5.20) and anything added later all come through here, so they cannot
+    /// drift apart. Exhaustive on purpose: a shortcut cannot be added without
+    /// the compiler making someone say what it does, which is the failure mode
+    /// a table of callbacks invited.
+    public func perform(_ action: ShortcutAction) {
         switch action {
         case .freeze: toggleFreeze()
         case .mute: toggleMute()
@@ -638,6 +718,8 @@ public final class AppState: ObservableObject {
         case .away: toggleAway()
         case .panic: togglePanic()
         case .eyeContact: toggleEyeContact()
+        // Press, not toggle: the lag switch is held (§5.12) and its release
+        // arrives separately.
         case .lag: handleLagKey(pressed: true)
         case .badConnection: toggleBadConnection()
         case .voice: toggleVoice()
@@ -2036,7 +2118,145 @@ public final class AppState: ObservableObject {
         studio.micWatch.isEnabled = enabled
     }
 
-    // MARK: - Intents: external control
+    // MARK: - Intents: control surface (§5.19, §5.20)
+
+    /// §5.19. Said the same way wherever a chord is refused, because it is
+    /// the same rule and the reason is the whole explanation.
+    private static let modifierRuleWarning =
+        "A PRISM shortcut needs ⌥ or ⌃. PRISM listens without swallowing the keystroke, so a ⌘ chord would reach the app in front of you too."
+
+    public func shortcut(for action: ShortcutAction) -> HotkeyCombo? {
+        hotkeyBindings.combo(for: action)
+    }
+
+    /// The chord a control should print beside itself, empty when the action
+    /// is unbound. Every hint in the UI reads through here rather than
+    /// spelling "⌥⌘F" inline: a rebindable chord that the tiles still
+    /// advertise as its default is a lie the user finds out about at the
+    /// worst possible moment.
+    public func shortcutLabel(_ action: ShortcutAction) -> String {
+        shortcut(for: action)?.displayString ?? ""
+    }
+
+    /// The same, as a " · ⌥⌘F" tail for a help line.
+    public func shortcutSuffix(_ action: ShortcutAction) -> String {
+        shortcut(for: action).map { " · \($0.displayString)" } ?? ""
+    }
+
+    /// What a candidate chord would take away, so the editor can say so
+    /// before the user commits to it. Preset bindings are in scope too: they
+    /// go through the same tap, and a preset silently shadowed by a built-in
+    /// is exactly the bug this check exists to prevent.
+    public func shortcutConflict(for combo: HotkeyCombo,
+                                 excluding action: ShortcutAction?) -> ShortcutConflict? {
+        if let owner = hotkeyBindings.conflict(for: combo, excluding: action) {
+            return .action(owner)
+        }
+        if let preset = presets.first(where: { $0.hotkey == combo }) {
+            return .preset(id: preset.id, name: preset.name)
+        }
+        return nil
+    }
+
+    /// Assigns a chord, taking it from whoever had it.
+    ///
+    /// Stealing rather than refusing, because a refusal leaves the user to
+    /// hunt for the owner themselves, and silently allowing a duplicate would
+    /// leave two actions on one chord with only the match order deciding
+    /// which fires. The loser is left unbound and named in the warning row,
+    /// and "Reset all" is one click away.
+    public func setShortcut(_ combo: HotkeyCombo?, for action: ShortcutAction) {
+        guard let combo else {
+            hotkeyBindings.set(nil, for: action)
+            return
+        }
+        guard HotkeyBindings.isBindable(combo) else {
+            warning = WarningMessage(text: Self.modifierRuleWarning)
+            return
+        }
+        switch shortcutConflict(for: combo, excluding: action) {
+        case .action(let owner):
+            hotkeyBindings.set(nil, for: owner)
+            warning = WarningMessage(
+                text: "\(combo.displayString) now runs \(action.displayName). \(owner.displayName) has no shortcut.")
+        case .preset(let id, let name):
+            presetStore.setHotkey(id, hotkey: nil)
+            warning = WarningMessage(
+                text: "\(combo.displayString) now runs \(action.displayName). The \(name) preset has no shortcut.")
+        case nil:
+            break
+        }
+        hotkeyBindings.set(combo, for: action)
+    }
+
+    public func resetShortcut(_ action: ShortcutAction) {
+        // Restoring a default can collide with whatever took its chord in the
+        // meantime, so it goes through the same door as any other assignment;
+        // dropping the override afterwards is what makes the row read
+        // "Default" again rather than "assigned, and identical by accident".
+        setShortcut(action.defaultCombo, for: action)
+        if hotkeyBindings.combo(for: action) == action.defaultCombo {
+            hotkeyBindings.reset(action)
+        }
+    }
+
+    public func resetAllShortcuts() {
+        var restored = hotkeyBindings
+        restored.resetAll()
+        hotkeyBindings = restored
+        // Preset chords are the user's own choices and survive; only ones
+        // that now collide with a restored default are cleared.
+        for preset in presets {
+            guard let combo = preset.hotkey,
+                  hotkeyBindings.conflict(for: combo, excluding: nil) != nil
+            else { continue }
+            presetStore.setHotkey(preset.id, hotkey: nil)
+        }
+    }
+
+    /// Same collision handling for the preset side of the table (§5.5).
+    public func setPresetShortcut(_ combo: HotkeyCombo?, for presetID: UUID) {
+        guard let combo else {
+            presetStore.setHotkey(presetID, hotkey: nil)
+            return
+        }
+        guard HotkeyBindings.isBindable(combo) else {
+            warning = WarningMessage(text: Self.modifierRuleWarning)
+            return
+        }
+        let name = presets.first(where: { $0.id == presetID })?.name ?? "Preset"
+        switch shortcutConflict(for: combo, excluding: nil) {
+        case .action(let owner):
+            hotkeyBindings.set(nil, for: owner)
+            warning = WarningMessage(
+                text: "\(combo.displayString) now applies \(name). \(owner.displayName) has no shortcut.")
+        case .preset(let id, let other) where id != presetID:
+            presetStore.setHotkey(id, hotkey: nil)
+            warning = WarningMessage(
+                text: "\(combo.displayString) now applies \(name). The \(other) preset has no shortcut.")
+        case .preset, nil:
+            break
+        }
+        presetStore.setHotkey(presetID, hotkey: combo)
+    }
+
+    /// Recording a shortcut means typing the chord — including chords PRISM
+    /// itself is listening for. The tap is stopped for the duration so that
+    /// binding a key to Panic does not also panic.
+    ///
+    /// Counted, because clicking a second recorder while the first is still
+    /// armed leaves two of them live: the last one to finish is what may
+    /// restart the tap, and a tap restarted under an armed recorder is the
+    /// failure this exists to prevent.
+    public func beginShortcutRecording() {
+        shortcutRecorders += 1
+        if shortcutRecorders == 1 { hotkeys.stop() }
+    }
+
+    public func endShortcutRecording() {
+        shortcutRecorders = max(0, shortcutRecorders - 1)
+        if shortcutRecorders == 0, started { hotkeys.start() }
+    }
 
     // MARK: - Replay state mirroring
 
@@ -2277,6 +2497,9 @@ public final class AppState: ObservableObject {
             // Outside the published set → reconnect boundary for the set.
             requestPublishedFormatsChange(publishedFormats + [format])
             return
+        }
+        if formatManager.activeFormat != format {
+            sessionLog.record(.format, "Output format is now \(format.displayName)")
         }
         formatManager.activeFormat = format
         config.format = format
@@ -2739,6 +2962,11 @@ public final class AppState: ObservableObject {
             newState = .idle
         }
         if newState != menuBarState {
+            // §5.21: the glyph already summarises everything that changes
+            // what clients can see, and it changes exactly when that answer
+            // changes — so recording it here catches freeze, mute, panic,
+            // away, replay and the rest without a call at each site.
+            sessionLog.record(.onAir, newState.sessionDescription)
             menuBarState = newState
         }
     }
@@ -2793,6 +3021,12 @@ public final class AppState: ObservableObject {
            let decoded = try? JSONDecoder().decode(StudioSettings.self, from: data) {
             studio = decoded
         }
+        if let data = UserDefaults.standard.data(forKey: DefaultsKey.hotkeys),
+           let decoded = try? JSONDecoder().decode(HotkeyBindings.self, from: data) {
+            hotkeyBindings = decoded
+        }
+        externalControlEnabled =
+            UserDefaults.standard.bool(forKey: DefaultsKey.externalControl)
         // §8.3 default: Framing, Effects, Format collapsed on first launch —
         // an empty set is exactly that, so no seeding is needed.
     }
@@ -2814,6 +3048,12 @@ public final class AppState: ObservableObject {
     private func persistStudio() {
         if let data = try? JSONEncoder().encode(studio) {
             UserDefaults.standard.set(data, forKey: DefaultsKey.studio)
+        }
+    }
+
+    private func persistHotkeyBindings() {
+        if let data = try? JSONEncoder().encode(hotkeyBindings) {
+            UserDefaults.standard.set(data, forKey: DefaultsKey.hotkeys)
         }
     }
 

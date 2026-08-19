@@ -1,12 +1,12 @@
 // Hotkeys.swift
 // PRISM
 //
-// Global hotkeys (§5.2): ⌥⌘F freeze, ⌥⌘M mute, ⌥⌘⇧F freeze+mute, plus
-// user-bound preset combos. Primary path is a listen-only CGEventTap on
-// keyDown; when tap creation fails (no Accessibility / Input Monitoring
-// permission) it falls back to NSEvent global+local monitors. The fallback
-// cannot consume events — which is fine, PRISM never consumes any event.
-// All callbacks fire on the main thread.
+// Global hotkeys (§5.2, §5.19): a table of ShortcutAction → HotkeyCombo the
+// user can rebind, plus user-bound preset combos. Primary path is a
+// listen-only CGEventTap on keyDown; when tap creation fails (no
+// Accessibility / Input Monitoring permission) it falls back to NSEvent
+// global+local monitors. The fallback cannot consume events — which is fine,
+// PRISM never consumes any event. All callbacks fire on the main thread.
 //
 // Licensed under the Apache License, Version 2.0.
 
@@ -15,7 +15,7 @@ import CoreGraphics
 import Foundation
 
 /// One case per global intent PRISM can be driven by, and the chord that
-/// reaches it.
+/// reaches it by default.
 ///
 /// The shape this replaced — a constant, a callback and a rung of an if/else
 /// ladder per chord — made every new shortcut a three-place edit, and made a
@@ -24,9 +24,14 @@ import Foundation
 /// receiver switches over the action exhaustively: a shortcut cannot be added
 /// without the compiler asking what it does.
 ///
+/// Every chord below is a *default*, not a constant: §5.19 lets the user
+/// rebind any of them, and `HotkeyBindings` is where their choices live. The
+/// chords stay documented here because a default nobody can find is the same
+/// as no default.
+///
 /// Every chord shares the ⌥⌘ family prefix except the two that add ⌃ for the
 /// reason documented on their cases.
-public enum ShortcutAction: String, Codable, CaseIterable {
+public enum ShortcutAction: String, Codable, CaseIterable, Identifiable {
     case freeze                 // ⌥⌘F
     case mute                   // ⌥⌘M
     case freezeAndMute          // ⌥⌘⇧F
@@ -111,15 +116,26 @@ public enum ShortcutAction: String, Codable, CaseIterable {
         case .prompter: return "Prompter"
         }
     }
+
+    /// §5.12: the lag switch is the only action whose key *release* is
+    /// observed, so it can be held rather than toggled — which is what
+    /// "switch" means. A property rather than a comparison at the two call
+    /// sites, so a second held action is one line here and not a hunt.
+    public var isMomentary: Bool { self == .lag }
+
+    /// For `ForEach` over the binding editor's rows (§5.19).
+    public var id: String { rawValue }
 }
 
 public final class Hotkeys {
 
     // MARK: Callbacks (invoked on the main thread)
 
+    /// A bound chord went down. The action names what to do; Hotkeys knows
+    /// nothing about what any of them mean.
     public var onAction: ((ShortcutAction) -> Void)?
-    /// Key releases, reported only for the actions that are held rather than
-    /// toggled — today only `.lag` (§5.12).
+    /// A momentary action's key came back up (§5.12 lag switch). Fires only
+    /// for `isMomentary` actions — nothing else observes releases.
     public var onActionRelease: ((ShortcutAction) -> Void)?
     public var onPreset: ((UUID) -> Void)?
 
@@ -129,11 +145,11 @@ public final class Hotkeys {
     private var runLoopSource: CFRunLoopSource?
     private var globalMonitor: Any?
     private var localMonitor: Any?
+    /// Starts on the defaults so a Hotkeys nobody has configured still works;
+    /// AppState overwrites this the moment the persisted table is loaded.
+    private var bindings: [ShortcutAction: HotkeyCombo] =
+        HotkeyBindings().resolved
     private var presetBindings: [(UUID, HotkeyCombo)] = []
-    /// Every action always has a chord, so a partial saved map cannot leave an
-    /// intent unreachable with no way to notice.
-    private var bindings: [(action: ShortcutAction, combo: HotkeyCombo)] =
-        ShortcutAction.allCases.map { ($0, $0.defaultCombo) }
 
     public init() {}
 
@@ -141,12 +157,14 @@ public final class Hotkeys {
         stop()
     }
 
-    /// Replaces the chords the user has rebound; actions absent from the map
-    /// keep their default. Call on the main thread; the tap's run-loop source
-    /// lives on the main run loop, so matching reads this array on the main
-    /// thread too.
+    /// Installs the chord table (§5.19). The map is taken as given rather
+    /// than back-filled with defaults: an action the user has deliberately
+    /// unbound is *absent*, and re-adding its default here would hand back
+    /// the chord they just took away. Call on the main thread; the tap's
+    /// run-loop source lives on the main run loop, so matching reads this
+    /// table on the main thread too.
     public func setBindings(_ bindings: [ShortcutAction: HotkeyCombo]) {
-        self.bindings = ShortcutAction.allCases.map { ($0, bindings[$0] ?? $0.defaultCombo) }
+        self.bindings = bindings
     }
 
     /// Registers preset hotkeys (§5.5). Same threading rule as setBindings.
@@ -276,28 +294,26 @@ public final class Hotkeys {
     /// lag switch that could be pressed but never released would be the worst
     /// possible outcome of rebinding it.
     private func matchRelease(keyCode: UInt16) {
-        guard let lag = bindings.first(where: { $0.action == .lag })?.combo,
-              lag.keyCode == keyCode else { return }
-        fire { $0.onActionRelease?(.lag) }
+        for action in ShortcutAction.allCases where action.isMomentary {
+            guard bindings[action]?.keyCode == keyCode else { continue }
+            fire { $0.onActionRelease?(action) }
+        }
     }
 
     /// Exact modifier matching over {⌥, ⌘, ⇧, ⌃} so ⌥⌘F and ⌥⌘⇧F stay
-    /// distinct combos rather than one shadowing the other — which is also
-    /// why the table can be scanned in any order.
+    /// distinct combos rather than one shadowing the other.
+    ///
+    /// At most one action can own a chord — the binding editor resolves
+    /// collisions when they are made, not here — so the table is scanned in
+    /// whatever order it comes in, and the first hit wins.
     private func match(keyCode: UInt16, option: Bool, command: Bool,
                        shift: Bool, control: Bool) {
-        func matches(_ combo: HotkeyCombo) -> Bool {
-            combo.keyCode == keyCode
-                && combo.option == option
-                && combo.command == command
-                && combo.shift == shift
-                && combo.control == control
-        }
-
-        if let binding = bindings.first(where: { matches($0.combo) }) {
-            let action = binding.action
+        let pressed = HotkeyCombo(keyCode: keyCode, option: option,
+                                  command: command, shift: shift,
+                                  control: control)
+        if let action = bindings.first(where: { $0.value == pressed })?.key {
             fire { $0.onAction?(action) }
-        } else if let (id, _) = presetBindings.first(where: { matches($0.1) }) {
+        } else if let (id, _) = presetBindings.first(where: { $0.1 == pressed }) {
             fire { $0.onPreset?(id) }
         }
     }

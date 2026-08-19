@@ -68,7 +68,7 @@ struct VoiceSection: View {
             .accessibilityLabel("Voice effect")
             .accessibilityValue(state.studio.voice.effect.displayName)
         }
-        .help("Change what the microphone sounds like · ⌃⌥⌘V")
+        .help("Change what the microphone sounds like\(state.shortcutSuffix(.voice))")
     }
 
     /// §5.17 — the whole feature, as one picker.

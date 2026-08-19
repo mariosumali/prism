@@ -15,8 +15,8 @@ import UniformTypeIdentifiers
 
 enum MainPane: String, CaseIterable, Identifiable {
     case studio, scene, moments, capture, voice, framing, effects, format,
-         devices, presets, apps, menuBar, general, prompter, gestures,
-         diagnostics, about
+         devices, presets, apps, menuBar, shortcuts, general, prompter,
+         gestures, diagnostics, about
 
     var id: String { rawValue }
 
@@ -34,6 +34,7 @@ enum MainPane: String, CaseIterable, Identifiable {
         case .presets: return "Presets"
         case .apps: return "Apps"
         case .menuBar: return "Menu Bar"
+        case .shortcuts: return "Shortcuts"
         case .general: return "General"
         case .prompter: return "Prompter"
         case .gestures: return "Gestures"
@@ -56,6 +57,7 @@ enum MainPane: String, CaseIterable, Identifiable {
         case .presets: return "square.stack"
         case .apps: return "app.badge.checkmark"
         case .menuBar: return "menubar.arrow.up.rectangle"
+        case .shortcuts: return "keyboard"
         case .general: return "gearshape"
         case .prompter: return "doc.plaintext"
         case .gestures: return "hand.raised"
@@ -114,6 +116,7 @@ struct MainWindowView: View {
         case .presets: PresetsPane()
         case .apps: AppsPane()
         case .menuBar: MenuBarLayoutPane()
+        case .shortcuts: ShortcutsPane()
         case .general: GeneralPane()
         case .prompter: PrompterPane()
         case .gestures: GesturesPane()
@@ -210,21 +213,10 @@ private struct GeneralPane: View {
                 Toggle("Launch at login", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { LoginItem.setEnabled($0) }
             }
-            Section("Keyboard shortcuts") {
-                LabeledContent("Freeze", value: "⌥⌘F")
-                LabeledContent("Mute", value: "⌥⌘M")
-                LabeledContent("Freeze and mute", value: "⌥⌘⇧F")
-                LabeledContent("Instant replay", value: "⌥⌘R")
-                LabeledContent("Away loop", value: "⌥⌘A")
-                LabeledContent("Panic", value: "⌥⌘P")
-                LabeledContent("Eye contact", value: "⌥⌘E")
-                LabeledContent("Lag switch", value: "⌥⌘L")
-                LabeledContent("Voice changer", value: "⌃⌥⌘V")
-                ForEach(state.presets.filter { $0.hotkey != nil }) { preset in
-                    LabeledContent(preset.name,
-                                   value: preset.hotkey?.displayString ?? "")
-                }
-                Text("Assign preset hotkeys in the Presets pane.")
+            Section {
+                // The list itself lives one row down the sidebar; repeating
+                // it here would be two editors for one setting.
+                Text("Keyboard shortcuts and control from other apps are in the Shortcuts pane.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

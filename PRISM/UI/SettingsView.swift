@@ -43,21 +43,14 @@ private struct GeneralSettingsTab: View {
                 Toggle("Launch at login", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { LoginItem.setEnabled($0) }
             }
-            Section("Keyboard shortcuts") {
-                LabeledContent("Freeze", value: "⌥⌘F")
-                LabeledContent("Mute", value: "⌥⌘M")
-                LabeledContent("Freeze and mute", value: "⌥⌘⇧F")
-                LabeledContent("Instant replay", value: "⌥⌘R")
-                LabeledContent("Away loop", value: "⌥⌘A")
-                LabeledContent("Panic", value: "⌥⌘P")
-                LabeledContent("Eye contact", value: "⌥⌘E")
-                LabeledContent("Lag switch", value: "⌥⌘L")
-                LabeledContent("Bad connection", value: "⌥⌘B")
-                LabeledContent("Voice changer", value: "⌃⌥⌘V")
-                ForEach(state.presets.filter { $0.hotkey != nil }) { preset in
-                    LabeledContent(preset.name,
-                                   value: preset.hotkey?.displayString ?? "")
-                }
+            ShortcutsList()
+            Section("Other apps") {
+                Toggle("Allow control from Shortcuts",
+                       isOn: Binding(get: { state.externalControlEnabled },
+                                     set: { state.externalControlEnabled = $0 }))
+                Text("Lets the Shortcuts app, and hardware that runs shortcuts, freeze, mute, panic, replay, step away, and switch presets. Off until you turn it on, and it can never read your camera or microphone.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
