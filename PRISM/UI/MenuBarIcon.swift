@@ -60,7 +60,7 @@ struct MenuBarIcon: View {
     }
 
     private var baseImage: Image {
-        if Self.hasCustomGlyphs {
+        if hasCustomGlyphs {
             return Image(isFilled ? "PrismGlyphFilled" : "PrismGlyph")
         }
         return Image(systemName: isFilled ? "triangle.fill" : "triangle")
