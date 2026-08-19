@@ -129,6 +129,15 @@ public final class GeometryStage: EffectStage {
         return m
     }
 
+    /// The matrix as the picture will actually see it this frame: identity
+    /// when the stage declines to encode. Anything anchored to a measurement
+    /// taken before Geometry has to compose with this rather than with
+    /// `buildUVTransform`, which would happily hand back the crop of a stage
+    /// that is switched off.
+    public func appliedUVTransform(inputSize: CGSize) -> simd_float3x3 {
+        wantsEncode() ? buildUVTransform(inputSize: inputSize) : matrix_identity_float3x3
+    }
+
     /// Folds autoFrameOffset into the user zoom/pan (§5.4) before the matrix
     /// is built. Effective zoom stays within the stage's 1…4 range.
     private func effectiveValues() -> (zoom: Double, panX: Double, panY: Double) {

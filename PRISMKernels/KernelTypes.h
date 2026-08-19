@@ -66,8 +66,8 @@ typedef struct {
 typedef struct {
     float amount;                // 0…1 blend toward the smoothed image
     float detail;                // 0…1 fine texture restored from the source
-    float _pad0;
-    float _pad1;
+    unsigned int useMask;        // 1 = narrow the gate by the person mask
+    unsigned int _pad0;
 } PRISMRetouchParams;
 
 // Composite.metal — mix sharp person over blurred background by mask.

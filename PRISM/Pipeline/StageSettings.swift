@@ -511,6 +511,13 @@ public struct OverlaySettings: Codable, Equatable {
     public var needsPersonMask: Bool {
         renderableLayers.contains { $0.placement == .behind }
     }
+
+    /// True when any enabled layer rides the face — that, and only that, is
+    /// what makes the overlay stage a face-tracking consumer. A layer pinned
+    /// to the frame costs no Vision, however many of them there are.
+    public var needsFaceTracker: Bool {
+        renderableLayers.contains { $0.anchor == .face }
+    }
 }
 
 // MARK: - Style — preset visual effects (§5.4)
@@ -693,7 +700,9 @@ public struct PipelineConfiguration: Codable, Equatable {
             return overlay.renderableLayers.isEmpty
         case .style:
             return style.isNormal || style.intensity <= 0
-        case .blur, .background, .gaze, .retouch, .clip, .replay, .freeze,
+        case .retouch:
+            return retouch.isInert
+        case .blur, .background, .gaze, .clip, .replay, .freeze,
              .connection, .outputFit:
             // These change the picture whenever they are on (background
             // replacement falls back to its colour rather than to nothing,
@@ -723,6 +732,8 @@ public struct PipelineConfiguration: Codable, Equatable {
             return style.intensity <= 0
                 ? "On, but intensity is 0."
                 : "On, but Normal is the unstyled picture."
+        case .retouch:
+            return "On, but the amount is 0."
         default:
             return nil
         }

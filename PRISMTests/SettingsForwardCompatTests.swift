@@ -263,7 +263,10 @@ final class SettingsForwardCompatTests: XCTestCase {
         let config = try decode(PipelineConfiguration.self, configFixture)
 
         XCTAssertEqual(config.retouch, RetouchSettings())
-        XCTAssertEqual(config.retouch.amount, 0.35)
+        // Zero, not defaultAmount: the stage ships off and its knob ships
+        // inert, so a configuration written before retouch existed must come
+        // back meaning "no retouch" rather than "retouch, ready to go".
+        XCTAssertEqual(config.retouch.amount, 0)
         XCTAssertEqual(config.retouch.detail, 0.55)
 
         XCTAssertFalse(config.style.audioReactive)

@@ -220,7 +220,7 @@ Bad connection (§5.14) runs after everything the user composes, because a strug
 
 Output fit is not a user stage — it is the final scale/letterbox into the negotiated format and always runs.
 
-**One face measurement per frame.** The same rule, one model along: eye contact (§5.6), skin retouch (§5.4) and face-anchored overlay layers (§5.8) all want the same 76-point landmark constellation, so a shared `FaceTracker` owns the request and the pipeline drives it **once**, at the first face-consuming stage's position in the chain — pre-Geometry, which is the space eye contact warps in. Detection is demand-gated: no consumer, no Vision request, and the measurement is dropped when the last one goes away so a re-enabled feature never anchors to a stale face.
+**One face measurement per frame.** The same rule, one model along: eye contact (§5.6) and face-anchored overlay layers (§5.8) want the same 76-point landmark constellation, so a shared `FaceTracker` owns the request and the pipeline drives it **once**, at the first face-consuming stage's position in the chain — pre-Geometry, which is the space eye contact warps in and the space face-anchored placement is built in. Detection is demand-gated: no consumer, no Vision request, and the measurement is dropped when the last one goes away so a re-enabled feature never anchors to a stale face. Demand is per-layer, not per-stage — a frame-anchored overlay layer raises none of it. Skin retouch (§5.22) is deliberately not a consumer: its gate is skin chroma, so switching it on buys no Vision request of either kind.
 
 **One segmentation per frame.** Four features need the person mask: background blur (§5.4), virtual backgrounds (§5.7), overlay layers placed behind the subject (§5.8), and auto-framing (§5.4). Segmentation is the single most expensive thing in the pipeline, so it runs **once**, driven by the pipeline at the first mask-consuming stage's position in the chain, and every consumer shares the result. Running two of these features together must cost one segmentation, not two. The mask is captured post-Geometry so it aligns with everything that samples it, and so auto-framing remains the closed-loop servo it is specified to be.
 
@@ -392,6 +392,8 @@ Sampling is bilinear below 2× zoom and Lanczos at or above it. Zoom, pan, and r
 
 **Auto-framing** is a v1 control, not a separate stage: reuse the `VNGeneratePersonSegmentationRequest` mask already computed for blur to derive a subject bounding box, and drive Geometry's zoom and pan toward keeping it centered. Motion is critically damped with a 1.5s time constant — a camera that snaps is worse than one that doesn't move. Auto-framing requires the segmentation request, so enabling it without blur incurs blur's cost; state that in the UI. Disabled by default.
 
+**Skin retouch** (`Retouch.metal`, `.expensive`) — an edge-preserving smooth over skin only, one knob, off by default. Specified in full at §5.22.
+
 **Style** (`Style.metal`, `.moderate`) — one preset visual effect over the finished, composed scene: pick an effect from a catalogue, one intensity slider, nothing else to configure. Each effect is its own single-pass compute kernel, selected by name (`prism_style_<case>`), so the catalogue grows by adding a kernel and an enum case. The catalogue is curated toward what plays on a live call — warps, glitches and motion trails, plus a few gadget-camera looks — not color filters. 23 effects in three groups:
 
 | Distortions | Motion | Looks |
@@ -479,6 +481,22 @@ Keying is computed in YCbCr so the key colour is arbitrary rather than hard-code
 The layer cap is a memory constraint, not a GPU one: each layer is one compute pass, but each *video* layer carries its own decoder and frame FIFO, and resident memory is the binding limit (§7). That is why the two caps differ — a text or live layer has no decoder to pay for. Layers are admitted in the user's own order until either cap is reached. At scale 1 a layer is fitted into the frame with its own aspect preserved — a square PNG stays square.
 
 Layers composite bottom-up in array order. Dropping an image or video onto the Scene pane adds it as a layer, the same affordance as dropping a `.cube` to import a LUT.
+
+**Face-anchored layers.** A layer pinned to `.face` rides the head instead of the frame: a hat above it, glasses on the eye line, a moustache under the nose, or a mask over the whole of it. It is driven by the shared `FaceTracker` (§3.3), which the overlay stage demands **only when a layer is actually face-anchored** — a frame-anchored lower third costs no Vision, however many of them there are, and removing the last face-anchored layer drops the demand again.
+
+| Property | Specification |
+|---|---|
+| Anchor points | above the head, eyes, under the nose, mouth, chin, whole face (`FaceAnchorPoint`) |
+| Size | measured against the tracked face, not the frame: at size 1 the layer is exactly as wide as the face box |
+| Offset | in face widths, and carried around with the layer so a nudge stays put as the head turns |
+| Rotation | the head's roll, added to the layer's own — opt-in per layer (`followsRoll`) |
+| Tracking loss | fade out over ~0.25 s, holding the last pose; fade back in on reacquisition |
+
+Size follows the face so a prop keeps its proportion as someone leans toward the camera and back out, and so the same number means the same thing at 720p and 1080p. The eye anchor uses the *measured* eye midpoint when both eyes are landmarked and falls back to a fraction of the face box otherwise — a profile turn still reports a box after the landmark constellation has given up. The anchor point always swings with the head's tilt, whether or not the layer itself rotates: a moustache belongs under the nose wherever the nose has gone. Roll following is off by default because roll is the noisiest quantity the tracker reports, and a prop that jitters in rotation is more distracting than one that stays level.
+
+**Losing the face fades the layer out rather than freezing or cutting it.** Freezing at the last pose leaves a moustache hanging in mid-air where a head used to be, and cutting instantly makes the prop flash on and off with every detection flicker — both are worse on camera than a quarter-second fade. The tracker's confidence ramp already runs ~0.25 s in each direction and already holds the last pose through a dropout, so the layer shrinks out of sight from where it was standing and returns to where the head is now. At zero confidence the pass is skipped outright, so a stale pose can never reach the picture.
+
+**The face is measured before Geometry and the layers land after it**, so the placement is built in the tracker's own pre-Geometry space and then composed with the frame's geometry matrix (`GeometryStage.appliedUVTransform`). Nothing is decomposed: zoom, pan, free rotation, mirror, a non-square crop and continuous auto-framing all arrive intact, and the prop is glued to the face in camera space. Without this a hat would sit where the head was before the zoom moved it — and auto-framing moves it continuously.
 
 ### 5.9 Instant replay
 
@@ -798,6 +816,31 @@ PRISM already computes every auto-disable, every device change, every dropped fr
 **Repeats coalesce rather than scroll.** A camera that reconnects forty times is one story; forty rows would push the auto-disable that actually explains the session off the end of a bounded list.
 
 **The menu bar glyph is the recording point for what is on air.** It already summarises freeze, mute, panic, away, replay, lag and bad connection with the right precedence, and it changes exactly when that answer changes — so one call there beats a call at every intent.
+
+### 5.22 Skin retouch
+
+An edge-preserving smooth over skin, and nothing else in the frame.
+
+| Property | Specification |
+|---|---|
+| Stage | `.retouch`, `.expensive`, between Geometry and Adjust |
+| Kernels | `prism_retouch_blur` (separable bilateral, one direction per pass), `prism_retouch_combine` |
+| Passes | half-resolution downsample → bilateral H → bilateral V → full-resolution combine |
+| Control | **one** — Amount (0…1) |
+| Gate | skin chroma, narrowed by the person mask when one already exists |
+| Default | stage off, amount 0 |
+
+**What this is.** It smooths the skin you have. The smoothing is a weighted average of pixels already in the frame; there is no face model, nothing is generated, and nothing is replaced. §5.6 sets the precedent and the same instruction applies: **do not describe this feature to users in terms that imply a rendered or synthesised face.**
+
+**Why it does not go plastic.** Two mechanisms, both necessary. The blur is *bilateral* — each tap is weighted by luma distance as well as by spatial distance — so eyelashes, nostrils, the lip line and the hairline are cliffs the smoothing steps around rather than melts; a plain Gaussian's treatment of those edges is exactly what reads as a mask. Then the combine hands the removed texture back: everything the blur took out is `source − smoothed`, and `detail` of it is added to the result, which is frequency separation. Pores and stubble therefore survive a heavy smooth. `detail` is a persisted field and deliberately **not** a control — §8.7 asks one question per effect, and "how much of what you removed would you like back" is not a question a user can hold in their head.
+
+**Half resolution costs nothing visually.** The bilateral runs at half resolution and the combine at full, so the frequencies the downsample discards are precisely the ones the combine restores from the full-resolution source.
+
+**The gate is chroma, and the person mask is opportunistic.** Skin occupies a compact region of Rec.601 Cb/Cr, and across skin tones melanin moves brightness far more than it moves hue — so a chroma region covers the range of human skin where a luma threshold would quietly work for some people and not others. Chroma needs nothing but the frame, which is the point: **turning retouch on must never buy a Vision segmentation request.** Retouch is therefore not in the pipeline's mask-consumer set. When a mask does happen to exist — someone has blur, a virtual background, or a layer behind them — it narrows the gate to the subject. That can only change the picture *outside* the person, never on the face, which is what makes an opportunistic input honest here.
+
+**Measured cost**, 1920×1080, Apple silicon: 0.64 ms at the default amount, 0.78 ms at full, against background blur's 0.92 ms in the same harness. The 60 fps balanced budget is 6.7 ms (§3.4), so the stage is about a tenth of it. Its GPU weight is 9, against blur's 12.
+
+**Amount 0 is off, and 0 is where it ships.** The stage declines to encode, `isInert` reports it, and every surface says `On, but the amount is 0.` Switching the stage on when the amount is still zero lifts it to `RetouchSettings.defaultAmount` — the LUT/Neutral and Style/Normal remedy for the §8.7 inert-toggle problem, applied to an effect that has exactly one knob and therefore exactly one unambiguous value meaning "on".
 
 ---
 

@@ -1,37 +1,52 @@
 // RetouchSettings.swift
 // PRISM
 //
-// Parameters for the skin retouch stage (§5.4, .expensive). The stage is
-// registered and declines to encode; these are the knobs its kernel will
-// read. They live here, in their own file, so that the retouch work can add
-// fields without touching a file any other track is editing.
+// Parameters for the skin retouch stage (§5.22, .expensive). One user knob —
+// amount — and the derived quantities its kernel reads. They live here, in
+// their own file, so that the retouch work can add fields without touching a
+// file any other track is editing.
 //
 // Licensed under the Apache License, Version 2.0.
 
 import Foundation
 
 public struct RetouchSettings: Codable, Equatable {
-    /// How much smoothing to apply. Deliberately well under half: retouch is
-    /// the effect people notice on other people's calls, and the failure mode
-    /// is a plastic mask, not an under-smoothed cheek.
-    public var amount: Double = 0.35        // 0…1
+    /// What switching the stage on picks when the amount is still at zero.
+    /// Deliberately well under half: retouch is the effect people notice on
+    /// other people's calls, and the failure mode is a plastic mask, not an
+    /// under-smoothed cheek.
+    public static let defaultAmount: Double = 0.35
+
+    /// How much smoothing to apply. Zero is off, and zero is where it starts:
+    /// the stage ships disabled and its knob ships inert, so a fresh install
+    /// and a fresh preset both send the camera through untouched. Switching
+    /// the stage on lifts a zero amount to `defaultAmount` (AppState), which
+    /// is the LUT/Neutral remedy for the §8.7 inert-toggle problem — the
+    /// switch is never on and doing nothing.
+    public var amount: Double = 0            // 0…1
     /// How much fine texture survives. Pores and stubble are what stop a
-    /// smoothed face reading as a render, so the default keeps most of them —
-    /// this is the knob that separates "retouched" from "airbrushed".
-    public var detail: Double = 0.55        // 0…1
+    /// smoothed face reading as a render, so the default keeps most of them.
+    ///
+    /// Not a control. §8.7 asks one question per effect, and the question
+    /// here is "how much", not "how much, and how much of what you removed
+    /// would you like back" — the second one has no answer a user can hold in
+    /// their head. It stays a persisted field so the value is stable across
+    /// builds and can be dialled from an exported preset.
+    public var detail: Double = 0.55         // 0…1
     public init() {}
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        amount = c.tolerant(.amount, 0.35)
+        amount = c.tolerant(.amount, 0)
         detail = c.tolerant(.detail, 0.55)
     }
 
-    /// The floor exists because an amount of zero would be an "on" switch
-    /// that changes nothing — the §8.7 inert-toggle problem, and the same
-    /// reason ConnectionSettings.severity is floored.
-    public var clampedAmount: Double { min(max(amount, 0.1), 1) }
+    public var clampedAmount: Double { min(max(amount, 0), 1) }
     public var clampedDetail: Double { min(max(detail, 0), 1) }
+
+    /// True when the stage would change nothing, so `wantsEncode()` can
+    /// decline and every surface can say why the switch is doing nothing.
+    public var isInert: Bool { clampedAmount <= 0 }
 
     /// Spatial radius of the smoothing kernel, in pixels at the given frame
     /// height. Expressed against 1080 and scaled, exactly like the blur and
@@ -52,9 +67,10 @@ public struct RetouchSettings: Codable, Equatable {
     }
 
     /// Fraction of the smoothed result mixed back over the original. Kept
-    /// below one at full amount: a retouch that fully replaces the skin has
-    /// no high-frequency content left to blend, and that is the plastic look.
+    /// below one at full amount: even with the detail pass handing texture
+    /// back, a retouch that fully replaces the skin has nothing of the
+    /// original left to disagree with it, and that is the plastic look.
     public var blend: Double {
-        0.15 + 0.75 * clampedAmount
+        0.9 * clampedAmount
     }
 }

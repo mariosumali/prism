@@ -38,7 +38,7 @@ public enum StageID: String, Codable, CaseIterable, Hashable, Comparable {
     case freeze
     case gaze
     case geometry
-    case retouch     // §5.4 skin smoothing; gated on skin chroma, pre-colour
+    case retouch     // §5.22 skin smoothing; gated on skin chroma, pre-colour
     case adjust
     case lut
     case blur

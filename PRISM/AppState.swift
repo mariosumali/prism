@@ -182,6 +182,11 @@ public final class AppState: ObservableObject {
     /// Eye contact has found a face and is actually correcting. A correction
     /// that silently does nothing is indistinguishable from a broken one.
     @Published public var eyeContactTracking = false
+    /// A face-anchored layer (§5.8) has a face to sit on. Separate from
+    /// `eyeContactTracking` because it asks a weaker question: a prop needs a
+    /// face box, which a profile turn still gives, while a gaze correction
+    /// needs both pupils, which it does not.
+    @Published public var faceAnchorTracking = false
 
     // Pipeline / format
     @Published public var config = PipelineConfiguration()
@@ -873,6 +878,9 @@ public final class AppState: ObservableObject {
             let tracking = pipeline.gazeStage.isTracking
                 && config.flags(for: .gaze).enabled
             if eyeContactTracking != tracking { eyeContactTracking = tracking }
+            let anchored = pipeline.faceTracker.isTracking
+                && pipeline.overlayStage.needsFaceTracker
+            if faceAnchorTracking != anchored { faceAnchorTracking = anchored }
         }
     }
 
@@ -2313,6 +2321,12 @@ public final class AppState: ObservableObject {
                 // The catalogue's first tile after Normal (grids lead with
                 // the distortions).
                 cfg.style.effect = firstEffect
+            }
+            // Retouch has a single knob and it ships at zero, so it is the
+            // same case: there is exactly one value that means "on", and
+            // guessing it is unambiguous.
+            if enabled, id == .retouch, cfg.retouch.amount <= 0 {
+                cfg.retouch.amount = RetouchSettings.defaultAmount
             }
         }
         // Clearing a manual LIVE toggle also clears any auto-disable latch;

@@ -773,4 +773,163 @@ final class KernelTests: XCTestCase {
             XCTAssertEqual(slots[i], sentinel, "slot \(i) must be untouched")
         }
     }
+
+    // MARK: - 10. prism_retouch_blur / prism_retouch_combine
+
+    /// A mid-grey with a skin hue: what the gate is supposed to let through.
+    private static let skinColor = SIMD4<Float>(0.78, 0.60, 0.50, 1)
+
+    private func runRetouchBlur(direction: SIMD2<Float>,
+                                radius: Float,
+                                rangeSigma: Float,
+                                from src: MTLTexture,
+                                to dst: MTLTexture) throws {
+        try run2D("prism_retouch_blur", output: dst) { enc in
+            enc.setTexture(src, index: 0)
+            enc.setTexture(dst, index: 1)
+            var p = PRISMRetouchBlurParams()
+            p.direction = direction
+            p.radius = radius
+            p.rangeSigma = rangeSigma
+            setParams(enc, p, index: 0)
+        }
+    }
+
+    private func runRetouchCombine(src: MTLTexture,
+                                   smoothed: MTLTexture,
+                                   mask: MTLTexture?,
+                                   amount: Float,
+                                   detail: Float,
+                                   to dst: MTLTexture) throws {
+        try run2D("prism_retouch_combine", output: dst) { enc in
+            enc.setTexture(src, index: 0)
+            enc.setTexture(smoothed, index: 1)
+            enc.setTexture(mask ?? src, index: 2)
+            enc.setTexture(dst, index: 3)
+            var p = PRISMRetouchParams()
+            p.amount = amount
+            p.detail = detail
+            p.useMask = mask == nil ? 0 : 1
+            setParams(enc, p, index: 0)
+        }
+    }
+
+    /// The edge-preserving claim, stated as a comparison: with a tight range
+    /// sigma a luma cliff survives the blur, and with a loose one — which is
+    /// a plain Gaussian in all but name — it does not. This is the whole
+    /// difference between a retouched face and a plastic one.
+    func testRetouchBlurKeepsAHardEdgeThatAGaussianWouldMelt() throws {
+        // Dark left half, bright right half — an eyelash, structurally.
+        let step = (0..<(Self.width * Self.height)).map { i -> SIMD4<Float> in
+            (i % Self.width) < Self.width / 2 ? SIMD4(0.1, 0.1, 0.1, 1)
+                                              : SIMD4(0.9, 0.9, 0.9, 1)
+        }
+        let src = try makeTexture(width: Self.width, height: Self.height, pixels: step)
+        let preserved = try makeOutputTexture(width: Self.width, height: Self.height)
+        let melted = try makeOutputTexture(width: Self.width, height: Self.height)
+
+        try runRetouchBlur(direction: SIMD2(1, 0), radius: 8, rangeSigma: 0.03,
+                           from: src, to: preserved)
+        try runRetouchBlur(direction: SIMD2(1, 0), radius: 8, rangeSigma: 10,
+                           from: src, to: melted)
+
+        // One pixel to the left of the seam, on the dark side.
+        let x = Self.width / 2 - 1
+        let dark = pixel(readPixels(preserved), x, 18).x
+        let bled = pixel(readPixels(melted), x, 18).x
+        XCTAssertLessThan(dark, 0.2, "the bilateral must not pull the bright half across")
+        XCTAssertGreaterThan(bled, dark + 0.15,
+                             "a wide range sigma is a plain Gaussian and must bleed")
+    }
+
+    /// Inside a region of one colour there is no edge to protect, so the
+    /// bilateral has to smooth exactly like the Gaussian it is built from —
+    /// otherwise it would preserve the pores it exists to soften.
+    func testRetouchBlurStillSmoothsWithinOneTone() throws {
+        var pixels = uniform(SIMD4<Float>(0.5, 0.5, 0.5, 1))
+        // A speck of texture: one pixel a little brighter than its neighbours.
+        pixels[18 * Self.width + 32] = SIMD4(0.56, 0.56, 0.56, 1)
+        let src = try makeTexture(width: Self.width, height: Self.height, pixels: pixels)
+        let dst = try makeOutputTexture(width: Self.width, height: Self.height)
+        try runRetouchBlur(direction: SIMD2(1, 0), radius: 6, rangeSigma: 0.12,
+                           from: src, to: dst)
+        let out = pixel(readPixels(dst), 32, 18).x
+        XCTAssertLessThan(out, 0.545, "fine texture within one tone must be averaged away")
+        XCTAssertGreaterThan(out, 0.5)
+    }
+
+    /// Amount 0 is off, not "run four passes and write the source back with a
+    /// rounding error in it".
+    func testRetouchCombineAtZeroAmountIsExactPassThrough() throws {
+        let src = try makeTexture(width: Self.width, height: Self.height,
+                                  pixels: uniform(Self.skinColor))
+        let smoothed = try makeTexture(width: Self.width, height: Self.height,
+                                       pixels: uniform(SIMD4(0, 1, 0, 1)))
+        let dst = try makeOutputTexture(width: Self.width, height: Self.height)
+        try runRetouchCombine(src: src, smoothed: smoothed, mask: nil,
+                              amount: 0, detail: 0, to: dst)
+        assertImagesClose(readPixels(dst), readPixels(src),
+                          "amount 0 must not touch a single pixel")
+    }
+
+    /// Full detail restores everything the blur removed, so the combine is an
+    /// identity however hard the smoothing was. This is the property that
+    /// makes `detail` the honest knob it claims to be.
+    func testRetouchCombineAtFullDetailReturnsTheSource() throws {
+        let src = try makeTexture(width: Self.width, height: Self.height,
+                                  pixels: uniform(Self.skinColor))
+        let smoothed = try makeTexture(width: Self.width, height: Self.height,
+                                       pixels: uniform(SIMD4(0.5, 0.4, 0.35, 1)))
+        let dst = try makeOutputTexture(width: Self.width, height: Self.height)
+        try runRetouchCombine(src: src, smoothed: smoothed, mask: nil,
+                              amount: 1, detail: 1, to: dst)
+        assertImagesClose(readPixels(dst), readPixels(src),
+                          "detail 1 hands every removed frequency back")
+    }
+
+    /// The gate is chroma, so a blue wall behind someone is left alone even
+    /// at full amount — and the same test says the gate is doing something
+    /// rather than passing everything.
+    func testRetouchCombineSmoothsSkinAndLeavesOtherColoursAlone() throws {
+        let half = (0..<(Self.width * Self.height)).map { i -> SIMD4<Float> in
+            (i % Self.width) < Self.width / 2 ? Self.skinColor
+                                              : SIMD4(0.15, 0.25, 0.80, 1)
+        }
+        let src = try makeTexture(width: Self.width, height: Self.height, pixels: half)
+        // A flat "smoothed" input, so any movement is unambiguous.
+        let smoothed = try makeTexture(width: Self.width, height: Self.height,
+                                       pixels: uniform(SIMD4(0.5, 0.5, 0.5, 1)))
+        let dst = try makeOutputTexture(width: Self.width, height: Self.height)
+        try runRetouchCombine(src: src, smoothed: smoothed, mask: nil,
+                              amount: 1, detail: 0, to: dst)
+        let out = readPixels(dst)
+        let skin = pixel(out, 8, 18)
+        let wall = pixel(out, 56, 18)
+        XCTAssertGreaterThan(simd_reduce_max(simd_abs(skin - Self.skinColor)), 0.05,
+                             "skin must actually be smoothed")
+        assertClose(wall, quantized(SIMD4(0.15, 0.25, 0.80, 1)), tolerance: 0.02,
+                    "a blue wall is not skin and must be untouched")
+    }
+
+    /// The mask is opportunistic, but when it is there it narrows the gate to
+    /// the subject: skin-coloured furniture behind someone stays sharp.
+    func testRetouchCombineMaskNarrowsTheGateToTheSubject() throws {
+        let src = try makeTexture(width: Self.width, height: Self.height,
+                                  pixels: uniform(Self.skinColor))
+        let smoothed = try makeTexture(width: Self.width, height: Self.height,
+                                       pixels: uniform(SIMD4(0.2, 0.2, 0.2, 1)))
+        let maskValues = (0..<(Self.width * Self.height)).map { i -> Float in
+            (i % Self.width) < Self.width / 2 ? 1 : 0
+        }
+        let mask = try makeMaskTexture(width: Self.width, height: Self.height,
+                                       values: maskValues)
+        let dst = try makeOutputTexture(width: Self.width, height: Self.height)
+        try runRetouchCombine(src: src, smoothed: smoothed, mask: mask,
+                              amount: 1, detail: 0, to: dst)
+        let out = readPixels(dst)
+        XCTAssertLessThan(pixel(out, 8, 18).x, Self.skinColor.x - 0.1,
+                          "the subject must be smoothed")
+        assertClose(pixel(out, 56, 18), quantized(Self.skinColor), tolerance: 0.02,
+                    "mask 0 must leave the frame exactly as it arrived")
+    }
 }

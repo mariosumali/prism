@@ -104,19 +104,31 @@ struct SceneSection: View {
     }
 
     private var overlayRow: some View {
-        HStack(spacing: Metrics.itemGap) {
-            Text("Overlay")
-                .font(.body)
-            Spacer(minLength: 0)
-            Text(layerSummary)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Toggle("Overlay", isOn: overlayBinding)
-                .labelsHidden()
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                .accessibilityLabel("Overlay layers")
-            costLabel(for: .overlay)
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: Metrics.itemGap) {
+                Text("Overlay")
+                    .font(.body)
+                Spacer(minLength: 0)
+                Text(layerSummary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Toggle("Overlay", isOn: overlayBinding)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .accessibilityLabel("Overlay layers")
+                costLabel(for: .overlay)
+            }
+            // A layer that rides the face draws nothing until there is a face
+            // to ride, and the same rule as eye contact applies: an effect
+            // that silently does nothing looks exactly like a broken one.
+            if state.editingConfig.overlay.needsFaceTracker {
+                Text(state.faceAnchorTracking
+                     ? "Tracking your face"
+                     : "Looking for your face…")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 

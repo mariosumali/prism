@@ -3,9 +3,9 @@
 //
 // The full effects chain over a live preview, one section per stage:
 // enable + "require" (pin, §3.4 — exempt from automatic degradation) + live
-// measured cost, then every parameter. Adjust's five sliders, LUT
-// choice/strength/import, the Style catalogue grid with its intensity
-// slider, blur quality/radius. Edits stage into the draft (previewed
+// measured cost, then every parameter. Adjust's five sliders, skin retouch's
+// one, LUT choice/strength/import, the Style catalogue grid with its
+// intensity slider, blur quality/radius. Edits stage into the draft (previewed
 // privately, applied from the Apply bar). Radius and strength are clamped
 // again by the stages, so the slider ranges here are UI ergonomics, not
 // safety.
@@ -60,6 +60,20 @@ struct EffectsPane: View {
                     state.updateEditing { $0.adjust = AdjustSettings() }
                 }
                 .disabled(state.editingConfig.adjust.isIdentity)
+            }
+            Section("Skin") {
+                stageHeader(.retouch)
+                PrismSliderRow(label: "Amount",
+                               value: retouchAmountBinding,
+                               range: 0...1,
+                               defaultValue: RetouchSettings.defaultAmount,
+                               fractionDigits: 2)
+                Text("Softens the texture of skin and leaves everything else alone. Edges are what it steps around — eyes, lashes, nostrils and the line of the lips stay exactly as sharp as the camera saw them.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("This smooths the skin you have. It is an average of the pixels already in the frame, not a face drawn over yours, and the fine texture the smoothing removes is handed back on purpose — that is what keeps a retouched face from reading as a mask.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Section("LUT") {
                 stageHeader(.lut)
@@ -219,6 +233,14 @@ struct EffectsPane: View {
             get: { state.editingConfig.adjust[keyPath: keyPath] },
             set: { newValue in
                 state.updateEditing { $0.adjust[keyPath: keyPath] = newValue }
+            })
+    }
+
+    private var retouchAmountBinding: Binding<Double> {
+        Binding(
+            get: { state.editingConfig.retouch.amount },
+            set: { amount in
+                state.updateEditing { $0.retouch.amount = amount }
             })
     }
 

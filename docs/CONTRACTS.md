@@ -109,6 +109,8 @@ texture format, not the shader). Include `KernelTypes.h` for param structs.
 | `prism_lut` | LUT.metal | src t0, dst t1, lut `texture3d<float>` t2, `constant PRISMLUTParams&` b0 |
 | `prism_geometry` | Geometry.metal | src t0, dst t1, `constant PRISMGeometryParams&` b0 — applies `uvTransform` (output UV → input UV, 3×3, bottom row 0 0 1); bilinear sample when `useLanczos == 0`, 4-tap-per-axis Lanczos-2 when 1; out-of-range UV → opaque black |
 | `prism_blur` | Blur.metal | src t0, dst t1, `constant PRISMBlurParams&` b0 — separable Gaussian along `direction`, sigma = radius/2, clamped ≤ 31 taps |
+| `prism_retouch_blur` | Retouch.metal | src t0, dst t1, `constant PRISMRetouchBlurParams&` b0 — one direction of a separable **bilateral**: sigma = radius/2, taps clamped ≤ 21, each tap weighted by `exp(−i²/2σ² − Δluma²/2·rangeSigma²)`. The centre tap weighs 1, so the weight sum can never reach zero |
+| `prism_retouch_combine` | Retouch.metal | src t0, smoothed t1, mask t2 (single channel, person = 1), dst t3, `constant PRISMRetouchParams&` b0 — `smoothed` may be lower-resolution and is sampled linearly; gate = Rec.601 skin-chroma membership, × mask when `useMask != 0`; result = `mix(src, smoothed + (src − smoothed)·detail, amount·gate)`, source alpha preserved. `amount == 0` or `detail == 1` reproduces the source exactly |
 | `prism_composite` | Composite.metal | sharp t0, blurred t1, mask `texture2d<float>` t2 (single channel, person = 1), dst t3, `constant PRISMCompositeParams&` b0 |
 | `prism_output_fit` | Composite.metal | src t0, dst t1, `constant PRISMFitParams&` b0 — scale/offset content, bars are opaque black |
 | `prism_crossfade` | Composite.metal | a t0, b t1, dst t2, `constant PRISMCrossfadeParams&` b0 |
@@ -863,12 +865,26 @@ public final class GeometryStage: EffectStage {    // id .geometry, cost .cheap
     /// Auto-framing (§5.4): smoothed target from AutoFramer; identity when off.
     public var autoFrameOffset: (zoom: Double, panX: Double, panY: Double)
     public func buildUVTransform(inputSize: CGSize) -> simd_float3x3  // exposed for tests
+    /// buildUVTransform, or identity when the stage declines to encode.
+    /// Anything anchored to a pre-Geometry measurement composes with THIS.
+    public func appliedUVTransform(inputSize: CGSize) -> simd_float3x3
 }
 public final class AdjustStage: EffectStage {      // id .adjust, cost .cheap
     public var settings: AdjustSettings
 }
 public final class LUTStage: EffectStage {         // id .lut, cost .moderate
     public var settings: LUTSettings { get set }   // setting lutName loads texture via LUTStore
+}
+public final class RetouchStage: EffectStage {      // id .retouch, cost .expensive
+    /// §5.22. Four passes: half-res downsample → bilateral H → bilateral V →
+    /// full-res combine. The person mask is read if one exists and NEVER
+    /// demanded — retouch is deliberately absent from the pipeline's
+    /// maskConsumers, because switching it on must not start a Vision
+    /// segmentation request. The gate it does own is skin chroma.
+    /// Declines to encode at amount 0, which is the shipping default.
+    public init(metal: MetalContext, segmenter: PersonSegmenter) throws
+    public var settings: RetouchSettings
+    public let segmenter: PersonSegmenter
 }
 public final class BlurStage: EffectStage {        // id .blur, cost .expensive
     public var settings: BlurSettings
@@ -939,11 +955,33 @@ public final class OverlayStage: EffectStage {      // id .overlay, cost .modera
                 faceTracker: FaceTracker) throws
     public var settings: OverlaySettings            // caps: maxLayers total, maxVideoLayers video
     public let segmenter: PersonSegmenter
-    public let faceTracker: FaceTracker             // face-anchored layers, later
+    public let faceTracker: FaceTracker
     public var needsPersonMask: Bool { get }        // true when any layer is .behind
+    public var needsFaceTracker: Bool { get }       // true when any layer is .face-anchored
+    /// Output UV → pre-Geometry input UV, pushed once per frame by the
+    /// pipeline (GeometryStage.appliedUVTransform). Face-anchored placement
+    /// is built in the tracker's space and composed with this, so a prop
+    /// survives zoom, pan, rotation, mirror and auto-framing exactly.
+    public var faceSpaceTransform: simd_float3x3
     public func setDemandActive(_ active: Bool)
     static func placement(layer: OverlayLayer, contentSize: CGSize,
                           outputSize: CGSize) -> simd_float3x3
+    /// §5.8. Span is the face box width × scale (size 1 = as wide as the
+    /// face); offsets are in face widths and rotate with the layer; roll is
+    /// negated into this y-down space and applied only when followsRoll.
+    /// Returns identity for a degenerate face rather than centring on the
+    /// frame. Tracking loss is handled in wantsEncode/encode: below a
+    /// confidence of 0.01 the layer is skipped, above it the layer's opacity
+    /// is scaled by the tracker's ramp, so the prop fades rather than
+    /// freezing in mid-air or flashing with detection flicker.
+    static func facePlacement(layer: OverlayLayer, contentSize: CGSize,
+                              frameSize: CGSize, face: FaceTracker.FaceSample,
+                              geometry: simd_float3x3) -> simd_float3x3
+    /// Where a layer's centre lands, in the tracker's input UV. Fractions of
+    /// the face box height from its centre, rotated by `roll`; the measured
+    /// eye midpoint wins for .eyes when both eyes are landmarked.
+    static func anchorPoint(face: FaceTracker.FaceSample, point: FaceAnchorPoint,
+                            roll: Float, frameAspect: Float) -> SIMD2<Float>
 }
 public final class ReplayStage: EffectStage {       // id .replay, cost .cheap
     public var player: ReplayPlayer?                // substitutes while active

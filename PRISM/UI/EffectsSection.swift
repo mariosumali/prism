@@ -1,7 +1,7 @@
 // EffectsSection.swift
 // PRISM
 //
-// Collapsible Effects section (§8.3): Adjust, LUT, Style, and Blur rows with
+// Collapsible Effects section (§8.3): Adjust, Skin, LUT, Style, and Blur rows with
 // per-stage measured cost at .caption2 secondary, inline pickers, pin
 // ("Require this effect") via context menu, and the auto-disabled caption.
 //
@@ -16,6 +16,9 @@ struct EffectsSection: View {
         DisclosureGroup(isExpanded: isExpanded) {
             VStack(alignment: .leading, spacing: Metrics.itemGap) {
                 effectRow(.adjust, title: "Adjust") {
+                    EmptyView()
+                }
+                effectRow(.retouch, title: "Skin") {
                     EmptyView()
                 }
                 effectRow(.lut, title: "LUT") {
@@ -41,7 +44,7 @@ struct EffectsSection: View {
     /// stage reports a number, so the switches hold a single vertical line
     /// instead of jogging sideways as stages are turned on and off.
     private var showsCostColumn: Bool {
-        [StageID.adjust, .lut, .style, .blur].contains {
+        [StageID.adjust, .retouch, .lut, .style, .blur].contains {
             (state.stageStatus[$0] ?? StageStatus()).measuredMs > 0
         }
     }
@@ -93,7 +96,8 @@ struct EffectsSection: View {
     /// does. Adjust's five parameters live only in the main window, so its row
     /// here can otherwise look permanently broken (§8.4). Style's intensity
     /// slider lives there too, so an intensity of 0 is the same trap: picking
-    /// looks here changes nothing until the main window fixes the slider.
+    /// looks here changes nothing until the main window fixes the slider, and
+    /// Skin's one knob is the same again.
     @ViewBuilder
     private func inertCaption(_ id: StageID, reason: String) -> some View {
         HStack(spacing: Metrics.itemGap) {
@@ -106,6 +110,10 @@ struct EffectsSection: View {
                     .font(.caption2)
             } else if id == .style, state.editingConfig.style.intensity <= 0 {
                 Button("Set intensity…") { state.showMainWindow() }
+                    .buttonStyle(.link)
+                    .font(.caption2)
+            } else if id == .retouch {
+                Button("Set amount…") { state.showMainWindow() }
                     .buttonStyle(.link)
                     .font(.caption2)
             }

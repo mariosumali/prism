@@ -3,9 +3,9 @@
 //
 // Everything that changes what is in frame besides you: the background
 // (§5.4 blur / §5.7 replacement), overlay layers with chroma and luma keying
-// (§5.8), and eye-contact correction (§5.6). Edits stage into the draft like
-// every other editing surface, so the Apply bar previews them privately
-// before any client app sees them.
+// and frame- or face-anchored placement (§5.8), and eye-contact correction
+// (§5.6). Edits stage into the draft like every other editing surface, so the
+// Apply bar previews them privately before any client app sees them.
 //
 // Licensed under the Apache License, Version 2.0.
 
@@ -183,7 +183,7 @@ struct ScenePane: View {
             }
 
             if state.editingConfig.overlay.layers.isEmpty {
-                Text("Drop an image or video anywhere on this pane, or use Add layer. A PNG with alpha composites as-is; a green-screen clip gets keyed. Put a layer behind you and you are standing in front of it.")
+                Text("Drop an image or video anywhere on this pane, or use Add layer. A PNG with alpha composites as-is; a green-screen clip gets keyed. Put a layer behind you and you are standing in front of it, or pin it to your face and it rides along — a hat above your head, glasses on the eye line, a moustache under your nose.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
@@ -193,6 +193,13 @@ struct ScenePane: View {
                 Text("Layers composite bottom-up, up to \(OverlaySettings.maxLayers). Each one is a compute pass and, for video, its own decoder.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if state.editingConfig.overlay.needsFaceTracker {
+                    Text(state.faceAnchorTracking
+                         ? "Tracking your face."
+                         : "Looking for your face… a layer pinned to it stays hidden until one is found.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -340,6 +347,28 @@ private struct LayerEditor: View {
                 }
 
                 Divider()
+                Picker("Pinned to", selection: binding(\.anchor)) {
+                    ForEach(LayerAnchor.allCases, id: \.self) { anchor in
+                        Text(anchor.displayName).tag(anchor)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                if layer.anchor == .face {
+                    Picker("Sits on", selection: binding(\.facePoint)) {
+                        ForEach(FaceAnchorPoint.allCases, id: \.self) { point in
+                            Text(point.displayName).tag(point)
+                        }
+                    }
+                    Toggle("Tilt with my head", isOn: binding(\.followsRoll))
+                    Text("Size is measured against your face, not the frame: at 1 the layer is exactly as wide as you are, so a prop keeps its proportion as you lean in and back out. Horizontal and Vertical move it in face widths.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("If PRISM loses your face the layer fades out and waits, rather than hanging in the air where your head used to be. It fades back the moment you are found again.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 PrismSliderRow(label: "Size", value: binding(\.scale),
                                range: 0.05...4, defaultValue: 1, fractionDigits: 2)
                 PrismSliderRow(label: "Horizontal", value: binding(\.offsetX),
@@ -374,7 +403,9 @@ private struct LayerEditor: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer()
-                Text(layer.placement.displayName)
+                Text(layer.anchor == .face
+                     ? layer.facePoint.displayName
+                     : layer.placement.displayName)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

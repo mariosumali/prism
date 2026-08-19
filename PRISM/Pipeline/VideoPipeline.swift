@@ -258,12 +258,18 @@ public final class VideoPipeline {
     /// somewhat, which is the acceptable direction — the model is
     /// proportional, not a measurement.
     ///
+    /// Retouch's 9 was 5 while the stage was a registered skeleton, which was
+    /// a guess. Measured at 1080p it costs 0.64 ms at the default amount and
+    /// 0.78 ms at full against blur's 0.92 ms, so it sits just under blur
+    /// rather than at half of it — its bilateral taps are dearer than a
+    /// Gaussian's and it runs the same four-pass shape.
+    ///
     /// Internal rather than private so ChainRegistrationTests can prove every
     /// StageID has an entry: a missing weight silently attributes 1ms-equivalent
     /// to a stage that may be the most expensive in the chain.
     static let stageWeights: [StageID: Double] = [
         .clip: 1, .replay: 1, .freeze: 1, .gaze: 8, .geometry: 2,
-        .retouch: 5, .adjust: 1, .lut: 3, .blur: 12, .background: 6,
+        .retouch: 9, .adjust: 1, .lut: 3, .blur: 12, .background: 6,
         .overlay: 3, .style: 5, .connection: 1, .outputFit: 1,
     ]
 
@@ -280,11 +286,9 @@ public final class VideoPipeline {
 
     /// Stages that consume the shared face measurement. Tracking runs once per
     /// frame at the first of these positions — pre-geometry, which is the
-    /// space eye contact warps in (§5.6). Retouch and overlay are listed
-    /// because they hold the tracker for features still to land; neither
-    /// contributes demand yet, so today the request runs exactly when the
-    /// eye-contact pass does.
-    private static let faceConsumers: Set<StageID> = [.gaze, .retouch, .overlay]
+    /// space eye contact warps in (§5.6) and the space face-anchored overlay
+    /// layers are placed in before the geometry matrix carries them forward.
+    private static let faceConsumers: Set<StageID> = [.gaze, .overlay]
 
     // MARK: Init / configure
 
@@ -300,7 +304,7 @@ public final class VideoPipeline {
         freezeStage = try FreezeStage(metal: metal)
         gazeStage = try GazeStage(metal: metal, faceTracker: faceTracker)
         geometryStage = try GeometryStage(metal: metal)
-        retouchStage = try RetouchStage(metal: metal, faceTracker: faceTracker)
+        retouchStage = try RetouchStage(metal: metal, segmenter: segmenter)
         adjustStage = try AdjustStage(metal: metal)
         lutStage = try LUTStage(metal: metal)
         blurStage = try BlurStage(metal: metal, segmenter: segmenter)
@@ -657,6 +661,11 @@ public final class VideoPipeline {
         var useA = true
         var segmentationDone = false
         var faceTrackingDone = false
+        // The face is measured pre-Geometry and the layers land post-Geometry,
+        // so the overlay stage needs this frame's crop to put a prop back on
+        // the head it was measured on.
+        overlayStage.faceSpaceTransform = geometryStage.appliedUVTransform(
+            inputSize: CGSize(width: source.width, height: source.height))
         for stage in userStages {
             // One landmark request per frame for every face consumer, taken
             // at the first consumer's position, for the same reason as the
@@ -664,7 +673,10 @@ public final class VideoPipeline {
             // for identical numbers.
             if !faceTrackingDone, Self.faceConsumers.contains(stage.id) {
                 faceTrackingDone = true
-                if gazeStage.wantsEncode() {
+                // Eye contact, or a layer actually anchored to a face. A
+                // frame-anchored layer never reaches this, so nobody pays for
+                // Vision because they dropped a lower third on the picture.
+                if gazeStage.wantsEncode() || overlayStage.needsFaceTracker {
                     faceTracker.isDemanded = true
                     faceTracker.update(commandBuffer: commandBuffer, input: current)
                 } else if faceTracker.isDemanded {

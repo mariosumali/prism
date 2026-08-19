@@ -57,7 +57,7 @@ final class DraftRenderer {
     private static let maskConsumers: Set<StageID> = [.blur, .background, .overlay]
 
     /// Mirrors VideoPipeline.faceConsumers, likewise.
-    private static let faceConsumers: Set<StageID> = [.gaze, .retouch, .overlay]
+    private static let faceConsumers: Set<StageID> = [.gaze, .overlay]
 
     /// The finished draft texture for the preview. Completion-thread callback.
     var onOutput: ((MTLTexture) -> Void)?
@@ -85,7 +85,7 @@ final class DraftRenderer {
         faceTracker = try FaceTracker(metal: metal)
         gazeStage = try GazeStage(metal: metal, faceTracker: faceTracker)
         geometryStage = try GeometryStage(metal: metal)
-        retouchStage = try RetouchStage(metal: metal, faceTracker: faceTracker)
+        retouchStage = try RetouchStage(metal: metal, segmenter: segmenter)
         adjustStage = try AdjustStage(metal: metal)
         lutStage = try LUTStage(metal: metal)
         blurStage = try BlurStage(metal: metal, segmenter: segmenter)
@@ -197,6 +197,8 @@ final class DraftRenderer {
         var useA = true
         var segmentationDone = false
         var faceTrackingDone = false
+        overlayStage.faceSpaceTransform = geometryStage.appliedUVTransform(
+            inputSize: CGSize(width: source.width, height: source.height))
         for stage in userStages {
             // Same one-request-per-frame contract as VideoPipeline, and for
             // the same reason the draft segments: a drafted eye contact that
@@ -204,7 +206,7 @@ final class DraftRenderer {
             // not do.
             if !faceTrackingDone, Self.faceConsumers.contains(stage.id) {
                 faceTrackingDone = true
-                if gazeStage.wantsEncode() {
+                if gazeStage.wantsEncode() || overlayStage.needsFaceTracker {
                     faceTracker.isDemanded = true
                     faceTracker.update(commandBuffer: commandBuffer, input: current)
                 } else if faceTracker.isDemanded {
