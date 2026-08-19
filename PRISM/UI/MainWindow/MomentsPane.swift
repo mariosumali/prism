@@ -22,6 +22,7 @@ struct MomentsPane: View {
             bufferSection
             replaySection
             awaySection
+            presenceSection
             lagSection
             connectionSection
             panicSection
@@ -255,6 +256,73 @@ struct MomentsPane: View {
         }
     }
 
+    // MARK: - Presence (§5.28)
+
+    private var presenceSection: some View {
+        Section("When you step away") {
+            Picker("Do this", selection: presenceActionBinding) {
+                ForEach(PresenceAction.allCases, id: \.self) { action in
+                    Text(action.displayName).tag(action)
+                }
+            }
+            if state.studio.presence.action == .loop {
+                Text("Choosing the loop turns the rolling buffer on, because that is where the loop comes from. It stays on until you turn it off.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            PrismSliderRow(label: "Wait before acting",
+                           value: presenceAwayBinding,
+                           range: 2...60,
+                           defaultValue: 6,
+                           fractionDigits: 0,
+                           unit: " s")
+            PrismSliderRow(label: "Come back after",
+                           value: presenceReturnBinding,
+                           range: 0.2...10,
+                           defaultValue: 1,
+                           fractionDigits: 1,
+                           unit: " s")
+            PrismSliderRow(label: "Counts as present at",
+                           value: presenceCoverageBinding,
+                           range: 0.005...0.5,
+                           defaultValue: 0.04,
+                           fractionDigits: 3)
+            Toggle("Tell me when I leave with PRISM on air",
+                   isOn: presenceNotifyBinding)
+            if state.studio.presence.isActive {
+                LabeledContent("Right now", value: presenceStateLine)
+            }
+            if state.presenceEngaged {
+                Button("I'm back") { state.comeBack() }
+            }
+            Text("Leaving is slow and coming back is fast, deliberately. A late trigger costs nothing — you had already walked out. A false one puts a recording of you on air while you are sitting there talking, and you find out when somebody says you have frozen.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("Reaching out of shot for a coffee does not empty the frame for \(Int(state.studio.presence.clampedAwaySeconds.rounded())) seconds. Going to answer the door does.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("PRISM looks for an upper body about once a second, on a small copy of the picture — not the background-blur silhouette, which costs far more and would have to run all meeting to answer one question a second. The camera only: while a screen is on air there is nobody in the picture to look for, so nothing is watched and nothing fires.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("Muting follows the “Mute while away” switch above — one question, one control, whichever of the two actions fires. Whatever PRISM engages comes off the moment you are back, or the moment you press “I'm back”, and it only ever undoes what it did itself.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// The calibration readout. The coverage slider is the one control here
+    /// whose right value depends on the room, and it is unusable without a
+    /// live answer to "does PRISM think I am here".
+    private var presenceStateLine: String {
+        switch state.presence {
+        case .present: return "You're in frame"
+        case .absent: return "Nobody in frame"
+        case .unknown:
+            return state.videoSource.kind == .camera
+                ? "Nothing measured yet" : "Not watching — a screen is on air"
+        }
+    }
+
     // MARK: - Panic
 
     private var panicSection: some View {
@@ -358,6 +426,31 @@ struct MomentsPane: View {
     private var armsOnFirstUseBinding: Binding<Bool> {
         Binding(get: { state.studio.away.armsBufferOnFirstUse },
                 set: { state.studio.away.armsBufferOnFirstUse = $0 })
+    }
+
+    private var presenceActionBinding: Binding<PresenceAction> {
+        Binding(get: { state.studio.presence.action },
+                set: { state.setPresenceAction($0) })
+    }
+
+    private var presenceAwayBinding: Binding<Double> {
+        Binding(get: { state.studio.presence.awaySeconds },
+                set: { state.setPresenceAwaySeconds($0) })
+    }
+
+    private var presenceReturnBinding: Binding<Double> {
+        Binding(get: { state.studio.presence.returnSeconds },
+                set: { state.setPresenceReturnSeconds($0) })
+    }
+
+    private var presenceCoverageBinding: Binding<Double> {
+        Binding(get: { state.studio.presence.coverage },
+                set: { state.setPresenceCoverage($0) })
+    }
+
+    private var presenceNotifyBinding: Binding<Bool> {
+        Binding(get: { state.studio.presence.notifiesWhenAway },
+                set: { state.setPresenceNotifies($0) })
     }
 
     private var lagDelayBinding: Binding<Double> {

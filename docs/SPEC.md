@@ -983,6 +983,36 @@ Your script, on your screen, where nobody else can read it.
 **The panel stays out of the way.** Non-activating and floating, so clicking it does not pull focus off the call in front of it and it stays visible over a full-screen meeting window on any space. Its controls — hold, back to the top, close — appear only under the pointer, because this thing sits in the reader's eyeline while they are on camera and a permanent row of buttons there is a row of buttons everyone watches them look at. Mirroring flips the words, not the panel, for a beam-splitter rig where the script is read off glass in front of the lens.
 
 
+### 5.28 Presence automation
+
+The away loop (§5.10) without the keystroke: when nobody has been in frame for a while, take the configured action; when they come back, undo it.
+
+| Property | Specification |
+|---|---|
+| Detector | `VNDetectHumanRectanglesRequest`, upper body only, on a 640×360 downsample |
+| Scheduling | a `VisionCoordinator` modality of its own at cadence 15 — about 1 Hz under full contention |
+| Demand | only while an action or the nudge is switched on, **and** the camera is the source |
+| Action | nothing / away loop / freeze — **`.none` by default** |
+| Leaving | 2–60 s, default 6 s below the coverage threshold |
+| Returning | 0.2–10 s, default 1 s above it |
+| Coverage | 0.005–0.5 of the frame, default 0.04; release at 0.75 of that |
+| Muting | follows §5.10's "mute while away" for both actions — one question, one control |
+| Nudge | optional Notification Centre line when the frame empties, default off |
+
+**Choosing the detector is the cost decision, and there were three candidates.** The person mask (§5.4) is already being produced, which makes reading it look free — but it is only produced while somebody else wants it, and presence watching is on for the whole meeting. Demanding `.person` on presence's behalf would pin the single most expensive request in the pipeline on permanently, to answer a question that never needed a per-pixel silhouette: six milliseconds a frame for one bit a second. Frame differencing is nearly free and answers the wrong question — it measures motion, not presence, so the first person it declares absent is the one sitting still and reading, which is both the commonest way to be present and the worst possible false trigger; it also tracks the camera's own gain and noise, so a threshold tuned in daylight fires at dusk. A human-rectangle request on a quarter-size copy is the cheapest thing that actually answers the question asked, and upper-body-only is the right mode because a seated person's legs are under the desk and the torso is what leaves when they stand up.
+
+**It is a coordinated modality, declared last and cadenced slowest.** §5.23's schedule gives at most one modality per frame, so a new one competing at eye contact's cadence would take frames off the warp. Presence asks for one frame in fifteen and loses every tie it enters, which still leaves it running about once a second against a threshold measured in seconds. It is demanded only while one of its switches is on, and it stands down on the frames the no-camera heartbeat produces — the flat dark texture is a measurement of nothing, not evidence that the room emptied.
+
+**Hysteresis is the whole feature, and it is deliberately asymmetric.** A late trigger costs nothing: the loop starts a second after the user walked out, and nobody was watching. A false trigger costs the thing this app exists to protect — it puts a recording of the user on air while they are sitting there talking, and they find out when somebody says "you've frozen". So leaving is slow and returning is fast; the two coverage thresholds are different numbers, with a dead band between them where nothing is decided, so a subject sitting exactly on one cannot flap across it; the absence clock restarts on the first sighting, so four seconds out, one second in and four seconds out is not eight seconds away; and one observation can only advance the clock by two seconds however long the gap before it was. That last rule is what stops a sleeping Mac from firing the away loop at the exact moment the user sat back down.
+
+`unknown` is a real third state and not a synonym for absent. Before anything has been measured there is no evidence either way, and acting on no evidence is the failure.
+
+**The away loop needs an armed rolling buffer, so choosing it arms one.** The loop reads from §5.9's recorder, and an automation that fires into an unarmed buffer is an automation that does nothing at the one moment it was supposed to work — so picking the loop turns the buffer on, exactly as the first press of ⌥⌘A does, and both surfaces say so beside the control. When the loop still cannot start because nothing is recorded yet, PRISM holds the frame instead and says which happened. What it never does is nothing.
+
+**Disclosure, because this is the one thing in PRISM that acts without being asked each time.** Armed, both surfaces print what will happen and after how long. Fired, the menu bar takes its existing `.away` glyph (or the freeze bar), the notice row says which action ran and why, and a system notification goes out — the user is by definition not at the keyboard. Every one of those carries the same one-tap escape, and the escape is also the Away and Freeze tiles themselves: turning off by hand what presence turned on releases the mute that went with it, which a user who unfroze themselves and stayed silently muted would have no way to connect. Presence undoes only what it did — a freeze the user engaged first stays engaged, and a mute they set themselves survives them walking back into shot. And it fires once per departure, not once per absent observation, which is what makes the manual escape stick: nothing comes back on until the user has been seen in frame and left again.
+
+**The nudge is the one presence behaviour that changes nothing on air**, which is why it can be switched on by itself with the action left at nothing: "you left your camera on", said once, in Notification Centre.
+
 ---
 
 ## 6. Latency requirements

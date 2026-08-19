@@ -139,13 +139,60 @@ final class VisionCoordinatorTests: XCTestCase {
     /// full rate — the slip is shared. A recogniser at two-thirds rate is a
     /// slightly slower gesture; one that never runs is a broken feature.
     func testContentionSlowsEveryoneRatherThanStarvingAnyone() {
-        let ran = run(frames: 90, demand: [.face, .person, .hands])
-        for modality in Modality.allCases {
+        let demand: Set<Modality> = [.face, .person, .hands]
+        let ran = run(frames: 90, demand: demand)
+        for modality in demand {
             let count = ran.filter { $0 == modality }.count
             XCTAssertGreaterThan(count, 15,
                                  "\(modality) ran only \(count) times in 90 frames")
         }
         XCTAssertEqual(ran.compactMap { $0 }.count, 90, "no frame is wasted")
+    }
+
+    /// §5.28 rests entirely on this. Presence asks for one frame in fifteen
+    /// against three modalities asking for one in two or three, and it is
+    /// declared last, so it loses every tie it enters — the whole point of
+    /// giving it a slow cadence instead of letting it compete. It must still
+    /// run often enough that a six-second threshold is measured in seconds
+    /// rather than in whether the user also switched blur on.
+    func testPresenceStillRunsAboutOnceASecondUnderFullContention() {
+        let ran = run(frames: 300,
+                      demand: [.face, .person, .hands, .presence],
+                      cadences: [.face: 2, .person: 2, .hands: 3, .presence: 15])
+        let count = ran.filter { $0 == .presence }.count
+        // 300 frames is ten seconds at 30 fps.
+        XCTAssertGreaterThanOrEqual(count, 8,
+                                    "presence ran \(count) times in 300 frames")
+        var gap = 0
+        var worst = 0
+        for modality in ran {
+            gap += 1
+            if modality == .presence {
+                worst = max(worst, gap)
+                gap = 0
+            }
+        }
+        XCTAssertLessThanOrEqual(worst, 45,
+                                 "presence waited \(worst) frames — 1.5 s at 30 fps")
+    }
+
+    /// And the other half of the same bargain: presence must not buy its
+    /// share out of eye contact's. The face's worst wait is unchanged from
+    /// the three-modality case.
+    func testPresenceDoesNotStarveTheFace() {
+        let ran = run(frames: 300,
+                      demand: [.face, .person, .hands, .presence],
+                      cadences: [.face: 2, .person: 2, .hands: 3, .presence: 15])
+        var gap = 0
+        var worst = 0
+        for modality in ran {
+            gap += 1
+            if modality == .face {
+                worst = max(worst, gap)
+                gap = 0
+            }
+        }
+        XCTAssertLessThanOrEqual(worst, 4, "the face waited \(worst) frames")
     }
 
     /// Eye contact is the consumer that degrades soonest and most visibly, so

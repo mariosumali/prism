@@ -19,6 +19,8 @@ in the repo — read them before writing code:
   `StageStatus`, `PopoverSection`
 - `PRISM/Pipeline/Settings/AppRuleSettings.swift` — `AppAccess`, `AppRule`,
   `AppRulesSettings`, `AppRuleMatch`, `AppRuleResolver`, `AccessPolicy` (§5.18)
+- `PRISM/Pipeline/Settings/PresenceSettings.swift` — `PresenceAction`,
+  `PresenceSettings` (§5.28); `isActive` is the demand gate for the detector
 - `PRISM/System/Hotkeys.swift` — `ShortcutAction`, `Hotkeys`
 - `PRISM/System/HotkeyBindings.swift` — `HotkeyBindings`, `ShortcutConflict` (§5.19)
 - `PRISM/System/SessionLog.swift` — `SessionEvent`, `SessionLog` (§5.21)
@@ -338,7 +340,9 @@ as long as there were two of them.
 ```swift
 public final class VisionCoordinator {
     /// Declaration order is the tie-break.
-    public enum Modality: Int, CaseIterable, Comparable { case face, person, hands }
+    public enum Modality: Int, CaseIterable, Comparable {
+        case face, person, hands, presence
+    }
 
     public struct Decision: Equatable {
         public var demanded: Set<Modality>
@@ -365,6 +369,77 @@ alternation exactly, which is what keeps eye contact's smoothing unchanged.
 `PersonSegmenter.update` and `FaceTracker.update` take `capture:` from the
 decision and run their per-frame work regardless — the smoothing has to
 resolve at frame rate, not at detection rate.
+
+Registered cadences: `face` 2, `person` 2, `presence` 15. `hands` has a case
+and no registration until the gesture recogniser arrives. Presence is declared
+last and cadenced slowest on purpose (§5.28) — it loses every tie it enters
+and still runs about once a second, against a threshold measured in seconds,
+so it cannot take frames off the eye-contact warp.
+
+### PresenceDetector (`PRISM/Pipeline/Stages/PresenceDetector.swift`)
+
+Is anyone in front of the camera (§5.28). Same shape and threading as
+PersonSegmenter and FaceTracker: `update` on the frame queue, Vision on a
+private serial queue, two rotating downsample slots. Runs against the
+pipeline's `source` texture rather than at a position in the chain — it asks
+whether a person is in front of the camera, not whether one survived the crop,
+the backdrop and the layers.
+
+```swift
+public final class PresenceDetector {
+    public struct Sample: Equatable {
+        public var coverage: Double        // largest detected person / frame
+        public var date: Date
+        public var sequence: UInt64        // consumers must not integrate one twice
+    }
+    public var isDemanded: Bool            // set per frame from the decision
+    /// Fires once per completed detection, on the Vision queue. Pushed rather
+    /// than polled: the watcher integrates the gap between consecutive
+    /// observations, so a poll slower than the detector halves the rate its
+    /// clock advances at.
+    public var onSample: ((Sample) -> Void)?
+    public var latestSample: Sample? { get }               // thread-safe
+    public init(metal: MetalContext) throws
+    public func update(commandBuffer: MTLCommandBuffer, input: MTLTexture,
+                       capture: Bool)
+    public func invalidate()                               // demand went to zero
+    static let minimumConfidence: Float = 0.35
+    static func coverage(of observations: [VNHumanObservation]) -> Double
+}
+```
+
+`VNDetectHumanRectanglesRequest` with `upperBodyOnly = true`, capped at
+640×360 — a quarter of the pixels segmentation and landmarks are given,
+because the answer is a box area compared against a few percent. Largest
+observation wins, as it does for faces. A request that threw publishes
+nothing: a failure cannot support the claim that the room is empty.
+
+### PresenceWatcher (`PRISM/Pipeline/PresenceWatcher.swift`)
+
+The §5.28 hysteresis, as pure logic — no Vision, no frame path, no AppState.
+Takes a coverage number and a date, answers with an edge.
+
+```swift
+public final class PresenceWatcher {
+    public enum Transition: Equatable { case none, left, returned }
+    public private(set) var state: PresenceState           // unknown ≠ absent
+    public init()
+    /// Call only for real measurements. "The detector did not run" is not an
+    /// observation of an empty room.
+    @discardableResult
+    public func observe(coverage: Double, settings: PresenceSettings,
+                        at now: Date) -> Transition
+    public func reset()
+    static let maximumStepSeconds: Double = 2              // one sample's cap
+    static let releaseRatio: Double = 0.75                 // the lower threshold
+}
+```
+
+Edges, not levels: `left` fires once per departure, which is what makes the
+manual escape stick. Time advances only on observations and only by
+`maximumStepSeconds` each, so a gap becomes a delayed trigger rather than a
+false one. Between `coverage × releaseRatio` and `coverage` neither clock
+runs and the state holds.
 
 ### StillRing (`PRISM/Pipeline/StillRing.swift`)
 
@@ -1476,6 +1551,12 @@ public final class AppState: ObservableObject {
     /// set it would move the label without moving the picture.
     @Published public private(set) var isSharingScreen: Bool
     @Published public var eyeContactTracking: Bool
+    /// §5.28 — whether anybody is in front of the camera. `.unknown` whenever
+    /// presence is not being watched, which is most of the time.
+    @Published public private(set) var presence: PresenceState
+    /// §5.28 — presence automation put something on air and is holding it
+    /// there. The bit every surface needs: the user pressed nothing for this.
+    @Published public private(set) var presenceEngaged: Bool
     // Clip
     @Published public var clipState: ClipState
     @Published public var clipDuration: Double
@@ -1570,6 +1651,21 @@ public final class AppState: ObservableObject {
     public func setVoiceCleanupAmount(_ amount: Double)
     public var isVoiceCleanupActive: Bool { get }
     public func setMicWatchEnabled(_ enabled: Bool)     // the banner is opt-in
+    // Presence automation (§5.28). Watching is gated on an action or the
+    // nudge being on AND the camera being the source, and that gate is the
+    // whole demand for the Vision request behind it.
+    /// Choosing `.loop` arms the rolling buffer, because that is where the
+    /// loop comes from; both surfaces say so beside the control.
+    public func setPresenceAction(_ action: PresenceAction)
+    public func setPresenceAwaySeconds(_ seconds: Double)
+    public func setPresenceReturnSeconds(_ seconds: Double)
+    public func setPresenceCoverage(_ coverage: Double)
+    public func setPresenceNotifies(_ notifies: Bool)
+    /// The manual escape, behind the notice row's button, the popover's row
+    /// and the pane's. Releases whatever presence engaged whether or not the
+    /// detector agrees the user is back yet, and never touches a freeze or a
+    /// mute the user engaged themselves.
+    public func comeBack()
     // Lag switch (§5.12)
     public func engageLag()
     public func releaseLag()

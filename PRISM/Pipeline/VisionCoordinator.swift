@@ -47,10 +47,14 @@ public final class VisionCoordinator {
     /// tie-break: face first, because the eye-contact warp is the only
     /// consumer whose output is a geometric correction applied every frame —
     /// it degrades visibly, and sooner, than a silhouette or a gesture does.
+    /// Presence last, because it is the only one whose consumer is measured
+    /// in seconds: losing a tie costs it a thirtieth of a second out of six,
+    /// and losing the same tie costs the warp a visible slip.
     public enum Modality: Int, CaseIterable, Comparable {
         case face
         case person
         case hands
+        case presence
 
         public static func < (lhs: Modality, rhs: Modality) -> Bool {
             lhs.rawValue < rhs.rawValue

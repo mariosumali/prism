@@ -164,6 +164,12 @@ public final class AppState: ObservableObject {
                 micWatch.apply(studio.micWatch)
                 refreshMutedTalkingNotice()
             }
+            // §5.28: the presence switches are the whole demand gate for a
+            // Vision request, so the detector has to be armed and disarmed
+            // with them rather than on the next frame that happens to notice.
+            if studio.presence != oldValue.presence {
+                updatePresenceWatching()
+            }
             // §5.18: the extension keeps enforcing whatever it last
             // persisted, so every edit to the rule list has to reach it.
             if studio.apps != oldValue.apps {
@@ -218,6 +224,15 @@ public final class AppState: ObservableObject {
     /// face box, which a profile turn still gives, while a gaze correction
     /// needs both pupils, which it does not.
     @Published public var faceAnchorTracking = false
+    /// §5.28 — whether anybody is in front of the camera. `.unknown` whenever
+    /// presence is not being watched, which is most of the time. Read-only
+    /// from outside: a surface that could set it would be claiming to have
+    /// seen something.
+    @Published public private(set) var presence: PresenceState = .unknown
+    /// §5.28 — presence automation put something on air and is holding it
+    /// there. What it did is `presenceAction`; this is the bit every surface
+    /// needs, which is that the user did not press anything for this.
+    @Published public private(set) var presenceEngaged = false
 
     // Pipeline / format
     @Published public var config = PipelineConfiguration()
@@ -427,6 +442,18 @@ public final class AppState: ObservableObject {
     /// user's own mute rather than blanket-unmuting.
     private var panicMutedByUs = false
     private var awayMutedByUs = false
+    /// §5.28. The hysteresis lives in PresenceWatcher; these three are the
+    /// bookkeeping for undoing exactly what presence did and nothing else —
+    /// a freeze the user had already engaged is theirs to release, and a mute
+    /// they set themselves must survive them walking back into shot.
+    private let presenceWatcher = PresenceWatcher()
+    private var presenceAction: PresenceAction?
+    private var presenceFrozeByUs = false
+    private var presenceMutedByUs = false
+    /// Mirrors what the pipeline was last told, so the gate is recomputed
+    /// from several places without churning the frame path.
+    private var presenceWatching = false
+    private var lastPresenceSequence: UInt64 = 0
     /// Whether the bad connection engaged the §5.12 delay itself (§5.14), so
     /// releasing it releases only the delay it engaged — never one the user
     /// asked for separately with the lag switch.
@@ -538,6 +565,7 @@ public final class AppState: ObservableObject {
         audioCapture.voiceChanger.apply(studio.voice)
         audioCapture.voiceCleanup.apply(studio.cleanup)
         micWatch.apply(studio.micWatch)
+        updatePresenceWatching()
         monitor.setPolicy(config.latencyPolicy,
                           frameIntervalMs: formatManager.activeFormat.frameIntervalMs)
 
@@ -625,6 +653,14 @@ public final class AppState: ObservableObject {
         }
         pipeline.onTimings = { [weak self] timings in
             self?.monitor.record(timings)
+        }
+        // §5.28. Pushed rather than polled: the watcher integrates the gap
+        // between consecutive observations, and a 1 Hz poll against a ~1 Hz
+        // detector would silently drop every other one — halving the rate the
+        // away clock advances at, which is exactly the sort of drift nobody
+        // would ever trace back to a timer.
+        pipeline.presenceDetector.onSample = { [weak self] sample in
+            Task { @MainActor [weak self] in self?.handlePresence(sample) }
         }
         pipeline.onResourcePlan = { [weak self] plan in
             Task { @MainActor [weak self] in
@@ -1410,6 +1446,15 @@ public final class AppState: ObservableObject {
 
     public func toggleFreeze() {
         guard let pipeline else { return }
+        // §5.28: thawing a picture presence froze is the user saying they are
+        // back. Routed through the release rather than handled here so the
+        // mute that went with the freeze comes off too — a user who unfroze
+        // themselves and stayed silently muted would have no way to connect
+        // the two.
+        if isFrozen, presenceAction == .freeze {
+            releasePresence()
+            return
+        }
         isFrozen.toggle()
         pipeline.setFrozen(isFrozen)
         // §5.3: freezing during clip playback pauses the clip on its frame.
@@ -1699,6 +1744,7 @@ public final class AppState: ObservableObject {
         // just asked for. `begin` supersedes whatever was playing on its own.
         if isAway {
             isAway = false
+            presenceYieldsTheLoop()
             if awayMutedByUs {
                 awayMutedByUs = false
                 if isMuted { toggleMute() }
@@ -1759,28 +1805,42 @@ public final class AppState: ObservableObject {
 
     public func toggleAway() {
         if isAway {
+            // §5.28: turning off a loop presence started is the user saying
+            // they are back, and it has to release the mute presence engaged
+            // with it rather than leaving them silently off air.
+            if presenceAction == .loop {
+                releasePresence()
+                return
+            }
             endAway(returnToLive: true)
         } else {
             beginAway()
         }
     }
 
-    private func beginAway() {
-        guard let pipeline else { return }
+    /// Engages the away loop, reporting whether it actually started. The
+    /// chord wants the explanation in the warning row; presence automation
+    /// (§5.28) wants the answer, because a failure there means falling back
+    /// to a held frame rather than telling the empty chair about it.
+    @discardableResult
+    private func beginAway(explaining: Bool = true) -> Bool {
+        guard let pipeline else { return false }
         guard studio.replay.isArmed else {
             // First use with the buffer off: arm it and say so. The loop
             // cannot start yet — nothing is recorded — but the next press
             // will work, which beats a control that does nothing.
             if studio.away.armsBufferOnFirstUse {
                 studio.replay.isArmed = true
-                warning = WarningMessage(
-                    text: "Rolling buffer on. The away loop needs a few seconds of video first.")
-            } else {
+                if explaining {
+                    warning = WarningMessage(
+                        text: "Rolling buffer on. The away loop needs a few seconds of video first.")
+                }
+            } else if explaining {
                 warning = WarningMessage(
                     text: "Turn on the rolling buffer to use the away loop",
                     action: .armBuffer)
             }
-            return
+            return false
         }
         // Stepping away supersedes a delay; same no-stop() rule as above.
         if isLagging || isCatchingUp {
@@ -1792,9 +1852,11 @@ public final class AppState: ObservableObject {
         guard pipeline.replayPlayer.startAway(
             loopSeconds: studio.away.clampedLoopSeconds,
             crossfadeMs: studio.away.clampedCrossfadeMs) else {
-            warning = WarningMessage(
-                text: "Not enough video buffered yet for an away loop")
-            return
+            if explaining {
+                warning = WarningMessage(
+                    text: "Not enough video buffered yet for an away loop")
+            }
+            return false
         }
         isAway = true
         pipeline.beginCrossfade(durationMs: 300)
@@ -1804,6 +1866,7 @@ public final class AppState: ObservableObject {
         }
         refreshReplayState()
         updateMenuBarState()
+        return true
     }
 
     private func endAway(returnToLive: Bool) {
@@ -1847,6 +1910,7 @@ public final class AppState: ObservableObject {
         // does — `begin` supersedes the transport by itself.
         if isAway {
             isAway = false
+            presenceYieldsTheLoop()
             if awayMutedByUs {
                 awayMutedByUs = false
                 if isMuted { toggleMute() }
@@ -2376,6 +2440,11 @@ public final class AppState: ObservableObject {
         persistVideoSource()
         refreshScreenRecordingNeed()
         reconcileCaptures()
+        // §5.28: presence watches the camera, so a screen taking over is a
+        // reason to stop watching — and to release anything presence is
+        // currently holding, since it can no longer see whether the user
+        // came back.
+        updatePresenceWatching()
         sessionLog.record(.device, "Source: \(videoSourceName)")
         updateMenuBarState()
     }
@@ -2623,7 +2692,185 @@ public final class AppState: ObservableObject {
 
     // MARK: - Intents: app rules
 
-    // MARK: - Intents: presence
+    // MARK: - Intents: presence (§5.28)
+
+    /// What happens when the frame empties. Choosing the away loop arms the
+    /// rolling buffer, exactly as the first press of ⌥⌘A does (§5.10): the
+    /// loop reads from that buffer, and an automation that fires into an
+    /// unarmed recorder is an automation that does nothing at the one moment
+    /// it was supposed to work. Both surfaces say so beside the control.
+    public func setPresenceAction(_ action: PresenceAction) {
+        guard action != studio.presence.action else { return }
+        studio.presence.action = action
+        if action == .loop, !studio.replay.isArmed {
+            studio.replay.isArmed = true
+        }
+    }
+
+    public func setPresenceAwaySeconds(_ seconds: Double) {
+        studio.presence.awaySeconds = seconds
+    }
+
+    public func setPresenceReturnSeconds(_ seconds: Double) {
+        studio.presence.returnSeconds = seconds
+    }
+
+    public func setPresenceCoverage(_ coverage: Double) {
+        studio.presence.coverage = coverage
+    }
+
+    public func setPresenceNotifies(_ notifies: Bool) {
+        studio.presence.notifiesWhenAway = notifies
+    }
+
+    /// The manual escape, and the reason the notice row carries a button.
+    /// Everything presence engaged comes off in one tap, whether or not the
+    /// detector agrees the user is back yet — an automatic feature the user
+    /// cannot override immediately is worse than no automatic feature.
+    public func comeBack() {
+        releasePresence()
+    }
+
+    /// The demand gate for the whole feature. Presence is watched only while
+    /// one of its switches is on AND the camera is the picture: a screen share
+    /// has no person in it by construction, and a detector pointed at a slide
+    /// deck would decide the user had left within seconds of them starting to
+    /// present.
+    private func updatePresenceWatching() {
+        let watching = studio.presence.isActive && videoSource.kind == .camera
+        guard watching != presenceWatching else { return }
+        presenceWatching = watching
+        pipeline?.setPresenceWatching(watching)
+        guard !watching else { return }
+        // Standing down means the evidence stops arriving, so anything
+        // presence is holding has to come off now — it would otherwise stay
+        // on air until the user found the tile themselves.
+        releasePresence()
+        presenceWatcher.reset()
+        lastPresenceSequence = 0
+        presence = .unknown
+    }
+
+    /// One observation from the detector, turned into an edge by the watcher.
+    private func handlePresence(_ sample: PresenceDetector.Sample) {
+        guard presenceWatching else { return }
+        guard sample.sequence != lastPresenceSequence else { return }
+        lastPresenceSequence = sample.sequence
+
+        let transition = presenceWatcher.observe(coverage: sample.coverage,
+                                                 settings: studio.presence,
+                                                 at: sample.date)
+        if presence != presenceWatcher.state { presence = presenceWatcher.state }
+        switch transition {
+        case .left: presenceDidLeave()
+        case .returned: releasePresence()
+        case .none: break
+        }
+    }
+
+    /// The frame has been empty long enough. Fires once per departure, which
+    /// is what makes the manual escape stick: turning it off by hand is not
+    /// overridden a second later, because there is no second edge until the
+    /// user has been seen back in shot and left again.
+    private func presenceDidLeave() {
+        let line: String
+        switch studio.presence.action {
+        case .none:
+            // The nudge on its own. Nothing changes on air — this is the one
+            // presence behaviour that is pure disclosure.
+            line = "You're out of frame, and PRISM is still on air."
+        case .loop:
+            if beginAway(explaining: false) {
+                presenceAction = .loop
+                line = "You stepped out of frame — the away loop is on air."
+            } else {
+                // The honest fallback. The loop needs seconds of recorded
+                // video and there are none yet; holding the frame is a worse
+                // picture of the same promise, and a great deal better than a
+                // feature that announced itself and then did nothing.
+                engagePresenceFreeze()
+                presenceAction = .freeze
+                line = "You stepped out of frame — nothing was buffered to loop, so the picture is held."
+            }
+        case .freeze:
+            engagePresenceFreeze()
+            presenceAction = .freeze
+            line = "You stepped out of frame — the picture is held."
+        }
+        presenceEngaged = presenceAction != nil
+        sessionLog.record(.onAir, line)
+        postPresenceNotice(line)
+        // The chords and the tiles work with every PRISM surface closed, and
+        // this one fires with nobody at the keyboard by definition — so the
+        // only place it can be announced is Notification Centre.
+        if studio.presence.notifiesWhenAway {
+            postNotification(body: line)
+        }
+        updateMenuBarState()
+    }
+
+    private func engagePresenceFreeze() {
+        if !isFrozen {
+            presenceFrozeByUs = true
+            toggleFreeze()
+        }
+        // The same question the away loop already asks, answered by the same
+        // switch (§8.7): stepping away means stepping away, and a held
+        // picture over a live microphone is the worse half of both.
+        if studio.away.mutesAudio, !isMuted {
+            presenceMutedByUs = true
+            toggleMute()
+        }
+    }
+
+    /// A newer intent — a replay, the lag switch — has taken the transport
+    /// the away loop was using. Presence drops its claim without undoing
+    /// anything, because whatever replaced it *is* the undo, and re-running
+    /// the release here would tear down the thing the user just asked for.
+    private func presenceYieldsTheLoop() {
+        guard presenceAction == .loop else { return }
+        presenceAction = nil
+        presenceEngaged = false
+        if notice?.action == .comeBack { dismissNotice() }
+    }
+
+    /// Undoes exactly what presence did, and only while it is still true. A
+    /// freeze the user engaged themselves stays engaged; a mute they set
+    /// themselves survives them walking back into shot.
+    private func releasePresence() {
+        if notice?.action == .comeBack { dismissNotice() }
+        guard let action = presenceAction else { return }
+        presenceAction = nil
+        presenceEngaged = false
+        switch action {
+        case .loop:
+            if isAway { endAway(returnToLive: true) }
+        case .freeze:
+            if presenceFrozeByUs, isFrozen { toggleFreeze() }
+        case .none:
+            break
+        }
+        presenceFrozeByUs = false
+        if presenceMutedByUs {
+            presenceMutedByUs = false
+            if isMuted { toggleMute() }
+        }
+        sessionLog.record(.onAir, "Back in frame")
+        updateMenuBarState()
+    }
+
+    /// A condition rather than an event, so it is cleared by whoever posted
+    /// it rather than by the expiry timer — a "you're out of frame" line that
+    /// outlived being out of frame would be the same lie the freeze badge
+    /// exists to prevent.
+    private func postPresenceNotice(_ text: String) {
+        noticeTimer?.invalidate()
+        noticeTimer = nil
+        notice = NoticeMessage(text: text,
+                               symbolName: presenceAction == .loop
+                                   ? "moon.zzz.fill" : "person.slash",
+                               action: .comeBack)
+    }
 
     // MARK: - Intents: gestures
 

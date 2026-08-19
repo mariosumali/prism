@@ -3,8 +3,8 @@
 //
 // What happens when you leave the frame, and what happens when you come back.
 // Built on primitives PRISM already has — the away loop (§5.10) and freeze
-// (§5.2) — driven by the person mask the segmenter is already producing, so
-// presence detection costs no additional Vision request.
+// (§5.2) — driven by a coordinated human-rectangle request (§5.28) that is
+// demanded only while one of the switches below is on.
 //
 // Licensed under the Apache License, Version 2.0.
 
@@ -37,12 +37,18 @@ public struct PresenceSettings: Codable, Equatable {
     public var awaySeconds: Double = 6          // 2…60
     /// How long you must be back before it releases. Shorter than the away
     /// delay — coming back should feel immediate — but not instant, because a
-    /// single false-positive mask frame would otherwise flap the state.
+    /// single false-positive detection frame would otherwise flap the state.
     public var returnSeconds: Double = 1.0      // 0.2…10
-    /// Fraction of the frame the mask must cover to count as "present". Low
-    /// enough that sitting far back still counts, high enough that a hand or
-    /// a passing shoulder does not.
+    /// Fraction of the frame the detected person has to span to count as
+    /// "present". Low enough that sitting well back still counts, high enough
+    /// that somebody crossing the far end of the room does not.
     public var coverage: Double = 0.04          // 0.005…0.5
+    /// Say so in Notification Centre when the frame empties, whatever the
+    /// action is. This is the "you left your camera on" nudge, and it is the
+    /// one presence behaviour that changes nothing on air — which is exactly
+    /// why it can be useful on its own, with the action left at `.none`.
+    /// Off by default like everything else here.
+    public var notifiesWhenAway: Bool = false
     public init() {}
 
     public init(from decoder: Decoder) throws {
@@ -51,13 +57,16 @@ public struct PresenceSettings: Codable, Equatable {
         awaySeconds = c.tolerant(.awaySeconds, 6)
         returnSeconds = c.tolerant(.returnSeconds, 1.0)
         coverage = c.tolerant(.coverage, 0.04)
+        notifiesWhenAway = c.tolerant(.notifiesWhenAway, false)
     }
 
     public var clampedAwaySeconds: Double { min(max(awaySeconds, 2), 60) }
     public var clampedReturnSeconds: Double { min(max(returnSeconds, 0.2), 10) }
     public var clampedCoverage: Double { min(max(coverage, 0.005), 0.5) }
 
-    /// Presence watching is the mask consumer; `.none` means nobody is asking
-    /// for a mask on its behalf, which is what keeps this free when unused.
-    public var isActive: Bool { action != .none }
+    /// Whether anything is asking for presence detection at all. This is the
+    /// demand gate for the Vision request behind it (§5.28): with both
+    /// switches off nothing registers a consumer, so the detector never runs
+    /// and the feature costs exactly nothing.
+    public var isActive: Bool { action != .none || notifiesWhenAway }
 }

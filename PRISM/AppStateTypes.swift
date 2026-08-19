@@ -187,6 +187,12 @@ public struct NoticeMessage: Equatable, Identifiable {
     public enum Action: Equatable {
         /// §5.17 muted-and-talking. The fix is one keystroke, so offer it.
         case unmute
+        /// §5.28 — presence automation acted, or noticed you were out of
+        /// frame with the camera still on. The way out belongs in the row
+        /// that announces it: this is the one thing in PRISM that puts
+        /// something on air without being asked each time, so the escape has
+        /// to be in front of the user rather than one pane away.
+        case comeBack
         case none
     }
 
@@ -228,7 +234,7 @@ public enum CaptureResult: Equatable {
 
 /// Whether the subject is in frame.
 ///
-/// `unknown` is not `absent`: before the segmenter has produced a mask — no
+/// `unknown` is not `absent`: before the detector has measured anything — no
 /// camera, no demand, feature just switched on — treating the frame as empty
 /// would fire the away loop at precisely the wrong moment.
 public enum PresenceState: Equatable {

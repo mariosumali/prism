@@ -24,6 +24,15 @@ struct MomentsSection: View {
                 lagTile
                 glitchTile
             }
+            // §5.28 sits above the transport rather than inside its if/else
+            // chain, because it answers a different question: not "what is
+            // the transport doing" but "is something about to happen without
+            // me asking". Both answers can be needed at once.
+            if state.presenceEngaged {
+                presenceEngagedRow
+            } else if state.studio.presence.isActive {
+                presenceArmedLine
+            }
             if state.isBadConnection {
                 connectionLine
             } else if state.isLagging || state.isCatchingUp {
@@ -215,6 +224,51 @@ struct MomentsSection: View {
             return "\(rateText) — everyone is seeing the past right now."
         case .lag, .idle:
             return ""
+        }
+    }
+
+    // MARK: - Presence (§5.28)
+
+    /// The escape, in the surface the user is most likely to open when they
+    /// sit back down. It duplicates the notice row's button on purpose: a
+    /// notice can be dismissed, and the way out of something PRISM started by
+    /// itself must not be dismissable.
+    private var presenceEngagedRow: some View {
+        HStack(spacing: Metrics.itemGap) {
+            Label(presenceEngagedCaption, systemImage: "person.slash")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+            Button("I'm back") { state.comeBack() }
+                .controlSize(.small)
+                .buttonStyle(.borderedProminent)
+        }
+    }
+
+    private var presenceEngagedCaption: String {
+        state.isAway
+            ? "PRISM put the away loop on — you were out of frame."
+            : "PRISM held the picture — you were out of frame."
+    }
+
+    /// Armed and idle. Says what will happen and after how long, because a
+    /// feature that acts on its own has to be predictable before it acts and
+    /// not only explicable afterwards.
+    private var presenceArmedLine: some View {
+        Text(presenceArmedCaption)
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(.secondary)
+    }
+
+    private var presenceArmedCaption: String {
+        let seconds = Int(state.studio.presence.clampedAwaySeconds.rounded())
+        switch state.studio.presence.action {
+        case .loop:
+            return "Watching — the away loop starts \(seconds) s after you leave."
+        case .freeze:
+            return "Watching — the picture holds \(seconds) s after you leave."
+        case .none:
+            return "Watching — you'll be told if you leave with PRISM on air."
         }
     }
 

@@ -357,6 +357,10 @@ struct PopoverView: View {
                 Button("Unmute") { state.toggleMute() }
                     .controlSize(.small)
                     .buttonStyle(.borderedProminent)
+            case .comeBack:
+                Button("I'm back") { state.comeBack() }
+                    .controlSize(.small)
+                    .buttonStyle(.borderedProminent)
             case .none:
                 EmptyView()
             }

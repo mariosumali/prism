@@ -170,6 +170,11 @@ public final class VideoPipeline {
     /// One face measurement, shared by eye contact, retouch and the
     /// face-anchored overlay layers (§5.6).
     public let faceTracker: FaceTracker
+    /// Is anyone in front of the camera (§5.28). Its own modality rather than
+    /// a reader of the mask: presence watching is on for the whole meeting,
+    /// and demanding segmentation for it would pin the most expensive request
+    /// in the pipeline on for a question that needs one bit a second.
+    public let presenceDetector: PresenceDetector
     /// Decides which of them runs this frame, and which frames a modality
     /// added later gets. One request per modality per frame, at most one
     /// modality per frame.
@@ -240,6 +245,16 @@ public final class VideoPipeline {
     private var lastFrameTime = CMTime.zero
     /// Auto-framing's mask demand — the one consumer with no stage of its own.
     private var autoFrameNeedsMask = false
+    /// §5.28 — presence automation is switched on and the camera is the
+    /// picture. Set from AppState, read on the frame queue, exactly like
+    /// `autoFrameNeedsMask` above.
+    private var presenceWatching = false
+    /// Whether this frame came from a camera at all. The no-camera heartbeat
+    /// feeds the chain a flat dark texture (§5.2/§5.3), and a presence
+    /// detector pointed at it would report an empty room every frame — which
+    /// is a measurement of nothing, not evidence that the user left.
+    /// frameQueue-confined, written at the top of process().
+    private var frameHasCamera = false
     /// §5.16's setting, remembered so a format change can re-plan against it
     /// without waiting for the next applyStudio.
     private var stillsWantSharpest = false
@@ -342,6 +357,7 @@ public final class VideoPipeline {
         resourcePlan = initialPlan
         segmenter = try PersonSegmenter(metal: metal)
         faceTracker = try FaceTracker(metal: metal)
+        presenceDetector = try PresenceDetector(metal: metal)
         replayBuffer = try ReplayBuffer(metal: metal)
         replayPlayer = ReplayPlayer(metal: metal, buffer: replayBuffer)
         liveFeeds = LiveFeeds(metal: metal)
@@ -383,6 +399,12 @@ public final class VideoPipeline {
         // at one of them.
         vision.register(.face, cadence: 2)
         vision.register(.person, cadence: 2)
+        // §5.28. Fifteen frames is half a second unopposed and about a second
+        // under full contention, against an away threshold measured in
+        // seconds — so presence can afford to lose almost every tie it
+        // enters, which is the point of giving it a cadence of its own rather
+        // than letting it compete for the frames eye contact needs.
+        vision.register(.presence, cadence: 15)
         let gaze = gazeStage, overlay = overlayStage
         let blur = blurStage, background = backgroundStage
         vision.addConsumer(of: .face) { gaze.wantsEncode() }
@@ -396,6 +418,14 @@ public final class VideoPipeline {
         // reason the mask survives the degradation engine turning blur off.
         vision.addConsumer(of: .person) { [weak self] in
             self?.autoFrameNeedsMask ?? false
+        }
+        // §5.28: the one modality whose demand is a user setting rather than
+        // a stage. It also stands down on the frames a camera did not
+        // produce, so the heartbeat's dark texture never reaches Vision and
+        // never spends a slot the others could have used.
+        vision.addConsumer(of: .presence) { [weak self] in
+            guard let self else { return false }
+            return self.presenceWatching && self.frameHasCamera
         }
 
         configure(outputFormat: initialFormat)
@@ -600,6 +630,18 @@ public final class VideoPipeline {
         replan()
     }
 
+    /// §5.28 — arms or disarms presence watching. Separate from `apply` for
+    /// the same reason `applyStudio` is: it is behaviour rather than a look,
+    /// and it is the whole demand gate for a Vision request, so a preset
+    /// switch must not be able to start or stop one.
+    ///
+    /// AppState folds the source into this: a screen share has no person in
+    /// it by construction, and a detector pointed at a slide deck would
+    /// decide the user had left within seconds of them starting to present.
+    public func setPresenceWatching(_ watching: Bool) {
+        presenceWatching = watching
+    }
+
     /// §5.24 — a screen capture session is running (as the source, or behind
     /// a picture-in-picture layer). Separate from `apply` because it is not a
     /// look: it is a capture session whose frame queue is a real allocation,
@@ -782,7 +824,22 @@ public final class VideoPipeline {
         var liveFeedsDecided = false
         // One decision for the whole frame, taken before any stage runs: what
         // Vision is wanted, and which single modality gets this frame.
+        frameHasCamera = cameraBuffer != nil
         let visionDecision = vision.beginFrame()
+        // §5.28 runs against `source` rather than at a position in the chain,
+        // and deliberately so: it asks whether a person is in front of the
+        // camera, not whether one survived the crop, the backdrop and the
+        // layers. Everything downstream can substitute the picture wholesale,
+        // and a presence detector reading a replay of yesterday would be
+        // measuring a recording of the user rather than the user.
+        if visionDecision.demanded.contains(.presence) {
+            presenceDetector.isDemanded = true
+            presenceDetector.update(commandBuffer: commandBuffer, input: source,
+                                    capture: visionDecision.running == .presence)
+        } else if visionDecision.ended.contains(.presence) {
+            presenceDetector.isDemanded = false
+            presenceDetector.invalidate()
+        }
         // The face is measured pre-Geometry and the layers land post-Geometry,
         // so the overlay stage needs this frame's crop to put a prop back on
         // the head it was measured on. The working resolution goes with it:
