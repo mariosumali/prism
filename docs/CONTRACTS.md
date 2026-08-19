@@ -27,7 +27,13 @@ in the repo — read them before writing code:
   `SetupStatus`, `WarningMessage`, `NoticeMessage`,
   `CapturePhase`, `CaptureResult`, `PresenceState`, `VideoSourceKind`,
   `VideoSourceSelection`, `ScreenSourceInfo`, `GestureEvent`, `ClipState`,
-  `StageStatus`, `PopoverSection`
+  `StageStatus`, `PopoverSection`, `ReplayTransportClaim`, `PanicHold`;
+  the last two are the "who is on air, and does the UI agree" bookkeeping —
+  `ReplayTransportClaim.claimed(by:)` derives the away/lagging/catching-up
+  flags from whoever claimed the one §5.9 transport (so no claimant can leave
+  another's flag standing) and `connectionMayClaimTransport` keeps §5.14 off
+  a transport something is already substituting on, while `PanicHold` records
+  what the §5.11 chord engaged so the release undoes only that
 - `PRISM/Pipeline/Settings/AppRuleSettings.swift` — `AppAccess`, `AppRule`,
   `AppRulesSettings`, `AppRuleMatch`, `AppRuleResolver`, `AccessPolicy` (§5.18)
 - `PRISM/Pipeline/Settings/PresenceSettings.swift` — `PresenceAction`,
@@ -229,8 +235,18 @@ public final class VideoPipeline {
     /// Live camera frame. Also drives clip/freeze substitution.
     public func submitCameraFrame(_ buffer: CVPixelBuffer, at time: CMTime)
     /// Heartbeat when no camera is available (timer-driven at output fps)
-    /// so clip playback and freeze keep producing frames.
+    /// so clip playback and freeze keep producing frames. A freeze deferred
+    /// for want of a frame to hold takes hold here too — its placeholder is
+    /// what is on air, and a freeze that never engages leaves the §5.25 live
+    /// layers moving under a frozen UI.
     public func tickWithoutCamera(at time: CMTime)
+    /// The one way to start ReplayPlayer's transport (§5.9–§5.14). Arms
+    /// ReplayStage's bridge frame from the freeze ring BEFORE `start` runs —
+    /// `begin()` clears the player's frames synchronously, and a frame
+    /// processed in the gap would find the transport active with nothing to
+    /// show and pass live video through. A refused start releases it.
+    @discardableResult
+    public func startReplayTransport(_ start: (ReplayPlayer) -> Bool) -> Bool
     public func setFrozen(_ frozen: Bool)              // §5.2 sharpest-frame
     public var isFrozen: Bool { get }
     public func apply(_ config: PipelineConfiguration)
@@ -973,6 +989,7 @@ final class LiveFeeds {
     func publish(_ buffer: CVPixelBuffer, feed: LiveLayerFeed)   // capture queues
     func clear(_ feed: LiveLayerFeed)                            // any thread
     func setHeld(_ wanted: Bool)                                 // frame queue
+    private(set) var isHeld: Bool                                // frame queue
     func texture(for feed: LiveLayerFeed) -> MTLTexture?         // frame queue
 }
 ```
@@ -1448,8 +1465,21 @@ public final class OverlayStage: EffectStage {      // id .overlay, cost .modera
     static func anchorPoint(face: FaceTracker.FaceSample, point: FaceAnchorPoint,
                             roll: Float, frameAspect: Float) -> SIMD2<Float>
 }
+/// What ReplayStage needs from the transport. ReplayPlayer is the only
+/// implementation; the protocol is what lets the start-up window — a claimed
+/// transport with no decoded frame yet — be exercised without a decoder.
+public protocol ReplayFrameSource: AnyObject {
+    var isActive: Bool { get }
+    func currentFrame(at hostTime: CMTime) -> ReplayPlayer.Frame?
+}
+
 public final class ReplayStage: EffectStage {       // id .replay, cost .cheap
-    public var player: ReplayPlayer?                // substitutes while active
+    public var player: ReplayFrameSource?           // substitutes while active
+    /// §5.9 — the picture held while the transport decodes its first frame,
+    /// armed by `VideoPipeline.startReplayTransport`. Released by the first
+    /// delivered frame, and never allowed to outlive its transport: the
+    /// stage clears it whenever the player is not active.
+    public var bridgeFrame: MTLTexture?
 }
 
 /// One mask, four consumers (§3.3). The pipeline calls `update` once per
@@ -1835,8 +1865,11 @@ public final class AppState: ObservableObject {
     public func handleLagKey(pressed: Bool)
     // Bad connection (§5.14): visual degrade always engages; the delay half
     // rides the §5.12 transport and is skipped (with a warning) when the
-    // rolling buffer cannot carry it. Release snaps a self-engaged delay
-    // back to live and never touches one the user engaged separately.
+    // rolling buffer cannot carry it, and skipped outright when something is
+    // already substituting — taking the one transport from an away loop would
+    // put delayed LIVE camera on air with nobody there to see it. Release
+    // snaps a self-engaged delay back to live and never touches one the user
+    // engaged separately.
     public func engageBadConnection()
     public func releaseBadConnection()
     public func toggleBadConnection()                  // ⌥⌘B

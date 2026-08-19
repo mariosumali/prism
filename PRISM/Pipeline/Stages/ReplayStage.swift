@@ -7,7 +7,8 @@
 //
 // The stage draws whatever ReplayPlayer hands it: one texture normally, or
 // two blended when the away loop is crossfading its tail into its own first
-// frame at the wrap.
+// frame at the wrap — and, for the frames between claiming the transport and
+// its first decoded frame, the bridge picture the pipeline armed instead.
 //
 // Buffered frames are RAW CAMERA frames, recorded upstream of everything, so
 // a replay runs through the live effects chain like any other source. That
@@ -21,13 +22,41 @@ import CoreMedia
 import Foundation
 import Metal
 
+/// What the stage needs from the transport: whether it is substituting at
+/// all, and the picture for this instant. ReplayPlayer is the only thing that
+/// implements it in the app — the protocol is here so the stage's start-up
+/// behaviour, which is what the picture on air depends on for the first frames
+/// of every away loop, can be exercised without a decompression session.
+public protocol ReplayFrameSource: AnyObject {
+    var isActive: Bool { get }
+    func currentFrame(at hostTime: CMTime) -> ReplayPlayer.Frame?
+}
+
+extension ReplayPlayer: ReplayFrameSource {}
+
 public final class ReplayStage: EffectStage {
     public let id: StageID = .replay
     public let cost: StageCost = .cheap
     public var isEnabled: Bool = true
 
     /// Set by the pipeline. Substitutes whenever the player is active.
-    public var player: ReplayPlayer?
+    public var player: ReplayFrameSource?
+
+    /// The picture to hold until the transport produces its first frame,
+    /// armed by the pipeline at the moment the transport is claimed.
+    ///
+    /// Starting a transport is not instant: `begin()` clears the player's
+    /// frames synchronously and then hands decoding to its own queue, which
+    /// has to create a VTDecompressionSession and decode forward from the
+    /// newest keyframe at or before the target — up to a full GOP, one second
+    /// by construction. Substituting nothing for that window passes the live
+    /// camera to air and leaves the `.live` layers moving with it, at the one
+    /// moment the user has already been told they are away and has stood up
+    /// to leave. Holding the frame that was on air when they pressed it is
+    /// the same answer freeze gives (§5.2), for the same reason.
+    ///
+    /// Frame-queue-confined once armed; the pipeline sets it on that queue.
+    public var bridgeFrame: MTLTexture?
 
     private let copyPipeline: MTLComputePipelineState
     private let crossfadePipeline: MTLComputePipelineState
@@ -43,9 +72,18 @@ public final class ReplayStage: EffectStage {
 
     public func wantsEncode() -> Bool {
         pending = nil
-        guard isEnabled, let player, player.isActive else { return false }
+        guard isEnabled, let player, player.isActive else {
+            // Nothing is substituting any more. A bridge outliving its
+            // transport would hold the picture on its own — a freeze nobody
+            // asked for and no surface would report.
+            bridgeFrame = nil
+            return false
+        }
         pending = player.currentFrame(at: CMClockGetTime(CMClockGetHostTimeClock()))
-        return pending != nil
+        // The first decoded frame ends the bridge: it is a full-frame texture
+        // and there is nothing left for it to cover.
+        if pending != nil { bridgeFrame = nil }
+        return pending != nil || bridgeFrame != nil
     }
 
     public func encode(commandBuffer: MTLCommandBuffer,
@@ -55,6 +93,13 @@ public final class ReplayStage: EffectStage {
         pending = nil
 
         guard let frame else {
+            if let bridge = bridgeFrame {
+                // Still spinning up: hold the picture from the moment the
+                // transport was claimed rather than passing live video.
+                try encodeCopy(commandBuffer: commandBuffer,
+                               source: bridge, destination: output)
+                return
+            }
             // The replay ended between wantsEncode() and encode(): pass live
             // video through rather than dropping the frame.
             try encodeCopy(commandBuffer: commandBuffer, source: input, destination: output)

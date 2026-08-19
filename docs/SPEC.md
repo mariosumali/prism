@@ -351,6 +351,8 @@ Holds a still image on the video output; clients see a frozen picture.
 
 Audio continuing by default is deliberate: people freeze because something visual happened, not because they stopped talking.
 
+**A freeze with nothing to hold defers to the next frame, and the no-camera heartbeat counts as one.** With an empty ring — the camera has not delivered since launch, or a format change has just reallocated it — freeze holds the first frame that arrives instead of nothing. The heartbeat's neutral placeholder (§5.1) is such a frame: it is what is on air, so it is what gets held. Waiting for a *camera* frame there would leave `FreezeStage` out of the substituting set indefinitely, which means the §5.25 live layers are never held and a picture-in-picture keeps moving over the placeholder while every surface says the picture is frozen.
+
 `FrameRing` holds `ResourceGovernor`'s granted depth in a preallocated `CVPixelBufferPool` — 11 frames at 1080p30, 15 at 720p30, 6 at 4K. Sharpness scoring runs on the GPU as part of the normal command buffer, writing a single float per frame into a small `MTLBuffer` — never as a separate synchronous pass.
 
 ### 5.3 Clip playback
@@ -521,6 +523,10 @@ Playback above 1× catches back up to live, which is the point: the user is show
 
 Alongside the compressed ring, a 32×18 luma thumbnail is kept per frame. §5.10 explains why.
 
+**There is one transport, and claiming it is one act.** `ReplayPlayer` plays a replay, the away loop and the lag switch's delay (§5.12, and the bad connection's delay half in §5.14) from the same ring: `begin()` re-bases it, so whatever it was playing is destroyed the instant somebody else starts it. Every claim therefore goes through one path (`AppState.claimReplayTransport`), and the flags each surface reads — away, lagging, catching up, connection-engaged — are *derived* from the claimant rather than set by hand. A claim that left another claimant's flag standing would leave the menu bar saying "Away" over delayed live camera, with nobody in front of the camera to notice; deriving them makes that unstateable rather than merely fixed at each call site. The outgoing claimant's own undo travels with it: the away loop's mute comes off, presence drops its claim on the loop, and the audio delay line goes back to zero. A start the player refuses changes nothing — whatever was playing is still playing, and the app has to keep saying so.
+
+**Claiming the transport does not mean an instant picture.** `begin()` clears the player's frames and hands decoding to its own queue, which has to create a decompression session and decode forward from the newest keyframe at or before the target — up to a full GOP, one second by construction. For those frames the player has nothing to hand over, and substituting nothing would put the live camera on air (and leave the §5.25 live layers moving) at the exact moment the user has been told they are away and has stood up to leave. So claiming the transport also arms `ReplayStage` with a **bridge frame**: the sharpest frame of the preceding 300 ms out of the freeze ring — the same pick §5.2 makes — held until the first decoded frame lands, and released by it. It costs one texture (~8 MB at 1080p), paid only while a transport is spinning up, and a bridge never outlives its transport.
+
 ### 5.10 Away loop
 
 An auto-generated "still here" idle loop instead of a static freeze when the user steps away.
@@ -555,7 +561,7 @@ One chord: freeze, mute, and swap to a "back in a bit" backdrop. Built entirely 
 
 Deliberately un-shifted: a panic key you have to reach for is not one.
 
-Pressing it again restores **exactly** the prior state, including a freeze or mute the user had engaged themselves beforehand — panic tracks what it changed rather than blanket-reverting.
+Pressing it again restores **exactly** the prior state, including a freeze or mute the user had engaged themselves beforehand — panic tracks what it changed rather than blanket-reverting. Both halves follow the rule presence automation follows (§5.28): `PanicHold` records what the chord actually engaged, and the release undoes only that, only while it is still true. Deciding the release from the settings instead — "panic freezes, so releasing thaws" — would thaw the picture a user froze to step out of shot and put them back on air without asking.
 
 The backdrop swap mutates the live configuration so every surface shows what is actually on air, but the pre-panic configuration snapshot is what gets persisted and what a preset save captures. Relaunching after a panic must leave the user where they were, not stuck behind a "back in a bit" card with no memory of why.
 
@@ -637,6 +643,8 @@ One switch that makes the published feed look like a struggling network: the pic
 The per-block shimmer is reseeded on every refresh so held frames "boil" between refreshes rather than freezing their noise, and the shimmer is applied before posterisation so blocks flicker between adjacent colour bands — codec artifact, not film grain.
 
 **The delay is the §5.12 lag switch's transport, not a second mechanism.** Same rolling-buffer bound, same hold-then-trail engage, same audio delay line — with the connection's own, shorter default (1.2 s: a struggling connection is behind, not absent). The microphone is always delayed to match, for the §5.12 reason: picture behind live audio reads as broken software. Releasing a delay this switch engaged itself always snaps back — a recovering connection drops its backlog — while a delay the user engaged separately with the lag switch is left alone (`connectionEngagedLag`). If the rolling buffer is off, the visual half still engages and a warning offers to arm the buffer, because a switch that does nothing is worse than a switch that does half and says so.
+
+**The delay half never takes the transport from something already substituting.** It is the optional half of this switch, and a replay, an away loop or a delay the user engaged themselves is a picture they deliberately put on air. Claiming §5.9's single transport from an away loop would destroy the loop and put the *live* camera, a second behind, in front of the meeting — with the user out of the room. So when the transport is already claimed the stunt degrades whatever is on air (which is the point of it) and adds no delay, and it says so when the loop is what it stepped around.
 
 **Reporting.** Engaged, the menu bar shows the wifi badge (§8.2, outranking the hourglass — the badge names the stunt the user engaged, and the delay is part of it), the Moments caption states the degradation in the settings' own terms ("19 px blocks · ≈11 fps · 1.2 s behind live" — ≈ because the rate is a mean of an irregular cadence), and any delay reports through `LatencyReport.deliberateDelayMs` exactly as §5.12 — never folded into the involuntary meter.
 
@@ -921,6 +929,8 @@ You over your screen, or your screen over you.
 **The hold is the correctness point.** A live layer sits at `.overlay`, far downstream of clip, replay and freeze. Left alone it would keep moving under a picture the user believes is held — freeze the screen and your face carries on talking in the corner; freeze the camera and the screen keeps scrolling behind it. That is the most damaging failure this app can produce, and it is the same failure in both directions, so it gets one answer: **while any substituting stage is engaged, the feeds are held.** The layer's texture is snapshotted and every frame published behind it is dropped until the substitution ends. This covers freeze, replay, the away loop, the lag switch and panic without any of them knowing the feature exists, because all five reach the picture through `.clip`, `.replay` or `.freeze`.
 
 The snapshot is a copy rather than a retained reference. Capture pools are shallow — three slots for ScreenCaptureKit — and a freeze can last minutes; holding one of their buffers that long starves the session that owns it. The copy costs one private texture per held feed, paid only while held, which is the trade `FreezeStage` already makes for the same reason. A feed with nothing on screen when the hold engages stays empty: handing it the next frame that arrives would be the same failure one beat later.
+
+A stage that is *supposed* to be substituting but has nothing to draw is the same failure wearing a different hat, so the two cases where that can happen are closed at the source rather than here: a deferred freeze takes hold on the next frame including the heartbeat (§5.2), and a transport still spinning up draws its bridge frame (§5.9).
 
 The decision is taken at the layers' own position in the chain walk, once every substituting stage has had its say. `ChainRegistrationTests` asserts that the substituting set is complete and that every member of it runs before `.overlay` — a stage added later that replaces the picture and forgets to join the set would be exactly the bug this paragraph exists to prevent, and it would not show up until it happened on someone's call.
 

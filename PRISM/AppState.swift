@@ -449,9 +449,11 @@ public final class AppState: ObservableObject {
     /// but it must never outlive the panic: this is what gets persisted and
     /// what a preset save captures while the chord is held.
     private var panicRestore: PipelineConfiguration?
-    /// Whether panic (or away) engaged mute itself, so releasing restores the
-    /// user's own mute rather than blanket-unmuting.
-    private var panicMutedByUs = false
+    /// What panic engaged itself (§5.11) — a freeze, a mute, or both — so
+    /// releasing restores the user's own freeze and mute rather than blanket
+    /// thawing and unmuting. The away loop keeps the same bookkeeping for the
+    /// mute it engages.
+    private var panicHold = PanicHold()
     private var awayMutedByUs = false
     /// §5.28. The hysteresis lives in PresenceWatcher; these three are the
     /// bookkeeping for undoing exactly what presence did and nothing else —
@@ -1786,6 +1788,71 @@ public final class AppState: ObservableObject {
         updateOverlayLayer(id) { mutate(&$0.text) }
     }
 
+    // MARK: - The one replay transport (§5.9–§5.14)
+
+    /// The single entry point to ReplayPlayer's transport. Everything that
+    /// starts it — a replay, the away loop, the lag switch, the bad
+    /// connection's delay — comes through here, and the flags every surface
+    /// reads are then derived from the claimant rather than set by hand.
+    ///
+    /// The player is one transport: `begin()` re-bases it on the newest
+    /// buffered frame, so the previous claimant's picture is already gone by
+    /// the time this returns. A claim that left another claimant's flag
+    /// standing would leave the menu bar saying "Away" over delayed live
+    /// camera. Deriving the flags is what makes that unstateable rather than
+    /// merely fixed at four call sites.
+    ///
+    /// The flags are dropped only on a start that actually succeeded: a
+    /// refused start leaves whatever was playing playing, and the app has to
+    /// keep saying so. Nothing here calls `stop()` — stopping the player
+    /// after `begin` has claimed it would tear down the substitution we just
+    /// asked for.
+    @discardableResult
+    private func claimReplayTransport(
+        for claimant: ReplayTransportClaim.Claimant,
+        start: (ReplayPlayer) -> Bool) -> Bool {
+        guard let pipeline else { return false }
+        let standing = ReplayTransportClaim(isAway: isAway,
+                                            isLagging: isLagging,
+                                            isCatchingUp: isCatchingUp,
+                                            connectionEngagedLag: connectionEngagedLag)
+        guard pipeline.startReplayTransport(start) else { return false }
+
+        let claimed = ReplayTransportClaim.claimed(by: claimant)
+        if isAway != claimed.isAway { isAway = claimed.isAway }
+        if isLagging != claimed.isLagging { isLagging = claimed.isLagging }
+        if isCatchingUp != claimed.isCatchingUp { isCatchingUp = claimed.isCatchingUp }
+        connectionEngagedLag = claimed.connectionEngagedLag
+
+        let release = standing.release
+        if release.loop {
+            presenceYieldsTheLoop()
+            if awayMutedByUs {
+                awayMutedByUs = false
+                if isMuted { toggleMute() }
+            }
+        }
+        if release.delayLine {
+            // Zeroed here rather than left to the new claimant: a lag sets its
+            // own delay immediately after this returns, and everything else
+            // has to hear live audio again.
+            audioCapture.delaySeconds = 0
+        }
+        return true
+    }
+
+    /// §5.14 — whether the bad connection's optional delay half may take the
+    /// transport. It never takes it from a picture the user deliberately put
+    /// on air.
+    private var replayTransportIsFreeForTheConnection: Bool {
+        ReplayTransportClaim.connectionMayClaimTransport(
+            mode: replayMode,
+            standing: ReplayTransportClaim(isAway: isAway,
+                                           isLagging: isLagging,
+                                           isCatchingUp: isCatchingUp,
+                                           connectionEngagedLag: connectionEngagedLag))
+    }
+
     // MARK: - Intents: instant replay (§5.9)
 
     /// Rewinds to the start of the rolling buffer and plays forward at the
@@ -1798,27 +1865,9 @@ public final class AppState: ObservableObject {
                 action: .armBuffer)
             return
         }
-        // Clear any other substitution BEFORE starting, and without calling
-        // stop(): the player is a single transport, so stopping it after
-        // startReplay has already claimed it would tear down the replay we
-        // just asked for. `begin` supersedes whatever was playing on its own.
-        if isAway {
-            isAway = false
-            presenceYieldsTheLoop()
-            if awayMutedByUs {
-                awayMutedByUs = false
-                if isMuted { toggleMute() }
-            }
-        }
-        if isLagging || isCatchingUp {
-            isLagging = false
-            isCatchingUp = false
-            connectionEngagedLag = false
-            audioCapture.delaySeconds = 0
-        }
-
-        guard pipeline.replayPlayer.startReplay(
-            rate: studio.replay.clampedPlaybackRate) else {
+        guard claimReplayTransport(for: .replay, start: {
+            $0.startReplay(rate: studio.replay.clampedPlaybackRate)
+        }) else {
             warning = WarningMessage(text: "Nothing buffered to replay yet")
             return
         }
@@ -1902,23 +1951,18 @@ public final class AppState: ObservableObject {
             }
             return false
         }
-        // Stepping away supersedes a delay; same no-stop() rule as above.
-        if isLagging || isCatchingUp {
-            isLagging = false
-            isCatchingUp = false
-            connectionEngagedLag = false
-            audioCapture.delaySeconds = 0
-        }
-        guard pipeline.replayPlayer.startAway(
-            loopSeconds: studio.away.clampedLoopSeconds,
-            crossfadeMs: studio.away.clampedCrossfadeMs) else {
+        // Stepping away supersedes a delay; the claim below drops its flags
+        // and its audio delay line.
+        guard claimReplayTransport(for: .away, start: {
+            $0.startAway(loopSeconds: studio.away.clampedLoopSeconds,
+                         crossfadeMs: studio.away.clampedCrossfadeMs)
+        }) else {
             if explaining {
                 warning = WarningMessage(
                     text: "Not enough video buffered yet for an away loop")
             }
             return false
         }
-        isAway = true
         pipeline.beginCrossfade(durationMs: 300)
         if studio.away.mutesAudio, !isMuted {
             awayMutedByUs = true
@@ -1965,25 +2009,19 @@ public final class AppState: ObservableObject {
             warning = WarningMessage(text: "Stop the replay before adding delay")
             return
         }
-        // Away and lag are both "what is on air is not live"; the newer
-        // intent wins. Cleared without stop() for the same reason startReplay
-        // does — `begin` supersedes the transport by itself.
-        if isAway {
-            isAway = false
-            presenceYieldsTheLoop()
-            if awayMutedByUs {
-                awayMutedByUs = false
-                if isMuted { toggleMute() }
-            }
-        }
         let requested = studio.lag.delaySeconds
         // The delay is held in the rolling buffer, so it cannot exceed it.
         let available = min(requested, studio.replay.clampedBufferSeconds - 0.5)
-        guard available > 0.1, pipeline.replayPlayer.startLag(delaySeconds: available) else {
+        // Away and lag are both "what is on air is not live"; the newer
+        // deliberate intent wins, and the claim drops the loop's flag and the
+        // mute it engaged.
+        guard available > 0.1,
+              claimReplayTransport(for: .lag, start: {
+                  $0.startLag(delaySeconds: available)
+              }) else {
             warning = WarningMessage(text: "Nothing buffered to delay yet")
             return
         }
-        isLagging = true
         if studio.lag.delaysAudio {
             audioCapture.delaySeconds = available
         }
@@ -2071,9 +2109,19 @@ public final class AppState: ObservableObject {
         // connection's own, shorter delay. It needs the rolling buffer
         // exactly like §5.12 — but the visual half must not fail with it:
         // degrade what can be degraded, and say what could not.
-        if studio.connection.addsLag, !isLagging, !isCatchingUp,
-           replayMode != .replay {
-            if !studio.replay.isArmed {
+        if studio.connection.addsLag {
+            if !replayTransportIsFreeForTheConnection {
+                // Something the user deliberately put on air already owns the
+                // transport. Starting the delay would re-base the player and
+                // destroy it — an away loop replaced by delayed LIVE camera,
+                // with nobody in front of the camera to notice. So the stunt
+                // degrades the picture that is already there and says the
+                // delay is the half it could not add.
+                if isAway {
+                    warning = WarningMessage(
+                        text: "Degrading the picture. The away loop stays on air")
+                }
+            } else if !studio.replay.isArmed {
                 warning = WarningMessage(
                     text: "Degrading the picture. Turn on the rolling buffer to fall behind live too",
                     action: .armBuffer)
@@ -2081,9 +2129,9 @@ public final class AppState: ObservableObject {
                 let available = min(studio.connection.lagSeconds,
                                     studio.replay.clampedBufferSeconds - 0.5)
                 if available > 0.1,
-                   pipeline.replayPlayer.startLag(delaySeconds: available) {
-                    isLagging = true
-                    connectionEngagedLag = true
+                   claimReplayTransport(for: .connectionLag, start: {
+                       $0.startLag(delaySeconds: available)
+                   }) {
                     // A real network delays both paths together; picture
                     // behind live audio reads as broken software (§5.12).
                     audioCapture.delaySeconds = available
@@ -2166,13 +2214,11 @@ public final class AppState: ObservableObject {
                 cfg.flags[.background] = flags
             }
         }
-        if studio.panic.mutes, !isMuted {
-            panicMutedByUs = true
-            toggleMute()
-        }
-        if studio.panic.freezes, !isFrozen {
-            toggleFreeze()
-        }
+        let engaging = PanicHold.engaging(settings: studio.panic,
+                                          isFrozen: isFrozen, isMuted: isMuted)
+        panicHold = engaging.hold
+        if engaging.mute { toggleMute() }
+        if engaging.freeze { toggleFreeze() }
         updateMenuBarState()
     }
 
@@ -2180,13 +2226,13 @@ public final class AppState: ObservableObject {
         guard isPanicked else { return }
         isPanicked = false
 
-        if isFrozen, studio.panic.freezes {
-            toggleFreeze()
-        }
-        if panicMutedByUs {
-            panicMutedByUs = false
-            if isMuted { toggleMute() }
-        }
+        // Only what panic engaged, and only while it is still true: a freeze
+        // the user set themselves before panicking is theirs to release, and
+        // thawing it here would put live video on air without being asked.
+        let releasing = panicHold.releasing(isFrozen: isFrozen, isMuted: isMuted)
+        panicHold = PanicHold()
+        if releasing.thaw { toggleFreeze() }
+        if releasing.unmute { toggleMute() }
         if let restore = panicRestore {
             panicRestore = nil
             pipeline?.beginCrossfade(durationMs: 200)

@@ -36,8 +36,9 @@ final class LiveFeeds {
 
     private let metal: MetalContext
     private let feeds: [LiveLayerFeed: Feed]
-    /// frame-queue-confined.
-    private var held = false
+    /// frame-queue-confined. Readable because "is a live layer actually being
+    /// held right now" is the question the §5.25 failure is invisible in.
+    private(set) var isHeld = false
 
     init(metal: MetalContext) {
         self.metal = metal
@@ -70,8 +71,8 @@ final class LiveFeeds {
     /// only on the engaging edge, so a minute of freeze costs one copy rather
     /// than one per frame.
     func setHeld(_ wanted: Bool) {
-        guard wanted != held else { return }
-        held = wanted
+        guard wanted != isHeld else { return }
+        isHeld = wanted
         for feed in feeds.values {
             if wanted {
                 feed.hold()
@@ -86,7 +87,7 @@ final class LiveFeeds {
     /// nothing snapshotted: the layer was showing nothing when the picture
     /// stopped, so it shows nothing until the picture moves again.
     func texture(for feed: LiveLayerFeed) -> MTLTexture? {
-        feeds[feed]?.current(held: held)
+        feeds[feed]?.current(held: isHeld)
     }
 
     // MARK: - One feed

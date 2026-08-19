@@ -577,6 +577,38 @@ public final class VideoPipeline {
         }
     }
 
+    /// Claims the one replay transport (§5.9, §5.10, §5.12, §5.14) with a
+    /// picture to cover its start-up, and reports whether `start` — one of
+    /// ReplayPlayer's `startReplay` / `startAway` / `startLag` — took it.
+    ///
+    /// The bridge is armed BEFORE the player starts, never after: `begin()`
+    /// clears the player's frames on the calling thread, so a camera frame
+    /// processed in the gap would find the transport active with nothing to
+    /// show and pass live video through — which is the whole failure this
+    /// exists to close. A refused start releases it again.
+    ///
+    /// The picture is the same pick freeze makes (§5.2): the sharpest frame
+    /// of the preceding 300 ms, copied out of the ring so the pool cannot
+    /// overwrite it. With an empty ring there is nothing to hold and the
+    /// stage falls back to what it did before — but then no camera has
+    /// delivered, so there is no live picture to leak either.
+    @discardableResult
+    public func startReplayTransport(_ start: (ReplayPlayer) -> Bool) -> Bool {
+        stateLock.lock()
+        let now = lastFrameTime
+        stateLock.unlock()
+        frameQueue.sync {
+            let pick = frameRing.sharpestFrame(nowTime: now, windowMs: 300)
+                ?? frameRing.sharpestFrame(nowTime: now, windowMs: .infinity)
+            replayStage.bridgeFrame = pick.flatMap { snapshotTexture(of: $0) }
+        }
+        guard start(replayPlayer) else {
+            frameQueue.sync { replayStage.bridgeFrame = nil }
+            return false
+        }
+        return true
+    }
+
     /// Re-arms the freeze frame from the most recent emitted output. Used
     /// when clip substitution ends while frozen (§5.2): without this the
     /// freeze stage holds nothing (freeze-during-clip relies on the clip
@@ -803,15 +835,23 @@ public final class VideoPipeline {
         lastFrameTime = time
         stateLock.unlock()
 
-        // Consume a deferred freeze: this is the first camera frame since
-        // freeze was engaged with nothing to hold. Snapshot it before the
-        // chain runs so the frozen image is this frame, not live video.
-        if freezePending, cameraBuffer != nil,
+        // Consume a deferred freeze: this is the first frame since freeze was
+        // engaged with nothing to hold. Taken before the chain runs so the
+        // frozen image is this frame, not live video.
+        //
+        // The no-camera heartbeat counts, and that is the point: its dark
+        // placeholder is what is on air, and a freeze that never takes hold
+        // there leaves FreezeStage out of the substituting set, so the `.live`
+        // layers keep moving over the placeholder while every surface says
+        // frozen (§5.25). Holding the placeholder is honest — it is the
+        // picture the user froze — and the camera coming back does not
+        // silently resume under it.
+        if freezePending,
            !(clipStage.isEnabled && (clipStage.player?.hasFrame ?? false)) {
-            if let cameraBuffer, let copy = snapshotTexture(of: cameraBuffer) {
-                freezeStage.freeze(texture: copy)
-                freezePending = false
-            }
+            // FreezeStage copies into its own private texture, so handing it
+            // the frame the chain is about to run is safe.
+            freezeStage.freeze(texture: source)
+            freezePending = !freezeStage.isFrozen
         }
 
         guard let pool else { throw PipelineError.textureAllocationFailed }

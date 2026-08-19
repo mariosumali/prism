@@ -478,3 +478,108 @@ public struct PopoverModuleItem: Codable, Equatable, Identifiable {
         return result
     }
 }
+
+/// Who owns the one ReplayPlayer transport, as the flags every surface reads:
+/// the away loop (§5.10), the lag switch (§5.12) and the delay half of the bad
+/// connection (§5.14). Instant replay (§5.9) claims it too and publishes
+/// nothing of its own — `replayMode` is its flag.
+///
+/// ReplayPlayer is a single transport. `begin()` bumps the generation, sets
+/// the mode and re-bases on the newest buffered frame, so whatever it was
+/// playing is destroyed the instant somebody else starts it. A claimant that
+/// takes the transport without dropping the previous claimant's flag leaves
+/// the app saying "Away" over delayed LIVE camera — the worst thing this app
+/// can do, because the user is not at their desk to see it.
+///
+/// Modelled here rather than open-coded at each call site because the failure
+/// is one of omission: flags derived from the claimant cannot be forgotten by
+/// the claimant after next.
+struct ReplayTransportClaim: Equatable {
+    /// §5.10 — the away loop is playing.
+    var isAway = false
+    /// §5.12 — the delay line is engaged.
+    var isLagging = false
+    /// §5.12 — a release is playing the backlog out faster than real time.
+    var isCatchingUp = false
+    /// §5.14 — the delay was engaged by the bad-connection switch, so that
+    /// switch releases it and the lag switch's own delay is left alone.
+    var connectionEngagedLag = false
+
+    /// Who is taking the transport.
+    enum Claimant: Equatable {
+        case replay         // §5.9
+        case away           // §5.10
+        case lag            // §5.12
+        case connectionLag  // §5.14
+    }
+
+    /// The flags after `claimant` has taken the transport: its own, and
+    /// nobody else's.
+    static func claimed(by claimant: Claimant) -> ReplayTransportClaim {
+        switch claimant {
+        case .replay:
+            return ReplayTransportClaim()
+        case .away:
+            return ReplayTransportClaim(isAway: true)
+        case .lag:
+            return ReplayTransportClaim(isLagging: true)
+        case .connectionLag:
+            return ReplayTransportClaim(isLagging: true, connectionEngagedLag: true)
+        }
+    }
+
+    /// What the outgoing claimant leaves the new one to undo. Derived from
+    /// what was standing rather than from who is taking over: the away loop's
+    /// mute and presence's claim on it belong to the loop, and the audio delay
+    /// line belongs to the delay — whoever replaces them inherits neither.
+    struct Release: Equatable {
+        var loop = false
+        var delayLine = false
+    }
+
+    var release: Release {
+        Release(loop: isAway, delayLine: isLagging || isCatchingUp)
+    }
+
+    /// §5.14 — whether the bad connection may take the transport for its
+    /// delay half. It may not: the delay is the optional half of that switch
+    /// ("degrade what can be degraded, and say what could not"), while a
+    /// replay or an away loop is a picture the user deliberately put on air.
+    /// Taking the transport from the away loop would put delayed live camera
+    /// on air with nobody in front of the camera to notice.
+    static func connectionMayClaimTransport(mode: ReplayMode,
+                                            standing: ReplayTransportClaim) -> Bool {
+        mode == .idle && !standing.isAway && !standing.isLagging
+            && !standing.isCatchingUp
+    }
+}
+
+/// What the panic chord (§5.11) engaged itself, so releasing it undoes
+/// exactly that and nothing else.
+///
+/// The rule is the one presence automation already follows (§5.28): a freeze
+/// or a mute the user engaged before panicking is theirs, and releasing panic
+/// leaves it engaged. Deciding the release from the settings instead — "panic
+/// freezes, so releasing thaws" — thaws the picture a user froze to step out
+/// of shot and puts them back on air without asking.
+struct PanicHold: Equatable {
+    var frozeByUs = false
+    var mutedByUs = false
+
+    /// What engaging does, given what is already true. Anything already
+    /// engaged is left alone: it is the user's, and it stays theirs.
+    static func engaging(settings: PanicSettings,
+                         isFrozen: Bool,
+                         isMuted: Bool) -> (hold: PanicHold, freeze: Bool, mute: Bool) {
+        let freeze = settings.freezes && !isFrozen
+        let mute = settings.mutes && !isMuted
+        return (PanicHold(frozeByUs: freeze, mutedByUs: mute), freeze, mute)
+    }
+
+    /// What releasing undoes: only what this hold engaged, and only while it
+    /// is still true — a user who thawed the picture by hand mid-panic must
+    /// not have it re-frozen or double-toggled on the way out.
+    func releasing(isFrozen: Bool, isMuted: Bool) -> (thaw: Bool, unmute: Bool) {
+        (thaw: frozeByUs && isFrozen, unmute: mutedByUs && isMuted)
+    }
+}
