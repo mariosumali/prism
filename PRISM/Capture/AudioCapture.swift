@@ -118,6 +118,13 @@ public final class AudioCapture {
     /// only by the RT callback; read anywhere.
     public var suppressionEngaged: Bool { _suppressAck }
 
+    /// The microphone is not reaching the call — muted, or stood down while
+    /// clip audio owns the ring (§5.3). Readable from any thread, on the same
+    /// argument the two flags are already read on: one-byte loads that cannot
+    /// tear, whose worst case is a value one IO slice old. §5.30's frame-queue
+    /// bridge joins the RT callback as a reader.
+    public var isOffAir: Bool { _isMuted || _suppressAck }
+
     /// Whether the HAL input unit is currently running (start() succeeded and
     /// stop() has not been called).
     public var isCapturing: Bool { running }

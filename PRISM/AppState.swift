@@ -13,6 +13,7 @@ import AVFoundation
 import Combine
 import CoreMedia
 import Metal
+import QuartzCore
 import SwiftUI
 import UserNotifications
 
@@ -1125,14 +1126,29 @@ public final class AppState: ObservableObject {
         return wants(config) || (draftConfig.map(wants) ?? false)
     }
 
-    /// The level the style stage samples, mapped exactly as the meter maps
-    /// it so "the bar is halfway up" and "the effect is halfway on" are the
-    /// same statement. Static, and capturing only the capture object, so the
-    /// closure the frame queue calls holds nothing of AppState — a main-actor
-    /// hop per frame is precisely what this must never be.
+    /// The level the style stage samples (§5.30), mapped exactly as the
+    /// meter maps it so "the bar is halfway up" and "the effect is halfway
+    /// on" are the same statement. Static, and capturing only the capture
+    /// object, so the closure the frame queue calls holds nothing of
+    /// AppState — a main-actor hop per frame is precisely what this must
+    /// never be.
+    ///
+    /// The rules live in AudioReactiveLevel: a counter that stopped moving
+    /// reads as silence rather than pinning the effect at the last loudness
+    /// heard, and a microphone that is off air reads as silence too. Each
+    /// installation gets its own follower, captured by the closure and
+    /// touched only by the queue that renders that chain — the live pipeline
+    /// and the draft renderer are two chains, two closures, two followers.
     nonisolated private static func audioLevelSource(
         of capture: AudioCapture) -> () -> Double {
-        { MicCheck.displayLevel(rms: capture.inputLevelReading.rms) }
+        var follower = AudioReactiveLevel()
+        return {
+            let reading = capture.inputLevelReading
+            return follower.level(rms: reading.rms,
+                                  sequence: reading.sequence,
+                                  offAir: capture.isOffAir,
+                                  at: CACurrentMediaTime())
+        }
     }
 
     /// The microphone is not reaching the call. Mute is the obvious case;

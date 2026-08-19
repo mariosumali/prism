@@ -58,4 +58,24 @@ public enum ClipDisclosure {
     /// teaches nobody what the feature does.
     public static let alwaysTrue =
         "A saved clip is the raw camera — no effects, no sound."
+
+    /// Today's consequence — nil when nothing on air is hiding anything.
+    ///
+    /// It is an addition to `alwaysTrue`, never a substitute for it (§5.15,
+    /// §8.3). Swapping the two over is the tempting edit, because the
+    /// concealment sentence is the more alarming one — and it is exactly
+    /// wrong: it drops "no effects", the half that teaches that the crop,
+    /// the colour and the overlays go too, in the one state where a clip is
+    /// most revealing. The rule teaches; the consequence stops someone.
+    public static func consequence(_ names: [String]) -> String? {
+        guard !names.isEmpty else { return nil }
+        return "Right now that means the room behind \(phrase(names)). "
+            + "PRISM will ask before it writes the file."
+    }
+
+    /// Every line a capture surface shows, in order, so no surface can print
+    /// a different disclosure than another for the same pending file.
+    public static func captions(_ names: [String]) -> [String] {
+        [alwaysTrue] + (consequence(names).map { [$0] } ?? [])
+    }
 }

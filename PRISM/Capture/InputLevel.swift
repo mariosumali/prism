@@ -120,6 +120,67 @@ final class InputLevelMailbox {
     }
 }
 
+// MARK: - AudioReactiveLevel
+
+/// The §5.30 bridge from the mailbox to an effect that reacts to it, as pure
+/// logic so both rules below can be tested against a clock rather than a
+/// microphone.
+///
+/// It exists because a mailbox is a mailbox. Nothing decays it: once the RT
+/// callback stops publishing — capture stopped, the meter disarmed, the
+/// device gone — the cell holds the last word spoken for as long as the
+/// process lives. The meter already handles that on its 10 Hz timer by
+/// comparing publish counters; the frame path has to handle it too, and with
+/// more urgency, because a meter frozen halfway up is a cosmetic bug in a
+/// window nobody is looking at while a style frozen halfway up is a picture
+/// pulsing on somebody else's screen.
+///
+/// Two rules, and both of them resolve to silence rather than to a hold:
+///
+/// - **A reading nobody published is not a level.** A counter that has not
+///   moved for `freshFor` reads as silence and the envelope releases toward
+///   it, which is what "the meter is not armed" should look like.
+/// - **Off air is silence** (§5.17's sense: muted, or standing down while
+///   clip audio owns the ring). The level the meter shows is deliberately
+///   taken ahead of the mute, because "is my microphone hearing me" has to
+///   stay answerable while muted — but an effect driven from that reading
+///   broadcasts the one thing a mute exists to withhold, spelling out on
+///   camera that the user is talking. The call cannot hear them, so the
+///   picture must not react to them either.
+struct AudioReactiveLevel {
+
+    /// How long a published window stays good for. The mailbox publishes
+    /// ~47×/s, so this is roughly five missed windows: long enough that a
+    /// 60 fps chain — which samples the mailbox faster than it fills, and so
+    /// legitimately sees the same counter twice in a row — never reads a
+    /// live microphone as silence, and short enough that a stopped capture
+    /// releases the effect before anyone could describe it as stuck.
+    static let freshFor: Double = 0.1
+
+    private var lastSequence: UInt32 = 0
+    private var lastPublishedAt: Double?
+
+    /// One frame's level, 0…1, mapped exactly as the meter maps it so "the
+    /// bar is halfway up" and "the effect is halfway on" are the same
+    /// statement. `now` is a monotonic clock in seconds.
+    ///
+    /// Freshness is tracked *before* the off-air gate on purpose: the RT
+    /// callback keeps publishing while muted (that is what feeds the
+    /// muted-and-talking watch), so unmuting mid-sentence finds a counter
+    /// that has been moving all along and the picture answers on the next
+    /// frame instead of after a freshness window of false silence.
+    mutating func level(rms: Double, sequence: UInt32, offAir: Bool,
+                        at now: Double) -> Double {
+        if sequence != lastSequence {
+            lastSequence = sequence
+            lastPublishedAt = now
+        }
+        guard !offAir, let published = lastPublishedAt,
+              now - published <= Self.freshFor else { return 0 }
+        return MicCheck.displayLevel(rms: rms)
+    }
+}
+
 // MARK: - MicWatch
 
 /// "You're muted but talking" (§5.17), as pure logic so the debounce can be

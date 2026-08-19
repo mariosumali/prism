@@ -523,4 +523,94 @@ final class SettingsForwardCompatTests: XCTestCase {
         XCTAssertEqual(preset.configuration.retouch, RetouchSettings())
         XCTAssertFalse(preset.configuration.style.audioReactive)
     }
+
+    // MARK: - The other direction: the PREVIOUS build reading this one
+
+    // A preset is a sharing format (§5.5), so compatibility is not only about
+    // reading old files — it is about the file this build exports landing in
+    // the build the person on the other end is running. The stage table is
+    // the one field where getting that wrong is silent: `flags` is a
+    // dictionary keyed by a String *enum*, JSONEncoder writes it as a flat
+    // alternating array, and decoding that array is all-or-nothing. A single
+    // stage key the reader's enum has no case for throws for the whole
+    // dictionary, the tolerant decode substitutes an empty one, and the
+    // preset arrives with every effect switched off and no error anywhere.
+
+    /// The pre-programme build's stage identifier, verbatim: the same String
+    /// enum without the case this programme added.
+    private enum PreFoundationStageID: String, Codable, Hashable {
+        case clip, replay, freeze, gaze, geometry, adjust, lut, blur
+        case background, overlay, style, connection, outputFit
+    }
+
+    private struct PreFoundationFlags: Codable, Equatable {
+        var enabled = false
+        var pinned = false
+    }
+
+    /// Only the field under test, decoded exactly the way that build decoded
+    /// it — tolerantly, falling back to an empty table.
+    private struct PreFoundationConfiguration: Decodable {
+        var flags: [PreFoundationStageID: PreFoundationFlags] = [:]
+        enum CodingKeys: String, CodingKey { case flags }
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let table = [PreFoundationStageID: PreFoundationFlags].self
+            flags = ((try? container.decodeIfPresent(table, forKey: .flags)) ?? nil) ?? [:]
+        }
+    }
+
+    private struct PreFoundationPreset: Decodable {
+        var name: String
+        var configuration: PreFoundationConfiguration
+    }
+
+    func testAPresetFromThisBuildStillCarriesItsSwitchesIntoThePreviousOne() throws {
+        var configuration = PipelineConfiguration()
+        configuration.flags[.lut] = StageFlags(enabled: true, pinned: true)
+        configuration.flags[.blur] = StageFlags(enabled: true, pinned: false)
+        configuration.flags[.retouch] = StageFlags(enabled: true, pinned: false)
+        let data = try JSONEncoder().encode(
+            Preset(name: "Studio", configuration: configuration))
+
+        let old = try JSONDecoder().decode(PreFoundationPreset.self, from: data)
+        XCTAssertEqual(old.configuration.flags[.lut],
+                       PreFoundationFlags(enabled: true, pinned: true),
+                       "the shared preset arrived with every effect switched off")
+        XCTAssertEqual(old.configuration.flags[.blur],
+                       PreFoundationFlags(enabled: true, pinned: false))
+        XCTAssertEqual(old.configuration.flags[.style], PreFoundationFlags())
+        XCTAssertEqual(old.configuration.flags.count,
+                       PipelineConfiguration.legacyFlagStages.count,
+                       "every stage that build can name, and only those")
+    }
+
+    /// The same rule in the other direction: a stage from a build newer than
+    /// this one costs its own switch and nothing else.
+    func testAStageThisBuildHasNeverHeardOfCostsOnlyItsOwnSwitch() throws {
+        let json = #"""
+        {
+          "stageFlags" : {
+            "lut" : { "enabled" : true, "pinned" : false },
+            "holograph" : { "enabled" : true, "pinned" : true },
+            "blur" : { "enabled" : true, "pinned" : false }
+          }
+        }
+        """#
+        let config = try decode(PipelineConfiguration.self, json)
+        XCTAssertEqual(config.flags(for: .lut), StageFlags(enabled: true, pinned: false))
+        XCTAssertEqual(config.flags(for: .blur), StageFlags(enabled: true, pinned: false))
+        XCTAssertEqual(config.flags.count, 2, "the unknown stage took the table down")
+    }
+
+    /// And the stage the old array cannot carry still survives a round trip
+    /// through this build's own file — it travels in the other shape.
+    func testEveryStageSurvivesThisBuildsOwnRoundTrip() throws {
+        var configuration = PipelineConfiguration()
+        configuration.flags[.retouch] = StageFlags(enabled: true, pinned: true)
+        configuration.flags[.gaze] = StageFlags(enabled: true, pinned: false)
+        let data = try JSONEncoder().encode(configuration)
+        XCTAssertEqual(try JSONDecoder().decode(PipelineConfiguration.self, from: data),
+                       configuration)
+    }
 }

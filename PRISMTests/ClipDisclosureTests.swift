@@ -100,6 +100,23 @@ final class ClipDisclosureTests: XCTestCase {
                        "one, two, and three")
     }
 
+    /// §5.15/§8.3: the standing line is there on every open, and the
+    /// concealment sentence *joins* it rather than replacing it. Swapping
+    /// them over is the tempting edit — the concealment sentence is the more
+    /// alarming one — and it takes "no effects", the half that teaches that
+    /// the crop, the colour and the overlays go too, off the screen in the
+    /// exact state where a saved clip gives most away.
+    func testTheStandingLineIsThereWhetherOrNotSomethingIsConcealed() {
+        XCTAssertEqual(ClipDisclosure.captions([]), [ClipDisclosure.alwaysTrue])
+        XCTAssertNil(ClipDisclosure.consequence([]))
+
+        let both = ClipDisclosure.captions(["background blur"])
+        XCTAssertEqual(both.count, 2)
+        XCTAssertEqual(both.first, ClipDisclosure.alwaysTrue,
+                       "the rule was replaced by the consequence")
+        XCTAssertTrue(both[1].contains("background blur"))
+    }
+
     func testTheStandingLineNamesBothOmissions() {
         // Sound is the half people forget: a clip with no audio is not a
         // recording of the meeting, and saying so once is cheaper than the

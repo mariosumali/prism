@@ -10,8 +10,15 @@ in the repo — read them before writing code:
 - `PRISM/Pipeline/EffectStage.swift` — `StageID`, `StageCost`, `LatencyPolicy`,
   `EffectStage`, `LatencyReport`, `PipelineError`
 - `PRISM/Pipeline/StageSettings.swift` — per-stage Codable settings,
-  `PipelineConfiguration`, `Preset`, `HotkeyCombo`. Includes `StyleLayer` and
-  `StyleSettings`, the one persisted struct with **two live shapes** (§5.29):
+  `PipelineConfiguration`, `Preset`, `HotkeyCombo`. `PipelineConfiguration`
+  writes its stage table in **two shapes** (§5.5): `stageFlags`, an object
+  keyed by the stage's raw name, decoded one entry at a time so an unknown
+  stage costs its own switch and not the table, and the legacy `flags`
+  alternating array, restricted to `legacyFlagStages` — the stages a build
+  that predates `stageFlags` can name — so an exported preset still switches
+  effects on over there. A stage added from here on travels in `stageFlags`
+  only. Includes `StyleLayer` and
+  `StyleSettings`, the persisted struct with **two live shapes** (§5.29):
   `layers` wins whenever the key is present at all, even as an empty array,
   and the flat `effect` / `intensity` / `audioReactive` triple builds slot 0
   only when it is absent — and is still *written*, mirroring slot 0, so a
@@ -1257,6 +1264,14 @@ final class InputLevelMailbox {                     // §5.17
     var reading: (rms: Double, sequence: UInt32) { get }
 }
 
+struct AudioReactiveLevel {                         // §5.30
+    static let freshFor: Double                     // 0.1 s — ~5 windows
+    /// Frame queue. `now` is a monotonic clock in seconds. Returns 0 when
+    /// the counter has not moved for `freshFor`, and 0 while off air.
+    mutating func level(rms: Double, sequence: UInt32, offAir: Bool,
+                        at now: Double) -> Double
+}
+
 final class MicWatch {                              // §5.17
     private(set) var isTalking: Bool
     /// Main thread. Adopts thresholdDB (converted to linear RMS here, once,
@@ -1274,6 +1289,16 @@ moves it with the `PRISMAtomicU64StoreRelease` / `LoadAcquire` shims in
 RingBuffer.h, so a reader can never pair a fresh counter with a stale
 level. RMS rather than peak: both consumers are asking how much *voice*
 is arriving, and a peak meter would let a keyboard click read as speech.
+
+`AudioReactiveLevel` is the §5.30 bridge from that mailbox to the frame
+path, pure for the same reason. Both of its rules resolve to silence rather
+than to a hold: a counter that stopped moving is not a level (the mailbox
+never decays, so a stopped capture would otherwise pin the effect at the
+last loudness heard, on camera), and a microphone that is off air must not
+drive the picture (the meter is deliberately read ahead of the mute, and an
+effect pulsing to a muted user's speech broadcasts exactly what the mute
+withholds). Freshness is tracked before the off-air gate, so unmuting
+answers on the next frame.
 
 `MicWatch` is pure logic so the debounce can be tested against a clock.
 Rules, all of them about not nagging: sustained speech only (accumulated,
@@ -1453,7 +1478,10 @@ public final class StyleStage: EffectStage {       // id .style, cost .moderate
     /// §5.30 — normalised 0…1 microphone loudness, sampled ONCE PER FRAME
     /// ON THE FRAME QUEUE. Whatever is installed must not block, allocate or
     /// take a lock the audio thread holds; the shipped one is a single
-    /// acquire-load out of InputLevelMailbox. nil reads as silence.
+    /// acquire-load out of InputLevelMailbox, through AudioReactiveLevel.
+    /// nil reads as silence, and so do the two cases that mailbox cannot
+    /// signal for itself: a publish counter that has not moved for 100 ms,
+    /// and a microphone that is off air.
     public var audioLevelSource: (() -> Double)?
     /// 1 or 2 — the live pass count (§3.4).
     public var weightMultiplier: Double { get }

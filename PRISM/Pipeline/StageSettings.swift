@@ -928,15 +928,32 @@ public struct PipelineConfiguration: Codable, Equatable {
 
     public enum CodingKeys: String, CodingKey {
         case adjust, retouch, lut, blur, geometry, gaze, background, overlay, style
-        case flags, format, latencyPolicy, cameraID, microphoneID
+        case flags, stageFlags, format, latencyPolicy, cameraID, microphoneID
     }
+
+    /// Any name, so `stageFlags` can be walked one entry at a time.
+    private struct StageFlagKey: CodingKey {
+        var stringValue: String
+        var intValue: Int? { nil }
+        init(_ id: StageID) { stringValue = id.rawValue }
+        init?(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { nil }
+    }
+
+    /// The stages the legacy `flags` array is allowed to carry: exactly the
+    /// ones a build that predates `stageFlags` has a `StageID` case for.
+    /// Frozen, deliberately — a stage added after this line travels in
+    /// `stageFlags` only, and never appears in the array. See `encode`.
+    static let legacyFlagStages: Set<StageID> = [
+        .gaze, .geometry, .adjust, .lut, .blur, .background, .overlay, .style,
+    ]
 
     // Synthesised Codable does not fall back to property defaults for absent
     // keys — it throws. That would mean every saved configuration and every
     // user preset written by an earlier build fails to decode the moment
     // this struct gains a field, and the user silently loses their whole
     // setup on upgrade. Decoding each field independently makes new fields
-    // additive and old files forward-compatible; `encode` stays synthesised.
+    // additive and old files forward-compatible.
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         func decode<T: Decodable>(_ key: CodingKeys, _ fallback: T) -> T {
@@ -951,11 +968,93 @@ public struct PipelineConfiguration: Codable, Equatable {
         background = decode(.background, BackgroundSettings())
         overlay = decode(.overlay, OverlaySettings())
         style = decode(.style, StyleSettings())
-        flags = decode(.flags, [:])
+        flags = Self.decodeFlags(from: container) ?? [:]
         format = decode(.format, VideoFormat(width: 1920, height: 1080, frameRate: 30))
         latencyPolicy = decode(.latencyPolicy, LatencyPolicy.balanced)
         cameraID = (try? container.decodeIfPresent(String.self, forKey: .cameraID)) ?? nil
         microphoneID = (try? container.decodeIfPresent(String.self, forKey: .microphoneID)) ?? nil
+    }
+
+    /// **The stage on/off table has two live shapes, for the same reason
+    /// StyleSettings does (§5.5): a shared preset that arrives blank in an
+    /// older build is a worse failure than one that arrives with an effect
+    /// missing.**
+    ///
+    /// `flags` is `[StageID: StageFlags]`, and StageID is a String *enum*
+    /// rather than a String, so JSONEncoder writes it as a flat alternating
+    /// key/value array. Decoding that array is all-or-nothing: one key the
+    /// reader's enum has no case for throws for the *whole* dictionary, and
+    /// the tolerant decode above then hands back an empty table — which is
+    /// every effect switched off, silently, on a preset the user was told
+    /// was a look they could share. Adding one stage would do that to every
+    /// preset this build exports.
+    ///
+    /// So: `stageFlags` is a plain JSON object keyed by the stage's raw
+    /// name, walked one entry at a time so an unknown stage costs that one
+    /// switch and nothing else, and it is what this build reads. `flags`
+    /// stays written in the old array shape, restricted to the stages an
+    /// older build can name, so a preset exported here still carries its
+    /// LUT, its blur and its backdrop into that build.
+    private static func decodeFlags(
+        from container: KeyedDecodingContainer<CodingKeys>) -> [StageID: StageFlags]? {
+        if let object = try? container.nestedContainer(keyedBy: StageFlagKey.self,
+                                                       forKey: .stageFlags) {
+            var result: [StageID: StageFlags] = [:]
+            for key in object.allKeys {
+                // A stage this build does not have, or a value it cannot
+                // read: drop that pair alone.
+                guard let id = StageID(rawValue: key.stringValue),
+                      let flags = try? object.decode(StageFlags.self, forKey: key)
+                else { continue }
+                result[id] = flags
+            }
+            return result
+        }
+        if var array = try? container.nestedUnkeyedContainer(forKey: .flags) {
+            var result: [StageID: StageFlags] = [:]
+            while !array.isAtEnd {
+                // Alternating key/value: anything that will not decode
+                // desyncs every pair after it, so parsing stops and keeps
+                // what it has rather than throwing the table away.
+                guard let name = try? array.decode(String.self),
+                      let flags = try? array.decode(StageFlags.self) else { break }
+                if let id = StageID(rawValue: name) { result[id] = flags }
+            }
+            return result
+        }
+        return nil
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(adjust, forKey: .adjust)
+        try container.encode(retouch, forKey: .retouch)
+        try container.encode(lut, forKey: .lut)
+        try container.encode(blur, forKey: .blur)
+        try container.encode(geometry, forKey: .geometry)
+        try container.encode(gaze, forKey: .gaze)
+        try container.encode(background, forKey: .background)
+        try container.encode(overlay, forKey: .overlay)
+        try container.encode(style, forKey: .style)
+
+        // Both shapes, in chain order so the file is stable between saves.
+        // See decodeFlags for why there are two.
+        let ordered = flags.sorted { $0.key < $1.key }
+        var object = container.nestedContainer(keyedBy: StageFlagKey.self,
+                                               forKey: .stageFlags)
+        for (id, value) in ordered {
+            try object.encode(value, forKey: StageFlagKey(id))
+        }
+        var legacy = container.nestedUnkeyedContainer(forKey: .flags)
+        for (id, value) in ordered where Self.legacyFlagStages.contains(id) {
+            try legacy.encode(id.rawValue)
+            try legacy.encode(value)
+        }
+
+        try container.encode(format, forKey: .format)
+        try container.encode(latencyPolicy, forKey: .latencyPolicy)
+        try container.encodeIfPresent(cameraID, forKey: .cameraID)
+        try container.encodeIfPresent(microphoneID, forKey: .microphoneID)
     }
 }
 

@@ -116,6 +116,59 @@ final class InputLevelTests: XCTestCase {
         XCTAssertLessThan(MicCheck.meterDecay, 1)
     }
 
+    // MARK: - The audio-reactive bridge (§5.30)
+
+    func testAFreshWindowReadsExactlyAsTheMeterReadsIt() {
+        var bridge = AudioReactiveLevel()
+        XCTAssertEqual(bridge.level(rms: 0.2, sequence: 7, offAir: false, at: 100),
+                       MicCheck.displayLevel(rms: 0.2), accuracy: 1e-9)
+    }
+
+    /// The mailbox has no decay: once the RT callback stops publishing, the
+    /// cell holds the last word spoken forever. Read raw, that pins the
+    /// effect at whatever loudness the meter was disarmed at — a picture
+    /// warping in time with speech that ended minutes ago, on camera.
+    func testAMailboxThatStoppedPublishingReleasesToSilence() {
+        var bridge = AudioReactiveLevel()
+        var now = 100.0
+        XCTAssertGreaterThan(bridge.level(rms: 0.2, sequence: 7, offAir: false, at: now), 0)
+        // The same counter one frame later is not staleness: a 60 fps chain
+        // samples the mailbox faster than its ~47 Hz windows fill, and
+        // reading every other frame as silence would strobe the effect.
+        now += 1.0 / 60
+        XCTAssertGreaterThan(bridge.level(rms: 0.2, sequence: 7, offAir: false, at: now), 0)
+        now += AudioReactiveLevel.freshFor + 0.001
+        XCTAssertEqual(bridge.level(rms: 0.2, sequence: 7, offAir: false, at: now), 0,
+                       "the effect is still being driven by audio nobody published")
+    }
+
+    func testAMailboxThatNeverPublishedIsSilence() {
+        var bridge = AudioReactiveLevel()
+        XCTAssertEqual(bridge.level(rms: 0.2, sequence: 0, offAir: false, at: 5), 0)
+    }
+
+    /// The meter is taken ahead of the mute on purpose (that is what makes
+    /// the muted-and-talking watch possible). An effect driven off the same
+    /// reading would spell out on camera the one thing a mute exists to
+    /// withhold.
+    func testAMutedMicrophoneDrivesNothing() {
+        var bridge = AudioReactiveLevel()
+        XCTAssertEqual(bridge.level(rms: 0.3, sequence: 1, offAir: true, at: 10), 0,
+                       "the call cannot hear them and the picture must not say otherwise")
+        // And coming back on air answers on the very next frame: the counter
+        // kept moving through the mute, so nothing has gone stale.
+        XCTAssertGreaterThan(bridge.level(rms: 0.3, sequence: 2, offAir: false, at: 10.02), 0)
+    }
+
+    func testOffAirIsWhatTheBridgeAsksTheCaptureFor() {
+        let capture = AudioCapture()
+        XCTAssertFalse(capture.isOffAir)
+        capture.isMuted = true
+        XCTAssertTrue(capture.isOffAir)
+        capture.isMuted = false
+        XCTAssertFalse(capture.isOffAir)
+    }
+
     // MARK: - MicWatch
 
     /// Drives the watch at the meter's own 10 Hz cadence.

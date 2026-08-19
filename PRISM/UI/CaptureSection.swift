@@ -24,12 +24,31 @@ struct CaptureSection: View {
                 stillTile
                 clipTile
             }
-            if state.clipConcealments.isEmpty {
-                Text(ClipDisclosure.alwaysTrue)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            } else {
-                concealmentLine
+            disclosure
+        }
+    }
+
+    // MARK: - The disclosure (§5.15)
+
+    /// Rendered straight from `ClipDisclosure.captions`, which decides what
+    /// is said and when: the standing rule first, always, and today's
+    /// consequence under it when something on air is hiding a room. Both,
+    /// never one instead of the other — showing only the consequence would
+    /// take "no effects" off the screen in the exact state where a saved
+    /// clip gives most away, and would leave this section and the main
+    /// window disclosing different things about the same pending file.
+    private var disclosure: some View {
+        let captions = ClipDisclosure.captions(state.clipConcealments)
+        return VStack(alignment: .leading, spacing: 4) {
+            ForEach(Array(captions.enumerated()), id: \.offset) { index, line in
+                if index == 0 {
+                    Text(line)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    concealmentLine(line)
+                }
             }
         }
     }
@@ -91,11 +110,11 @@ struct CaptureSection: View {
 
     /// Loud, not decorative: this is the one place the popover can say that
     /// the file about to be written shows what the call does not.
-    private var concealmentLine: some View {
+    private func concealmentLine(_ consequence: String) -> some View {
         HStack(alignment: .top, spacing: 4) {
             Image(systemName: "eye.trianglebadge.exclamationmark.fill")
                 .foregroundStyle(.orange)
-            Text("A saved clip is the raw camera — no sound, and no \(ClipDisclosure.phrase(state.clipConcealments)). PRISM asks before writing one.")
+            Text(consequence)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .font(.caption2)

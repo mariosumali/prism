@@ -51,8 +51,8 @@ struct CapturePane: View {
                     Button("Turn it on") { state.setBufferArmed(true) }
                 }
             }
-            if !state.clipConcealments.isEmpty {
-                concealmentRow
+            if let consequence = ClipDisclosure.consequence(state.clipConcealments) {
+                concealmentRow(consequence)
             }
             Text("The file is a copy of the frames already in the rolling buffer, so saving re-encodes nothing and costs the live picture nothing.")
                 .font(.caption)
@@ -65,12 +65,14 @@ struct CapturePane: View {
 
     /// The standing caption states the rule; this states today's consequence.
     /// Both, always, because the rule is what teaches and the consequence is
-    /// what stops someone.
-    private var concealmentRow: some View {
+    /// what stops someone. The sentence itself comes from ClipDisclosure so
+    /// this pane and the popover cannot drift into saying different things
+    /// about the same pending file.
+    private func concealmentRow(_ consequence: String) -> some View {
         HStack(alignment: .top, spacing: Metrics.itemGap) {
             Image(systemName: "eye.trianglebadge.exclamationmark.fill")
                 .foregroundStyle(.orange)
-            Text("Right now that means the room behind \(ClipDisclosure.phrase(state.clipConcealments)). PRISM will ask before it writes the file.")
+            Text(consequence)
                 .font(.caption)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
