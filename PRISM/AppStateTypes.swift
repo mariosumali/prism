@@ -116,18 +116,27 @@ public enum ExtensionStatus: Equatable {
     case failed(String)
 }
 
-/// §9 — the three grants driven by OnboardingView, as one state machine.
+/// §9 — the grants driven by OnboardingView, as one state machine.
 public struct SetupStatus: Equatable {
     public var camera: PermissionState = .notDetermined
     public var microphone: PermissionState = .notDetermined
     public var cameraExtension: ExtensionStatus = .unknown
     public var audioPlugInInstalled: Bool = false
+    /// §5.24. The fourth grant, and the only conditional one.
+    public var screenRecording: PermissionState = .notDetermined
+    /// Whether anything is currently asking for the screen — a screen or
+    /// window chosen as the source, or a picture-in-picture layer looking at
+    /// one. Sharing a screen ships off, and a setup banner that never goes
+    /// away because of a feature the user has not switched on is a banner
+    /// people learn to ignore. So the row appears when the feature does.
+    public var screenRecordingNeeded: Bool = false
 
     public init() {}
 
     public var isComplete: Bool {
         camera == .granted && microphone == .granted
             && cameraExtension == .installed && audioPlugInInstalled
+            && (!screenRecordingNeeded || screenRecording == .granted)
     }
 }
 
@@ -265,6 +274,14 @@ public struct ScreenSourceInfo: Identifiable, Equatable, Hashable {
         self.name = name
         self.applicationName = applicationName
     }
+
+    /// How a picker names it. A window title on its own is frequently a
+    /// document name and nothing else — "Untitled 2" — so the application
+    /// that owns it leads, which is also how a person would say it out loud.
+    public var displayName: String {
+        guard let applicationName, !applicationName.isEmpty else { return name }
+        return "\(applicationName) — \(name)"
+    }
 }
 
 /// The user's source pick, persisted.
@@ -273,7 +290,7 @@ public struct ScreenSourceInfo: Identifiable, Equatable, Hashable {
 /// only the id: a window id does not survive a reboot, and a source that
 /// cannot be resolved has to fall back to the camera rather than to a black
 /// frame nobody can explain.
-public struct VideoSourceSelection: Codable, Equatable {
+public struct VideoSourceSelection: Codable, Equatable, Hashable {
     public var kind: VideoSourceKind = .camera
     /// nil for `.camera`; a `ScreenSourceInfo.id` otherwise.
     public var sourceID: String?

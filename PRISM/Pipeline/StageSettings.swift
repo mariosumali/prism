@@ -518,6 +518,14 @@ public struct OverlaySettings: Codable, Equatable {
     public var needsFaceTracker: Bool {
         renderableLayers.contains { $0.anchor == .face }
     }
+
+    /// True when a layer is compositing this feed (§5.25). This is what keeps
+    /// the second capture alive: a camera that is not the source runs only
+    /// because something is putting it in the corner of the picture, and the
+    /// moment that layer goes so does the session.
+    public func needsLiveFeed(_ feed: LiveLayerFeed) -> Bool {
+        renderableLayers.contains { $0.sourceKind == .live && $0.liveFeed == feed }
+    }
 }
 
 // MARK: - Style — preset visual effects (§5.4)

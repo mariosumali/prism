@@ -178,6 +178,16 @@ public final class VideoPipeline {
     /// them (§5.16). Armed by `applyStudio` from `capture.prefersSharp`;
     /// disarmed it holds nothing.
     public let stillRing: StillRing
+    /// Whichever of the camera and the screen is not driving the chain, for
+    /// `.live` overlay layers (§5.25). Held while a substituting stage is
+    /// engaged.
+    let liveFeeds: LiveFeeds
+    /// The stages that replace the picture wholesale, and therefore the ones
+    /// that hold the live feeds: [.clip, .replay, .freeze]. Every member runs
+    /// before `.overlay`; ChainRegistrationTests proves both.
+    static let substitutingStages: Set<StageID>
+    /// §5.24 — an SCStream is running, so §5.23 charges its queue.
+    public func setScreenSourceActive(_ active: Bool)
 
     /// Post-effects output: IOSurface-backed buffer ready for the sink,
     /// plus the final texture for the preview. Called on the capture queue.
@@ -276,6 +286,7 @@ sum the shipped constants never added up to.
 public struct ResourceDemand: Equatable {
     public var format: VideoFormat
     public var stillsWantSharpest: Bool           // §5.16 setting armed
+    public var screenSourceActive: Bool           // §5.24 SCStream running
 }
 
 public enum ResourceTier: String { case full, reduced, minimum, exceeded }
@@ -285,6 +296,7 @@ public struct ResourcePlan: Equatable {
     public var freezeDepth: Int                   // FrameRing slots
     public var freezeStride: Int                  // record 1 camera frame in N
     public var stillDepth: Int                    // 0 → stills use last frame
+    public var screenDepth: Int                   // SCStream queue, 0 when idle
     public var plannedMB: Double
     public var ceilingMB: Double
     public var tier: ResourceTier
@@ -311,6 +323,11 @@ Order of service, fixed and deterministic: freeze's floor, then the still
 ring if armed, then whatever is left widening the freeze window toward
 `preferredFreezeSeconds`. The floor is taken before the ceiling is weighed —
 where it does not fit the tier is `exceeded` and the plan names the figure.
+
+`screenDepth` is `ScreenCapture.queueDepth` while a screen session runs and
+joins the *structural* frames rather than the order of service: PRISM cannot
+make ScreenCaptureKit's queue smaller, so it is spent before anything elastic
+is handed out.
 
 ### VisionCoordinator (`PRISM/Pipeline/VisionCoordinator.swift`)
 
@@ -658,6 +675,68 @@ public final class CameraCapture: NSObject {
 ```
 
 Excludes PRISM's own virtual camera when resolving `nil`/fallback devices.
+
+### ScreenCapture (`PRISM/Capture/ScreenCapture.swift`)
+
+```swift
+public final class ScreenCapture: NSObject {
+    /// Called on the dedicated .userInteractive capture queue, exactly like
+    /// CameraCapture.onFrame — and fed to the same pipeline entry point.
+    public var onFrame: ((CVPixelBuffer, CMTime) -> Void)?
+    /// The source went away, or the stream could not be built. Main thread,
+    /// with a sentence the user may be shown verbatim.
+    public var onStopped: ((String) -> Void)?
+    public private(set) var currentSourceName: String?
+    public var isRunning: Bool { get }
+
+    /// Empty without the Screen Recording grant — enumerating would raise
+    /// the system prompt, and a prompt nobody asked for is not a picker.
+    public static func shareableSources() async -> [ScreenSourceInfo]
+    public func start(selection: VideoSourceSelection, outputFormat: VideoFormat)
+    public func stop()
+    public func restart()                          // §7 sleep/wake
+
+    static let queueDepth = 3                      // SCStream's floor (§5.23)
+    public static func sourceID(display: CGDirectDisplayID) -> String
+    public static func sourceID(window: CGWindowID) -> String
+    public static func displayID(from: String?) -> CGDirectDisplayID?
+    public static func windowID(from: String?) -> CGWindowID?
+    /// Fitted into the format with the source's aspect preserved, even
+    /// dimensions, never scaled up.
+    public static func captureSize(source: CGSize,
+                                   within: VideoFormat) -> (width: Int, height: Int)
+}
+```
+
+Source ids are namespaced (`"display:1"`, `"window:1"`) because the window
+server numbers the two separately and they collide. PRISM's own windows are
+excluded from a display capture. Frames the stream reports as anything but
+`.complete` are skipped and the last real frame is re-sent at the configured
+rate — a still screen is still a screen, and a virtual camera with no frames
+is a placeholder (§3.2).
+
+### LiveFeeds (`PRISM/Media/LiveFeeds.swift`)
+
+Whichever capture is not driving the chain, as a texture a `.live` overlay
+layer composites (§5.25). Owned by `VideoPipeline`, published into from the
+capture queues, read from the frame queue.
+
+```swift
+final class LiveFeeds {
+    init(metal: MetalContext)
+    func publish(_ buffer: CVPixelBuffer, feed: LiveLayerFeed)   // capture queues
+    func clear(_ feed: LiveLayerFeed)                            // any thread
+    func setHeld(_ wanted: Bool)                                 // frame queue
+    func texture(for feed: LiveLayerFeed) -> MTLTexture?         // frame queue
+}
+```
+
+`setHeld(true)` snapshots each feed's current texture into a private copy and
+drops everything published behind it; `setHeld(false)` returns to live. A feed
+with nothing on screen when the hold engages reports nil until it is released.
+The pipeline engages it whenever a `substitutingStages` member encoded this
+frame — the one thing standing between a picture-in-picture and a face that
+keeps talking under a frozen frame.
 
 ### AudioCapture (`PRISM/Capture/AudioCapture.swift`)
 
@@ -1065,6 +1144,11 @@ public final class OverlayStage: EffectStage {      // id .overlay, cost .modera
     public let faceTracker: FaceTracker
     public var needsPersonMask: Bool { get }        // true when any layer is .behind
     public var needsFaceTracker: Bool { get }       // true when any layer is .face-anchored
+    /// §5.25. Set by the pipeline; nil in DraftRenderer, which previews a
+    /// look off camera frames and runs no capture of its own. A `.live`
+    /// layer takes its texture from here rather than from a LayerSource —
+    /// no decoder, and no `maxVideoLayers` slot.
+    var liveFeeds: LiveFeeds?
     /// Output UV → pre-Geometry input UV, pushed once per frame by the
     /// pipeline (GeometryStage.appliedUVTransform). Face-anchored placement
     /// is built in the tracker's space and composed with this, so a prop
@@ -1258,9 +1342,17 @@ public final class SessionLog: ObservableObject {
 public final class Permissions: ObservableObject {
     @Published public private(set) var camera: PermissionState
     @Published public private(set) var microphone: PermissionState
+    /// §5.24 — the conditional fourth grant. CGPreflightScreenCaptureAccess
+    /// answers "granted?" and nothing else, so "never asked" and "said no"
+    /// are told apart by a flag written when the prompt is first raised.
+    @Published public private(set) var screenRecording: PermissionState
     public func refresh()
     public func requestCamera() async -> Bool
     public func requestMicrophone() async -> Bool
+    /// Raises the system prompt, which only ever offers to open System
+    /// Settings; the grant applies at the next launch. Never called from
+    /// launch — only from an intent that asked for a screen.
+    @discardableResult public func requestScreenRecording() -> Bool
 }
 ```
 
@@ -1325,7 +1417,9 @@ public final class AppState: ObservableObject {
     @Published public var isCatchingUp: Bool
     @Published public var isBadConnection: Bool        // §5.14, never persisted
     @Published public var mutedTalking: Bool           // muted, and talking anyway
-    @Published public var isSharingScreen: Bool
+    /// Derived from `videoSource`; read-only, because a surface that could
+    /// set it would move the label without moving the picture.
+    @Published public private(set) var isSharingScreen: Bool
     @Published public var eyeContactTracking: Bool
     // Clip
     @Published public var clipState: ClipState
@@ -1338,7 +1432,15 @@ public final class AppState: ObservableObject {
     @Published public var stageStatus: [StageID: StageStatus]
     @Published public var publishedFormats: [VideoFormat]
     // Devices
-    @Published public var videoSource: VideoSourceSelection   // camera by default
+    /// §5.24. Written only through `selectVideoSource`, which is what starts
+    /// and stops the capture behind it.
+    @Published public private(set) var videoSource: VideoSourceSelection  // camera by default
+    /// Which screen a picture-in-picture shows while the camera is the
+    /// source (§5.25). Never `.camera`.
+    @Published public private(set) var screenFeed: VideoSourceSelection
+    /// Empty without the Screen Recording grant; refreshed when a picker
+    /// is drawn.
+    @Published public private(set) var screenSources: [ScreenSourceInfo]
     @Published public var cameras: [CameraDeviceInfo]
     @Published public var microphones: [AudioDeviceInfo]
     // Presets
@@ -1377,6 +1479,14 @@ public final class AppState: ObservableObject {
     public var backgroundMode: BackgroundMode { get }
     public func setBackgroundMode(_ mode: BackgroundMode)   // keeps both stages consistent
     public func setBackgroundAsset(_ url: URL?)
+    // Screen source and picture-in-picture (§5.24, §5.25)
+    public func selectVideoSource(_ selection: VideoSourceSelection)
+    public func toggleScreenSource()                   // ⌥⌘D, camera ⇄ last screen
+    public func selectScreenFeed(_ selection: VideoSourceSelection)
+    public func addPictureInPicture()                  // the feed that is not on air
+    public func refreshScreenSources()                 // no-op without the grant
+    public func requestScreenRecordingAccess()         // asks, and nothing else
+    public var videoSourceName: String { get }
     // Overlay layers (§5.8)
     public func addOverlayLayer(url: URL)
     public func updateOverlayLayer(_ id: UUID, _ mutate: (inout OverlayLayer) -> Void)

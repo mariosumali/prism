@@ -462,6 +462,33 @@ struct PopoverView: View {
 
     private var devicePickers: some View {
         VStack(alignment: .leading, spacing: Metrics.itemGap) {
+            devicePickerRow(label: "Source") {
+                Picker("Source", selection: sourceBinding) {
+                    Text("Camera").tag(VideoSourceSelection.camera)
+                    // A source that has gone still names itself while it is
+                    // selected; a picker showing a blank row is worse than
+                    // one showing a window that has closed.
+                    if state.videoSource.kind != .camera,
+                       !state.screenSources.contains(where: { $0.id == state.videoSource.sourceID }) {
+                        Text(state.videoSourceName).tag(state.videoSource)
+                    }
+                    ForEach(state.screenSources) { source in
+                        Text(source.displayName)
+                            .tag(VideoSourceSelection(kind: source.kind, sourceID: source.id))
+                    }
+                }
+            }
+            if state.setup.screenRecording != .granted {
+                HStack(spacing: Metrics.itemGap) {
+                    Text("Screens and windows need Screen Recording permission.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                    Button("Allow…") { state.requestScreenRecordingAccess() }
+                        .controlSize(.small)
+                }
+            }
             devicePickerRow(label: "Camera") {
                 Picker("Camera", selection: cameraBinding) {
                     Text("System default").tag(String?.none)
@@ -479,6 +506,7 @@ struct PopoverView: View {
                 }
             }
         }
+        .onAppear { state.refreshScreenSources() }
     }
 
     private func devicePickerRow<Content: View>(
@@ -496,6 +524,12 @@ struct PopoverView: View {
                 .fixedSize()
                 .accessibilityLabel(label)
         }
+    }
+
+    private var sourceBinding: Binding<VideoSourceSelection> {
+        Binding(
+            get: { state.videoSource },
+            set: { state.selectVideoSource($0) })
     }
 
     private var cameraBinding: Binding<String?> {

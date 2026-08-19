@@ -53,6 +53,29 @@ final class PreviewTextureBox {
     }
 }
 
+/// Which capture is driving the chain, readable from the capture queues.
+///
+/// `AppState.videoSource` is main-thread state and the frame path may not
+/// touch it: a camera frame and a screen frame arrive on different queues and
+/// each has to know, without a hop, whether it is the picture or a layer on
+/// top of it. One lock-guarded enum answers that for both.
+final class SourceRoute {
+    private let lock = NSLock()
+    private var kind: VideoSourceKind = .camera
+
+    func set(_ newKind: VideoSourceKind) {
+        lock.lock()
+        kind = newKind
+        lock.unlock()
+    }
+
+    var cameraIsSource: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return kind == .camera
+    }
+}
+
 @MainActor
 public final class AppState: ObservableObject {
 
@@ -181,8 +204,10 @@ public final class AppState: ObservableObject {
     /// anything that could set it would be claiming to have heard
     /// something.
     @Published public private(set) var mutedTalking = false
-    /// A screen or window is on air in place of the camera.
-    @Published public var isSharingScreen = false
+    /// A screen or window is on air in place of the camera. Derived from
+    /// `videoSource`, so it is read-only from outside: a surface that could
+    /// set it would be claiming the picture had changed without changing it.
+    @Published public private(set) var isSharingScreen = false
     /// Playing the backlog out faster than real time after a catch-up release.
     @Published public var isCatchingUp = false
     /// Eye contact has found a face and is actually correcting. A correction
@@ -201,8 +226,21 @@ public final class AppState: ObservableObject {
     // Devices
     /// What feeds the pipeline: the camera, or a screen or window. One
     /// question, one control (§8.7) — which is why the source sits with the
-    /// device pickers rather than in a pane of its own.
-    @Published public var videoSource = VideoSourceSelection.camera
+    /// device pickers rather than in a pane of its own. Written only through
+    /// `selectVideoSource`, which is what starts and stops the capture behind
+    /// it; a surface writing this directly would move the label without
+    /// moving the picture.
+    @Published public private(set) var videoSource = VideoSourceSelection.camera
+    /// Which screen or window the screen capture is pointed at. Usually the
+    /// same as `videoSource`, and separate from it for the one case where it
+    /// cannot be: a picture-in-picture of a screen while the camera is the
+    /// source (§5.25). Never `.camera`.
+    @Published public private(set) var screenFeed = VideoSourceSelection(
+        kind: .display, sourceID: ScreenCapture.sourceID(display: CGMainDisplayID()))
+    /// Everything shareable right now, refreshed when a picker is drawn.
+    /// Empty without the Screen Recording grant — enumerating would raise the
+    /// system prompt, and a prompt nobody asked for is not a picker.
+    @Published public private(set) var screenSources: [ScreenSourceInfo] = []
     @Published public var cameras: [CameraDeviceInfo] = []
     @Published public var microphones: [AudioDeviceInfo] = []
     // Presets
@@ -301,6 +339,8 @@ public final class AppState: ObservableObject {
     private var metal: MetalContext?
     private var pipeline: VideoPipeline?
     private let cameraCapture = CameraCapture()
+    private let screenCapture = ScreenCapture()
+    private let sourceRoute = SourceRoute()
     private let audioCapture = AudioCapture()
     private let deviceMonitor = DeviceMonitor()
     private let cmioSink = CMIOSink()
@@ -336,6 +376,21 @@ public final class AppState: ObservableObject {
     private var noticeTimer: Timer?
     private var lastCameraFrameAt = Date.distantPast
     private let lastFrameLock = NSLock()
+    /// What the running screen session was started for, so reconciliation can
+    /// tell "already capturing this" from "capturing something else".
+    private var activeScreenRequest: (selection: VideoSourceSelection,
+                                      format: VideoFormat)?
+    /// Set when a screen session reported it could not run. Without it a
+    /// picture-in-picture of a window that has closed would rebuild a failing
+    /// stream on every reconciliation, forever. It suppresses only the
+    /// *automatic* rebuild: a new pick, a new layer, a wake, or the grant
+    /// arriving all clear it, because each of them is the user or the system
+    /// saying the answer might be different now.
+    private var screenCaptureBlocked = false
+    /// Live-feed demand as of the last reconciliation, so an edit that did
+    /// not touch it does not tear a capture session down and build it again
+    /// on every drag of a slider.
+    private var lastLiveFeedDemand: Set<LiveLayerFeed> = []
     private var formatsPublishedToExtension = false
     /// Dirty flag for the §5.18 'polc' write, same shape as the one above.
     private var appRulePolicyPublished = false
@@ -381,6 +436,9 @@ public final class AppState: ObservableObject {
         static let popoverLayout = "PRISM.popoverLayout"
         static let studio = "PRISM.studio"
         static let videoSource = "PRISM.videoSource"
+        /// Which screen a picture-in-picture shows while the camera is the
+        /// source — a question `videoSource` cannot hold the answer to.
+        static let screenFeed = "PRISM.screenFeed"
         static let hotkeys = "PRISM.hotkeys"
         static let externalControl = "PRISM.externalControl"
     }
@@ -476,6 +534,13 @@ public final class AppState: ObservableObject {
             // start capturing: capture follows demand, not permission.
             _ = await self.permissions.requestCamera()
             _ = await self.permissions.requestMicrophone()
+            // Screen Recording is deliberately not prompted for here: the
+            // feature ships off, and a permission dialog at first launch for
+            // something nobody has asked for is how apps lose that grant for
+            // good. The persisted pick is only *resolved* — which needs the
+            // grant it already has, or falls back to the camera.
+            await self.resolvePersistedSource()
+            self.refreshScreenRecordingNeed()
             self.reconcileCaptures()
             self.refreshSetupStatus()
         }
@@ -493,12 +558,38 @@ public final class AppState: ObservableObject {
 
         cameraCapture.onFrame = { [weak self, weak pipeline, draftRendererBox] buffer, time in
             guard let self, let pipeline else { return }
+            // The camera is either the picture or a layer on top of it
+            // (§5.25), and the two are the same frames arriving on the same
+            // queue — only the destination differs.
+            guard self.sourceRoute.cameraIsSource else {
+                pipeline.liveFeeds.publish(buffer, feed: .camera)
+                return
+            }
             self.lastFrameLock.lock()
             self.lastCameraFrameAt = Date()
             self.lastFrameLock.unlock()
             pipeline.submitCameraFrame(buffer, at: time)
             // Draft preview rides the same frames; submit() drops when busy.
             draftRendererBox.get()?.submit(buffer)
+        }
+        // §5.24: screen frames enter through the camera's door on purpose.
+        // Everything downstream — the ring, freeze, replay, the still ring,
+        // latency attribution — keeps working precisely because none of it
+        // ever asked where the pixels came from.
+        screenCapture.onFrame = { [weak self, weak pipeline, draftRendererBox] buffer, time in
+            guard let self, let pipeline else { return }
+            guard !self.sourceRoute.cameraIsSource else {
+                pipeline.liveFeeds.publish(buffer, feed: .screen)
+                return
+            }
+            self.lastFrameLock.lock()
+            self.lastCameraFrameAt = Date()
+            self.lastFrameLock.unlock()
+            pipeline.submitCameraFrame(buffer, at: time)
+            draftRendererBox.get()?.submit(buffer)
+        }
+        screenCapture.onStopped = { [weak self] message in
+            Task { @MainActor [weak self] in self?.handleScreenCaptureStopped(message) }
         }
         cameraCapture.onRuntimeError = { [weak self] message in
             Task { @MainActor [weak self] in
@@ -671,6 +762,12 @@ public final class AppState: ObservableObject {
             guard self.audioCaptureDemand else { return }
             if self.captureDemand {
                 self.cameraCapture.restart()
+                // A wake is the other side of a display configuration change:
+                // lids close, docks come and go, and the screen session that
+                // gave up before sleeping deserves a fresh attempt.
+                self.screenCaptureBlocked = false
+                self.activeScreenRequest = nil
+                self.reconcileCaptures()
             }
             self.audioCapture.restart()
         }
@@ -783,11 +880,23 @@ public final class AppState: ObservableObject {
 
     private func wireSetupObservers() {
         permissions.$camera
-            .combineLatest(permissions.$microphone)
+            .combineLatest(permissions.$microphone, permissions.$screenRecording)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] camera, microphone in
-                self?.setup.camera = camera
-                self?.setup.microphone = microphone
+            .sink { [weak self] camera, microphone, screenRecording in
+                guard let self else { return }
+                self.setup.camera = camera
+                self.setup.microphone = microphone
+                let gained = screenRecording == .granted
+                    && self.setup.screenRecording != .granted
+                self.setup.screenRecording = screenRecording
+                // A grant given in System Settings arrives here, not through
+                // an intent — and it is the only thing standing between a
+                // chosen screen and a running one.
+                if gained {
+                    self.screenCaptureBlocked = false
+                    self.refreshScreenSources()
+                    self.reconcileCaptures()
+                }
             }
             .store(in: &cancellables)
         extensionInstaller.$status
@@ -1106,6 +1215,9 @@ public final class AppState: ObservableObject {
         previewBox.setEnabled(previewActive)
         if previewActive {
             refreshSetupStatus()
+            // The source picker is about to be drawn, and windows open and
+            // close while PRISM is not looking.
+            refreshScreenSources()
         }
         // The draft renderer costs GPU per frame, so it exists only while
         // some surface can show it. The draft itself survives both surfaces
@@ -1121,15 +1233,66 @@ public final class AppState: ObservableObject {
         reconcileCaptures()
     }
 
-    /// Single reconciliation point between `captureDemand` and the capture
-    /// hardware. Call whenever an input to the demand expression changes.
-    /// Idempotent; start/stop on an already-started/stopped capture no-ops.
+    /// The camera runs while it is the source, and while a picture-in-picture
+    /// layer is looking at it (§5.25) — the two are the same session, so
+    /// neither has to know about the other.
+    private var wantsCameraCapture: Bool {
+        captureDemand && (videoSource.kind == .camera || liveFeedDemand.contains(.camera))
+    }
+
+    /// The screen capture, on the same rule, with one addition: no grant, no
+    /// session. The framework would raise the system prompt on the user's
+    /// behalf, and a prompt nobody asked for is the thing §9 exists to avoid.
+    private var wantsScreenCapture: Bool {
+        captureDemand && !screenCaptureBlocked
+            && permissions.screenRecording == .granted
+            && (videoSource.kind != .camera || liveFeedDemand.contains(.screen))
+    }
+
+    /// Which feeds a `.live` overlay layer is currently compositing, read off
+    /// the live configuration rather than the draft: capture follows what is
+    /// on air, not what is being edited.
+    private var liveFeedDemand: Set<LiveLayerFeed> {
+        guard config.flags(for: .overlay).enabled else { return [] }
+        return Set(LiveLayerFeed.allCases.filter { config.overlay.needsLiveFeed($0) })
+    }
+
+    /// The screen or window a session would be started on.
+    private var screenSelection: VideoSourceSelection {
+        videoSource.kind == .camera ? screenFeed : videoSource
+    }
+
+    /// Single reconciliation point between demand and the capture hardware.
+    /// Call whenever an input to a demand expression changes. Idempotent;
+    /// start/stop on an already-started/stopped capture no-ops.
     private func reconcileCaptures() {
         guard started else { return }
-        if captureDemand {
+        lastLiveFeedDemand = liveFeedDemand
+        if wantsCameraCapture {
             if !cameraCapture.isRunning, permissions.camera == .granted {
                 startCamera()
             }
+        } else {
+            cameraCapture.stop()
+            pipeline?.liveFeeds.clear(.camera)
+        }
+        if wantsScreenCapture {
+            let request = (screenSelection, formatManager.activeFormat)
+            if !screenCapture.isRunning
+                || activeScreenRequest?.selection != request.0
+                || activeScreenRequest?.format != request.1 {
+                activeScreenRequest = request
+                screenCapture.start(selection: request.0, outputFormat: request.1)
+            }
+        } else {
+            screenCapture.stop()
+            activeScreenRequest = nil
+            pipeline?.liveFeeds.clear(.screen)
+        }
+        // §5.23: ScreenCaptureKit's queue is three full-size surfaces the
+        // governor has to see before it hands the rest of the ceiling out.
+        pipeline?.setScreenSourceActive(wantsScreenCapture)
+        if captureDemand {
             clipPlayer?.setDemandActive(true)
             // Background and overlay videos are media clocks too (§5.7, §5.8).
             pipeline?.setDemandActive(true)
@@ -1141,7 +1304,6 @@ public final class AppState: ObservableObject {
             if micCheck.phase != .idle {
                 micCheck.cancel()
             }
-            cameraCapture.stop()
             // Suspend the clip clock too: otherwise an idle PRISM keeps
             // decoding, and the next demand fast-forwards through the gap.
             clipPlayer?.setDemandActive(false)
@@ -2106,10 +2268,200 @@ public final class AppState: ObservableObject {
     // one file; disjoint regions are the difference between nine clean
     // additions and nine edits to the same hunk.
 
-    // MARK: - Intents: screen source
+    // MARK: - Intents: screen source (§5.24, §5.25)
 
+    /// ⌥⌘D. Straight to the last screen and straight back, because the point
+    /// of the chord is that it is faster than the picker — and a toggle that
+    /// re-asked which screen every time would not be.
     public func toggleScreenSource() {
-        warning = WarningMessage(text: "Sharing a screen isn't built yet.")
+        selectVideoSource(videoSource.kind == .camera ? screenFeed : .camera)
+    }
+
+    /// The one place the source changes. Everything else — the pickers, the
+    /// chord, the fallback when a window closes — comes through here, so the
+    /// capture sessions, the menu bar, the memory plan and the persisted pick
+    /// cannot drift apart.
+    public func selectVideoSource(_ selection: VideoSourceSelection) {
+        if selection.kind != .camera, !ensureScreenRecording() { return }
+        guard selection != videoSource else { return }
+        videoSource = selection
+        sourceRoute.set(selection.kind)
+        if selection.kind != .camera {
+            screenFeed = selection
+            // Only a pick clears the block. Falling back to the camera after
+            // a window closed must not, or a picture-in-picture of that same
+            // window would rebuild the failing stream on the way past.
+            screenCaptureBlocked = false
+        }
+        // Whatever was on air a moment ago is not the source any more; a
+        // stale frame left in a layer would be a picture of the past.
+        pipeline?.liveFeeds.clear(.camera)
+        pipeline?.liveFeeds.clear(.screen)
+        // A source change replaces every pixel, so it fades rather than cuts
+        // — the same 200 ms a preset switch gets (§5.5).
+        pipeline?.beginCrossfade(durationMs: 200)
+        persistVideoSource()
+        refreshScreenRecordingNeed()
+        reconcileCaptures()
+        sessionLog.record(.device, "Source: \(videoSourceName)")
+        updateMenuBarState()
+    }
+
+    /// Which screen a picture-in-picture of "the screen" shows, for the case
+    /// the source picker cannot answer: the camera is on air and the screen
+    /// is the layer. Retargets the source itself when the screen *is* the
+    /// source, so there is one control and never two disagreeing answers.
+    public func selectScreenFeed(_ selection: VideoSourceSelection) {
+        guard selection.kind != .camera else { return }
+        if videoSource.kind != .camera {
+            selectVideoSource(selection)
+            return
+        }
+        guard selection != screenFeed else { return }
+        guard ensureScreenRecording() else { return }
+        screenFeed = selection
+        screenCaptureBlocked = false
+        pipeline?.liveFeeds.clear(.screen)
+        persistVideoSource()
+        reconcileCaptures()
+    }
+
+    /// §5.25 — you over your screen, or your screen over you, whichever way
+    /// round the source currently is. Deliberately one action rather than a
+    /// choice: the only picture-in-picture worth having is of the feed that
+    /// is not already the picture (§8.7).
+    public func addPictureInPicture() {
+        let feed: LiveLayerFeed = videoSource.kind == .camera ? .screen : .camera
+        if feed == .screen, !ensureScreenRecording() { return }
+        guard editingConfig.overlay.layers.count < OverlaySettings.maxLayers else {
+            warning = WarningMessage(
+                text: "PRISM composites up to \(OverlaySettings.maxLayers) layers at once")
+            return
+        }
+        // Bottom right at just over a quarter width: the corner a call
+        // application would have put it in, at the size it would have used.
+        // A live feed carries its own alpha-free rectangle, so no key.
+        let layer = OverlayLayer(name: feed == .camera ? "Camera" : "Screen",
+                                 sourceKind: .live,
+                                 keyMode: .none,
+                                 scale: 0.28,
+                                 offsetX: 0.62,
+                                 offsetY: 0.62,
+                                 liveFeed: feed)
+        screenCaptureBlocked = false
+        updateEditing { cfg in
+            cfg.overlay.layers.append(layer)
+            var flags = cfg.flags(for: .overlay)
+            flags.enabled = true
+            cfg.flags[.overlay] = flags
+        }
+    }
+
+    /// Asks for the grant and nothing else, for the surfaces that offer it
+    /// beside an empty picker. Deliberately not "pick a screen": a button
+    /// labelled Allow must not also put a screen on air.
+    public func requestScreenRecordingAccess() {
+        ensureScreenRecording()
+    }
+
+    /// Re-reads what is shareable. Refused without the grant rather than
+    /// prompting: this runs whenever a picker is drawn, and enumerating
+    /// raises the system prompt.
+    public func refreshScreenSources() {
+        guard permissions.screenRecording == .granted else {
+            if !screenSources.isEmpty { screenSources = [] }
+            return
+        }
+        Task { @MainActor [weak self] in
+            let list = await ScreenCapture.shareableSources()
+            guard let self, list != self.screenSources else { return }
+            self.screenSources = list
+        }
+    }
+
+    /// What the source is called, for the status line and the session log.
+    /// Falls back to the kind when the source has gone: naming a window that
+    /// has closed is exactly the sentence a user needs.
+    public var videoSourceName: String {
+        guard videoSource.kind != .camera else {
+            return cameraCapture.currentDeviceName ?? "Camera"
+        }
+        return screenSources.first { $0.id == videoSource.sourceID }?.displayName
+            ?? screenCapture.currentSourceName
+            ?? videoSource.kind.displayName
+    }
+
+    /// Returns whether a screen may be captured, asking for the grant the
+    /// first time and pointing at System Settings after that. The prompt is
+    /// only ever raised from here — that is, only from an intent the user
+    /// expressed.
+    @discardableResult
+    private func ensureScreenRecording() -> Bool {
+        setup.screenRecordingNeeded = true
+        if permissions.screenRecording == .notDetermined {
+            permissions.requestScreenRecording()
+        }
+        setup.screenRecording = permissions.screenRecording
+        guard permissions.screenRecording != .granted else { return true }
+        warning = WarningMessage(
+            text: "PRISM needs Screen Recording. Allow it in System Settings, then reopen PRISM.",
+            action: .openScreenRecordingSettings)
+        return false
+    }
+
+    /// The grant is demanded by the feature, not by the app (§9): the setup
+    /// row appears when something is actually asking for a screen and goes
+    /// away with it.
+    private func refreshScreenRecordingNeed() {
+        let needed = videoSource.kind != .camera || liveFeedDemand.contains(.screen)
+        if setup.screenRecordingNeeded != needed {
+            setup.screenRecordingNeeded = needed
+        }
+    }
+
+    /// A window closed, a display was unplugged, or the stream could not be
+    /// built. §3.2's placeholder rule is the precedent: never a black frame.
+    /// The camera is the only source that exists without a grant, so it is
+    /// where a lost screen lands.
+    private func handleScreenCaptureStopped(_ message: String) {
+        screenCaptureBlocked = true
+        activeScreenRequest = nil
+        pipeline?.liveFeeds.clear(.screen)
+        sessionLog.record(.device, message)
+        warning = WarningMessage(
+            text: message,
+            action: permissions.screenRecording == .granted
+                ? .none : .openScreenRecordingSettings)
+        postNotification(body: message)
+        if videoSource.kind != .camera {
+            selectVideoSource(.camera)
+        } else {
+            reconcileCaptures()
+        }
+    }
+
+    /// Launch-time resolution of the persisted pick. A display id survives a
+    /// reboot and a window id does not, which is the whole reason the
+    /// selection stores an id and nothing else — an unresolvable one falls
+    /// back to the camera rather than to a black frame nobody can explain.
+    private func resolvePersistedSource() async {
+        guard videoSource.kind != .camera else { return }
+        guard permissions.screenRecording == .granted else {
+            revertToCamera(logging: "Screen sharing needs permission PRISM does not have; using the camera.")
+            return
+        }
+        let list = await ScreenCapture.shareableSources()
+        screenSources = list
+        guard !list.contains(where: { $0.id == videoSource.sourceID }) else { return }
+        revertToCamera(logging: "The \(videoSource.kind.displayName.lowercased()) PRISM was sharing is gone; using the camera.")
+    }
+
+    /// The quiet fallback. Deliberately not a warning: this happens at launch
+    /// after a reboot, every time, for anyone who shared a window — and a
+    /// warning that fires on a schedule is one people stop reading.
+    private func revertToCamera(logging message: String) {
+        sessionLog.record(.device, message)
+        selectVideoSource(.camera)
     }
 
     // MARK: - Intents: prompter
@@ -2419,6 +2771,14 @@ public final class AppState: ObservableObject {
         if autoFrameChanged {
             restartAutoFrameTimerIfNeeded()
         }
+        // §5.25: adding or removing a picture-in-picture layer starts or
+        // stops a whole capture session. Compared rather than reconciled
+        // unconditionally because this runs on every drag of every slider,
+        // and reconciliation rebuilds the no-camera tick timer.
+        if liveFeedDemand != lastLiveFeedDemand {
+            refreshScreenRecordingNeed()
+            reconcileCaptures()
+        }
         persistConfig()
         updateMenuBarState()
     }
@@ -2548,6 +2908,10 @@ public final class AppState: ObservableObject {
             startCamera()                 // re-pick the physical format (§3.2)
             restartNoCameraTimer()        // tick interval tracks the frame rate
         }
+        // §5.24: a screen session is configured at the format's size and rate,
+        // so a format change retargets it exactly as it retargets the camera's
+        // physical pick. Reconciliation compares the request it started with.
+        reconcileCaptures()
         // While idle the camera stays off; the next demand-driven start
         // reads formatManager.activeFormat and picks the format up then.
         formatManager.persist()
@@ -2940,6 +3304,7 @@ public final class AppState: ObservableObject {
         pipeline?.replayPlayer.stop()
         pipeline?.replayBuffer.reset()
         cameraCapture.stop()
+        screenCapture.stop()
         cmioSink.disconnect()
         audioSink?.close()      // marks producerAlive = 0 → plug-in emits silence
         NSApp.terminate(nil)
@@ -3027,6 +3392,9 @@ public final class AppState: ObservableObject {
         permissions.refresh()
         extensionInstaller.checkStatus()
         setup.audioPlugInInstalled = AudioSink.isPlugInInstalled
+        // §9: the screen row is owned by whether anything is asking for a
+        // screen, and an attempt the user abandoned stops asking.
+        refreshScreenRecordingNeed()
     }
 
     private func refreshDeviceLists() {
@@ -3060,6 +3428,21 @@ public final class AppState: ObservableObject {
            let decoded = try? JSONDecoder().decode(HotkeyBindings.self, from: data) {
             hotkeyBindings = decoded
         }
+        // §5.24: the pick is restored, but not trusted — resolvePersistedSource
+        // asks the window server whether it still means anything before any
+        // capture is started against it.
+        if let data = UserDefaults.standard.data(forKey: DefaultsKey.videoSource),
+           let decoded = try? JSONDecoder().decode(VideoSourceSelection.self, from: data) {
+            videoSource = decoded
+            isSharingScreen = decoded.kind != .camera
+            sourceRoute.set(decoded.kind)
+            if decoded.kind != .camera { screenFeed = decoded }
+        }
+        if let data = UserDefaults.standard.data(forKey: DefaultsKey.screenFeed),
+           let decoded = try? JSONDecoder().decode(VideoSourceSelection.self, from: data),
+           decoded.kind != .camera {
+            screenFeed = decoded
+        }
         externalControlEnabled =
             UserDefaults.standard.bool(forKey: DefaultsKey.externalControl)
         // §8.3 default: Framing, Effects, Format collapsed on first launch —
@@ -3083,6 +3466,15 @@ public final class AppState: ObservableObject {
     private func persistStudio() {
         if let data = try? JSONEncoder().encode(studio) {
             UserDefaults.standard.set(data, forKey: DefaultsKey.studio)
+        }
+    }
+
+    private func persistVideoSource() {
+        if let data = try? JSONEncoder().encode(videoSource) {
+            UserDefaults.standard.set(data, forKey: DefaultsKey.videoSource)
+        }
+        if let data = try? JSONEncoder().encode(screenFeed) {
+            UserDefaults.standard.set(data, forKey: DefaultsKey.screenFeed)
         }
     }
 

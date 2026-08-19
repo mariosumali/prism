@@ -48,10 +48,17 @@ public struct ResourceDemand: Equatable {
     /// output frames held. The only elastic demand a user switches on
     /// directly, which is why it outranks widening the freeze window.
     public var stillsWantSharpest: Bool
+    /// §5.24 — a ScreenCaptureKit session is running. Not elastic and not
+    /// negotiable: the framework holds its own queue of full-size surfaces
+    /// and PRISM cannot shrink it below three, so it is a fixed cost that has
+    /// to be taken off the top rather than something the plan can trade.
+    public var screenSourceActive: Bool
 
-    public init(format: VideoFormat, stillsWantSharpest: Bool = false) {
+    public init(format: VideoFormat, stillsWantSharpest: Bool = false,
+                screenSourceActive: Bool = false) {
         self.format = format
         self.stillsWantSharpest = stillsWantSharpest
+        self.screenSourceActive = screenSourceActive
     }
 }
 
@@ -76,6 +83,9 @@ public struct ResourcePlan: Equatable {
     public var freezeStride: Int
     /// StillRing slots (§5.16); 0 means stills fall back to the last frame.
     public var stillDepth: Int
+    /// Frames ScreenCaptureKit holds while a screen is being captured
+    /// (§5.24); 0 when no screen session is running.
+    public var screenDepth: Int
     public var plannedMB: Double
     public var ceilingMB: Double
     public var tier: ResourceTier
@@ -84,12 +94,14 @@ public struct ResourcePlan: Equatable {
     public var stillsSummary: String?
 
     public init(format: VideoFormat, freezeDepth: Int, freezeStride: Int = 1,
-                stillDepth: Int, plannedMB: Double, ceilingMB: Double,
+                stillDepth: Int, screenDepth: Int = 0,
+                plannedMB: Double, ceilingMB: Double,
                 tier: ResourceTier, stillsSummary: String? = nil) {
         self.format = format
         self.freezeDepth = freezeDepth
         self.freezeStride = freezeStride
         self.stillDepth = stillDepth
+        self.screenDepth = screenDepth
         self.plannedMB = plannedMB
         self.ceilingMB = ceilingMB
         self.tier = tier
@@ -196,7 +208,13 @@ public enum ResourceGovernor {
     public static func plan(for demand: ResourceDemand) -> ResourcePlan {
         let format = demand.format
         let frame = frameMB(for: format)
-        let fixed = reservedMB + visionStagingMB + Double(structuralFrames) * frame
+        // ScreenCaptureKit's queue joins the structural frames rather than
+        // the elastic ones: PRISM cannot make it smaller, so pretending it is
+        // negotiable would only mean the freeze window is planned against
+        // memory that is already spent.
+        let screenDepth = demand.screenSourceActive ? ScreenCapture.queueDepth : 0
+        let fixed = reservedMB + visionStagingMB
+            + Double(structuralFrames + screenDepth) * frame
 
         let floor = minimumFreezeDepth
         let preferred = preferredDepth(for: format)
@@ -244,6 +262,7 @@ public enum ResourceGovernor {
                             freezeStride: stride(depth: freezeDepth,
                                                  frameRate: format.frameRate),
                             stillDepth: stillDepth,
+                            screenDepth: screenDepth,
                             plannedMB: planned,
                             ceilingMB: ceilingMB,
                             tier: tier,

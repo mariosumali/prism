@@ -177,13 +177,21 @@ struct ScenePane: View {
                 Toggle("Enabled", isOn: enabledBinding(.overlay))
                 Toggle("Required", isOn: pinnedBinding(.overlay))
                 Spacer()
+                // One action, not a choice: the only picture-in-picture
+                // worth having is of the feed that is not already the
+                // picture, so the button names what you will get (§8.7).
+                Button(state.isSharingScreen ? "Add me" : "Add my screen") {
+                    state.addPictureInPicture()
+                }
+                .disabled(state.editingConfig.overlay.layers.count
+                          >= OverlaySettings.maxLayers)
                 Button("Add layer…") { chooseLayer() }
                     .disabled(state.editingConfig.overlay.layers.count
                               >= OverlaySettings.maxLayers)
             }
 
             if state.editingConfig.overlay.layers.isEmpty {
-                Text("Drop an image or video anywhere on this pane, or use Add layer. A PNG with alpha composites as-is; a green-screen clip gets keyed. Put a layer behind you and you are standing in front of it, or pin it to your face and it rides along — a hat above your head, glasses on the eye line, a moustache under your nose.")
+                Text("Drop an image or video anywhere on this pane, or use Add layer. A PNG with alpha composites as-is; a green-screen clip gets keyed. Put a layer behind you and you are standing in front of it, or pin it to your face and it rides along — a hat above your head, glasses on the eye line, a moustache under your nose. The other button puts whichever feed is not on air into the corner of the one that is.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
@@ -309,6 +317,9 @@ private struct LayerEditor: View {
     var body: some View {
         DisclosureGroup {
             VStack(alignment: .leading, spacing: Metrics.itemGap) {
+                if layer.sourceKind == .live {
+                    liveFeedControls
+                }
                 Picker("Placement", selection: binding(\.placement)) {
                     ForEach(LayerPlacement.allCases, id: \.self) { placement in
                         Text(placement.displayName).tag(placement)
@@ -397,7 +408,7 @@ private struct LayerEditor: View {
                     .labelsHidden()
                     .toggleStyle(.checkbox)
                     .accessibilityLabel("\(layer.name) enabled")
-                Image(systemName: layer.sourceKind == .video ? "film" : "photo")
+                Image(systemName: Self.symbol(for: layer.sourceKind))
                     .foregroundStyle(.secondary)
                 Text(layer.name)
                     .lineLimit(1)
@@ -410,6 +421,78 @@ private struct LayerEditor: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    private static func symbol(for kind: LayerSourceKind) -> String {
+        switch kind {
+        case .image: return "photo"
+        case .video: return "film"
+        case .text: return "textformat"
+        case .live: return "pip"
+        }
+    }
+
+    /// §5.25 — what a live layer is looking at, and which screen that means.
+    /// The feed picker is here rather than beside the source picker because
+    /// it is a property of this layer; the screen picker below it is the same
+    /// control as the source's, so the two can never disagree about which
+    /// screen PRISM is capturing.
+    @ViewBuilder
+    private var liveFeedControls: some View {
+        Picker("Showing", selection: feedBinding) {
+            ForEach(LiveLayerFeed.allCases, id: \.self) { feed in
+                Text(feed.displayName).tag(Optional(feed))
+            }
+        }
+        .pickerStyle(.segmented)
+
+        if layer.liveFeed == .screen, !state.isSharingScreen {
+            Picker("Screen", selection: screenBinding) {
+                ForEach(state.screenSources) { source in
+                    Text(source.displayName)
+                        .tag(VideoSourceSelection(kind: source.kind, sourceID: source.id))
+                }
+            }
+        }
+        if let reason = unavailableReason {
+            Text(reason)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        Text("A live layer holds still whenever the picture does — freeze, replay, away or panic — so nothing in the corner can keep moving under a frozen frame.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+
+    /// The one state a live layer can be in that looks broken and is not.
+    private var unavailableReason: String? {
+        switch layer.liveFeed {
+        case .camera where !state.isSharingScreen:
+            return "The camera is already the picture, so this draws nothing. Share a screen and it becomes you, in the corner."
+        case .screen where state.isSharingScreen:
+            return "The screen is already the picture, so this draws nothing."
+        case .screen where state.setup.screenRecording != .granted:
+            return "Screens need Screen Recording permission."
+        default:
+            return nil
+        }
+    }
+
+    private var feedBinding: Binding<LiveLayerFeed?> {
+        Binding(
+            get: {
+                state.editingConfig.overlay.layers
+                    .first { $0.id == layer.id }?.liveFeed ?? layer.liveFeed
+            },
+            set: { value in
+                state.updateOverlayLayer(layer.id) { $0.liveFeed = value }
+            })
+    }
+
+    private var screenBinding: Binding<VideoSourceSelection> {
+        Binding(
+            get: { state.screenFeed },
+            set: { state.selectScreenFeed($0) })
     }
 
     private func binding<Value>(

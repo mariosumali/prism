@@ -56,6 +56,11 @@ struct DiagnosticsPane: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                if state.resources.screenDepth > 0 {
+                    Text("Screen capture holds \(state.resources.screenDepth) frames of its own. That is the framework's floor, so it comes off the top rather than out of the freeze window.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             Section("GPU cost per effect") {
                 if measuredStages.isEmpty {

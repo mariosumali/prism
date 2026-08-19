@@ -24,6 +24,13 @@ struct OnboardingView: View {
             permissionsRow
             extensionRow
             audioRow
+            // §5.24 — the one conditional grant. It appears when something is
+            // actually asking for a screen and disappears with it, because a
+            // banner that never clears for a feature nobody switched on is a
+            // banner people learn to ignore.
+            if state.setup.screenRecordingNeeded {
+                screenRecordingRow
+            }
         }
         .prismCard()
         // §9 — the postinstall restarts coreaudiod; warn before running.
@@ -106,6 +113,22 @@ struct OnboardingView: View {
         }
     }
 
+    /// Unlike camera and microphone, PRISM cannot grant this by prompting:
+    /// macOS only offers to open the pane, and the grant takes effect when
+    /// PRISM is next launched. The caption says so rather than leaving the
+    /// user wondering why the screen is still not on air.
+    private var screenRecordingRow: some View {
+        if state.setup.screenRecording == .granted {
+            return setupRow(.done, title: "Screen recording",
+                            caption: nil, buttonTitle: nil) {}
+        }
+        return setupRow(.problem, title: "Screen recording",
+                        caption: "Allow PRISM in System Settings, then reopen PRISM to share a screen",
+                        buttonTitle: "Open System Settings") {
+            openScreenRecordingSettings()
+        }
+    }
+
     // MARK: - Row builder
 
     private enum RowState {
@@ -181,6 +204,13 @@ struct OnboardingView: View {
             ? "Privacy_Microphone"
             : "Privacy_Camera"
         let pane = "x-apple.systempreferences:com.apple.preference.security?\(target)"
+        if let url = URL(string: pane) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func openScreenRecordingSettings() {
+        let pane = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
         if let url = URL(string: pane) {
             NSWorkspace.shared.open(url)
         }

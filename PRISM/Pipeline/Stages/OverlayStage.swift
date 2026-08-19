@@ -43,6 +43,13 @@ public final class OverlayStage: EffectStage {
     /// which is the second full-frame Vision request this exists to prevent.
     public let faceTracker: FaceTracker
 
+    /// Whichever capture is not feeding the pipeline, for `.live` layers
+    /// (§5.25). Set by the pipeline, the same arrangement clip and replay
+    /// have with their players. Left nil in the draft renderer, which
+    /// previews a look off camera frames and runs no capture of its own —
+    /// the same reduced fidelity that already makes it skip segmentation.
+    var liveFeeds: LiveFeeds?
+
     /// Output UV → pre-geometry input UV, pushed by the pipeline each frame.
     ///
     /// The face is measured before Geometry (§5.6) and layers are composited
@@ -144,11 +151,26 @@ public final class OverlayStage: EffectStage {
             // through a dropout, so the prop shrinks out of sight from where
             // it was standing and comes back to where the head is now.
             if layer.anchor == .face, !isFaceUsable { continue }
-            guard let source = source(for: layer.id),
-                  let texture = source.currentTexture(at: hostTime) else { continue }
+            guard let texture = texture(for: layer, at: hostTime) else { continue }
             pending.append((layer, texture))
         }
         return !pending.isEmpty
+    }
+
+    /// Where a layer's pixels come from this frame. A file-backed layer has
+    /// its own decoder; a live one is looking at a capture session that
+    /// already exists, which is exactly why it costs no decoder and no cap
+    /// slot of the tighter kind (§5.8).
+    ///
+    /// A live layer asking for the feed that is already driving the pipeline
+    /// gets nothing, because nothing is published for it: a picture-in-
+    /// picture of the picture is a picture of itself.
+    private func texture(for layer: OverlayLayer, at hostTime: CMTime) -> MTLTexture? {
+        if layer.sourceKind == .live {
+            guard let feed = layer.liveFeed else { return nil }
+            return liveFeeds?.texture(for: feed)
+        }
+        return source(for: layer.id)?.currentTexture(at: hostTime)
     }
 
     /// A face-anchored layer needs a pose to hang off. Below the ramp's floor

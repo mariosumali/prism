@@ -160,6 +160,41 @@ private struct DevicesPane: View {
 
     var body: some View {
         Form {
+            Section("Source") {
+                Picker("On air", selection: sourceBinding) {
+                    Text("Camera").tag(VideoSourceSelection.camera)
+                    // Keeps a source that has since gone away nameable while
+                    // it is still selected.
+                    if state.videoSource.kind != .camera,
+                       !state.screenSources.contains(where: { $0.id == state.videoSource.sourceID }) {
+                        Text(state.videoSourceName).tag(state.videoSource)
+                    }
+                    ForEach(state.screenSources) { source in
+                        Text(source.displayName)
+                            .tag(VideoSourceSelection(kind: source.kind, sourceID: source.id))
+                    }
+                }
+                HStack {
+                    Button("Refresh list") { state.refreshScreenSources() }
+                    Spacer()
+                    Text(state.isSharingScreen ? "Sharing a screen" : "Camera on air")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if state.setup.screenRecording != .granted {
+                    HStack {
+                        Text("Screens and windows need Screen Recording permission. macOS applies the grant when PRISM is next opened.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                        Button("Allow…") { state.requestScreenRecordingAccess() }
+                    }
+                }
+                Text("A screen goes through the same chain the camera does, so freeze, replay, the effects and every saved clip work on it unchanged. If the window closes or the display goes, PRISM falls back to the camera and says so — never to a black frame.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section("Camera") {
                 Picker("Camera", selection: cameraBinding) {
                     Text("System default").tag(String?.none)
@@ -186,6 +221,13 @@ private struct DevicesPane: View {
             }
         }
         .formStyle(.grouped)
+        .onAppear { state.refreshScreenSources() }
+    }
+
+    private var sourceBinding: Binding<VideoSourceSelection> {
+        Binding(
+            get: { state.videoSource },
+            set: { state.selectVideoSource($0) })
     }
 
     private var cameraBinding: Binding<String?> {

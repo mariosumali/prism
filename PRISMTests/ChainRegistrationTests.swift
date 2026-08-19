@@ -96,4 +96,24 @@ final class ChainRegistrationTests: XCTestCase {
         let lastResort = StageID.allCases.filter(\.isLastResort)
         XCTAssertEqual(lastResort, [.background])
     }
+
+    /// §5.25: a live overlay layer is held whenever a stage is substituting
+    /// the picture, and the decision is taken at the layers' own position in
+    /// the walk — which is only correct while every substituting stage runs
+    /// before them. A stage added upstream of overlay that replaces the
+    /// picture and is not in this set would keep a picture-in-picture moving
+    /// under a frozen frame, and nobody would see it until it happened on a
+    /// call.
+    func testSubstitutingStagesAreCompleteAndRunBeforeTheLayers() {
+        // Intent-owned minus the two that modify rather than replace: bad
+        // connection degrades the picture it is given, and output fit is
+        // structural.
+        let expected = Self.intentOwned.subtracting([.connection, .outputFit])
+        XCTAssertEqual(VideoPipeline.substitutingStages, expected,
+                       "a stage that substitutes the picture must hold the live feeds")
+        for id in VideoPipeline.substitutingStages {
+            XCTAssertLessThan(id.chainIndex, StageID.overlay.chainIndex,
+                              "\(id) substitutes after the layers it is supposed to hold")
+        }
+    }
 }

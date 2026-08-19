@@ -180,6 +180,10 @@ public final class VideoPipeline {
     /// A fifth of a second of finished frames, scored, so a still can be the
     /// sharpest of them (§5.16). Disarmed — and empty — by default.
     public let stillRing: StillRing
+    /// Whichever of the camera and the screen is not driving the chain, for
+    /// `.live` overlay layers (§5.25). Published into from the capture
+    /// queues; read from the frame queue.
+    let liveFeeds: LiveFeeds
 
     /// Post-effects output: IOSurface-backed buffer ready for the sink, plus
     /// the final texture for the preview. Invoked from the command buffer's
@@ -239,6 +243,9 @@ public final class VideoPipeline {
     /// §5.16's setting, remembered so a format change can re-plan against it
     /// without waiting for the next applyStudio.
     private var stillsWantSharpest = false
+    /// §5.24 — a ScreenCaptureKit session is running, so its frame queue is
+    /// spoken for in the memory plan.
+    private var screenSourceActive = false
     /// Counts camera frames past the freeze ring, and the stride it is
     /// counted against — read off the plan once per frame in ensureWorking so
     /// the hot path never takes stateLock for it. Both frameQueue-confined.
@@ -311,6 +318,20 @@ public final class VideoPipeline {
     /// layers are placed in before the geometry matrix carries them forward.
     private static let faceConsumers: Set<StageID> = [.gaze, .overlay]
 
+    /// Where the live feeds are held or released: the first stage that can
+    /// composite one. Taken here rather than up front because by this point
+    /// in the walk every stage that can substitute the picture has already
+    /// had its say, and `encoded` is the record of what they decided.
+    private static let liveFeedConsumers: Set<StageID> = [.overlay]
+
+    /// The stages that replace the picture wholesale rather than modifying
+    /// it. A `.live` layer downstream of one of these would keep moving under
+    /// a picture the user believes is held — the failure §5.25 exists to
+    /// prevent — so this set is what the hold is keyed on. Internal so
+    /// ChainRegistrationTests can prove it stays complete and stays upstream
+    /// of the layers.
+    static let substitutingStages: Set<StageID> = [.clip, .replay, .freeze]
+
     // MARK: Init / configure
 
     public init(metal: MetalContext) throws {
@@ -323,6 +344,7 @@ public final class VideoPipeline {
         faceTracker = try FaceTracker(metal: metal)
         replayBuffer = try ReplayBuffer(metal: metal)
         replayPlayer = ReplayPlayer(metal: metal, buffer: replayBuffer)
+        liveFeeds = LiveFeeds(metal: metal)
 
         clipStage = try ClipStage(metal: metal)
         replayStage = try ReplayStage(metal: metal)
@@ -352,6 +374,7 @@ public final class VideoPipeline {
         sharpnessPipeline = try metal.computePipeline(function: "prism_sharpness")
         crossfadePipeline = try metal.computePipeline(function: "prism_crossfade")
         replayStage.player = replayPlayer
+        overlayStage.liveFeeds = liveFeeds
 
         // Every consumer of a Vision modality, declared once. The demands are
         // asked rather than pushed because a stage's enabled flag is written
@@ -412,7 +435,8 @@ public final class VideoPipeline {
     private func replan() {
         stateLock.lock()
         let demand = ResourceDemand(format: outputFormat,
-                                    stillsWantSharpest: stillsWantSharpest)
+                                    stillsWantSharpest: stillsWantSharpest,
+                                    screenSourceActive: screenSourceActive)
         let plan = ResourceGovernor.plan(for: demand)
         let changed = plan != resourcePlan
         resourcePlan = plan
@@ -573,6 +597,21 @@ public final class VideoPipeline {
         stillsWantSharpest = settings.capture.prefersSharp
         stateLock.unlock()
         stillRing.setArmed(settings.capture.prefersSharp)
+        replan()
+    }
+
+    /// §5.24 — a screen capture session is running (as the source, or behind
+    /// a picture-in-picture layer). Separate from `apply` because it is not a
+    /// look: it is a capture session whose frame queue is a real allocation,
+    /// and §5.23 has to see it before it hands the rest of the ceiling out.
+    public func setScreenSourceActive(_ active: Bool) {
+        stateLock.lock()
+        guard active != screenSourceActive else {
+            stateLock.unlock()
+            return
+        }
+        screenSourceActive = active
+        stateLock.unlock()
         replan()
     }
 
@@ -740,6 +779,7 @@ public final class VideoPipeline {
         var useA = true
         var segmentationDone = false
         var faceTrackingDone = false
+        var liveFeedsDecided = false
         // One decision for the whole frame, taken before any stage runs: what
         // Vision is wanted, and which single modality gets this frame.
         let visionDecision = vision.beginFrame()
@@ -782,6 +822,15 @@ public final class VideoPipeline {
                     segmenter.isDemanded = false
                     segmenter.invalidate()
                 }
+            }
+            // §5.25: a substituting stage has replaced the picture, so every
+            // live layer riding on top of it holds too. Both directions are
+            // the same failure — a face still talking over a frozen screen,
+            // a screen still scrolling behind a frozen face — and this is
+            // the one place that can see either of them happen.
+            if !liveFeedsDecided, Self.liveFeedConsumers.contains(stage.id) {
+                liveFeedsDecided = true
+                liveFeeds.setHeld(encoded.contains { Self.substitutingStages.contains($0) })
             }
             guard stage.wantsEncode() else { continue }
             guard let dst = useA ? intermediateA : intermediateB else {

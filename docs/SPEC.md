@@ -484,6 +484,8 @@ The layer cap is a memory constraint, not a GPU one: each layer is one compute p
 
 Layers composite bottom-up in array order. Dropping an image or video onto the Scene pane adds it as a layer, the same affordance as dropping a `.cube` to import a LUT.
 
+A `.live` layer is the second running capture rather than a file — §5.25 is what it is for, and why it holds when the picture does.
+
 **Face-anchored layers.** A layer pinned to `.face` rides the head instead of the frame: a hat above it, glasses on the eye line, a moustache under the nose, or a mask over the whole of it. It is driven by the shared `FaceTracker` (§3.3), which the overlay stage demands **only when a layer is actually face-anchored** — a frame-anchored lower third costs no Vision, however many of them there are, and removing the last face-anchored layer drops the demand again.
 
 | Property | Specification |
@@ -857,10 +859,11 @@ Every elastic allocation in PRISM was sized against §7's 250 MB ceiling indepen
 | `freezeDepth` | `FrameRing` slots |
 | `freezeStride` | record one camera frame in this many |
 | `stillDepth` | `StillRing` slots; 0 means stills fall back to the last frame |
+| `screenDepth` | frames ScreenCaptureKit holds while a screen is captured (§5.24); 0 otherwise |
 | `tier` | `full` / `reduced` / `minimum` / `exceeded` |
 | `plannedMB` | the sum, against `ceilingMB` |
 
-**The order of service is fixed**, which is what makes the degradation predictable: freeze's floor, then the still ring if the user armed it, then whatever is left widening the freeze window back toward half a second. Nothing is decided by which feature asked first.
+**The order of service is fixed**, which is what makes the degradation predictable: freeze's floor, then the still ring if the user armed it, then whatever is left widening the freeze window back toward half a second. Nothing is decided by which feature asked first. ScreenCaptureKit's queue is not in that order at all — it joins the structural frames, because PRISM cannot make it smaller than three and planning the freeze window against memory that is already spent is not planning.
 
 **Freeze's floor is the guarantee, and it is never spent.** §5.2 promises the sharpest frame of the recent past. A ring too shallow to hold a choice turns that into "the frame at the moment you pressed it", which §5.2 says freeze is not. So: **never fewer than six slots, and never less than 200 ms of wall time.** Six, because two slots are unavailable at any instant — the one being written and the one whose command buffer has not landed. 200 ms, because a blink closes the eyes for 100–150 ms and a window shorter than one has nothing sharper to offer. Where those two pull against each other — 200 ms of 60 fps is twelve slots — the ring **strides**: six slots recording every second frame still span 200 ms and still hold a choice, for half the memory. A coarser choice inside the window is a far cheaper loss than a window narrower than a blink.
 
@@ -871,6 +874,55 @@ Every elastic allocation in PRISM was sized against §7's 250 MB ceiling indepen
 **The policy is legible or it is a mystery.** The Diagnostics pane shows the planned figure against the ceiling, how far back freeze reaches in seconds and frames, and the sentence explaining why. A change to the plan is a §5.21 session event, for the same reason an auto-disabled effect is: the freeze window shortening is invisible until somebody freezes and finds the picture came from less history than they expected.
 
 **Vision consolidation.** `VisionCoordinator` decides which Vision request runs on each frame. At most one request per modality per frame and at most one modality per frame; each modality declares its own duty cycle; each consumer declares its own standing demand, evaluated per frame rather than cached. The pick is the modality furthest past its own cadence, ties to the earlier-declared one — which reproduces the previous hard-coded even/odd alternation exactly when only the person mask and the face are demanded, and shares the slip proportionally when a third modality is. Modalities are `face`, `person`, `hands`; `hands` has a case but no registration until the gesture recogniser arrives, and an unregistered modality never runs however loudly it is demanded.
+
+### 5.24 Screen or window as the source
+
+A display or a single window in place of the camera, so the thing you are talking about can be the thing on air.
+
+| Property | Specification |
+|---|---|
+| Framework | `ScreenCaptureKit` — `SCStream`, 32BGRA, `IOSurface`-backed |
+| Sources | any display, or any on-screen titled window (`SCShareableContent`) |
+| Trigger | the Source picker in both surfaces, plus global hotkey ⌥⌘D |
+| Grant | Screen Recording TCC, requested only when a screen is first chosen |
+| Scaling | fitted into the negotiated format with its own aspect preserved |
+| Frame rate | the negotiated format's, via `minimumFrameInterval` |
+| Queue depth | 3 — ScreenCaptureKit's floor, and charged to §5.23 |
+| Default | off; the camera is the source |
+
+**The frames enter through the camera's door.** `ScreenCapture.onFrame` calls the same `VideoPipeline.submitCameraFrame` the camera does, and nothing downstream is told the difference. That is the whole design: one command buffer per frame, the `FrameRing`, freeze, the rolling replay buffer, the still ring, the crossfade and the latency attribution all keep working on a screen because none of them ever asked where the pixels came from. Every effect applies to a screen. So does every moment — you can freeze a slide, replay the last ten seconds of a demo, and save the clip.
+
+**A still screen is still a screen.** ScreenCaptureKit reports frames as `.idle` when the display has not changed, which is correct for a recorder and wrong for a live source: a virtual camera receiving nothing falls back to the extension's placeholder (§3.2), and a static slide would blank the call. `ScreenCapture` therefore re-submits its last frame at the configured rate whenever none has arrived for more than one and a half intervals. That is what a camera pointed at a motionless scene does, and it keeps every downstream clock running on real frames.
+
+**Never a black frame.** A closed window, an unplugged display, a stream that will not build, a missing grant: each stops the session, names itself in a sentence, and falls back to the camera — the one source that exists without a grant. §3.2's placeholder rule is the precedent, and the honest degradation is always toward something, never toward a dark rectangle nobody can explain. A failed session is not retried on a loop; a new pick, a wake, a fresh look at what is shareable, or the grant arriving are what let it try again.
+
+**The pick is stored as an id and re-resolved at launch.** A display id survives a reboot; a window id does not. `VideoSourceSelection` therefore persists the kind and the id and nothing else, and the app asks the window server whether the id still means anything before starting any capture against it. One that does not resolve reverts to the camera and says so in the session log — quietly, because this happens on every launch after a reboot for anyone who shared a window, and a warning that fires on a schedule is one people stop reading.
+
+**The capture is fitted, not filled.** A 6K display at native size is three `IOSurface` slots of roughly 100 MB each, to produce pixels `OutputFitStage` is about to throw away. The stream is configured at the largest size that fits inside the negotiated format with the source's own aspect preserved, so ScreenCaptureKit is never asked to pad — the letterboxing is decided once, by the same stage that decides it for every other source. PRISM's own windows are excluded from a display capture, because a preview of the capture cannot be in the capture.
+
+**The grant is demanded by the feature, not by the app.** Screen Recording is not requested at first launch: the feature ships off, and a permission dialog for something nobody has asked for is how an app loses that grant for good. Choosing a screen raises the prompt; until then the picker offers the camera and a sentence. The setup banner grows a fourth row exactly while something is asking for a screen (§9), and macOS applies the grant when PRISM is next opened — which the copy says, rather than leaving the user to wonder why the screen is still not on air.
+
+### 5.25 Picture-in-picture
+
+You over your screen, or your screen over you.
+
+| Property | Specification |
+|---|---|
+| Mechanism | a `.live` overlay layer (§5.8), through `prism_overlay` |
+| Feeds | `LiveLayerFeed.camera`, `LiveLayerFeed.screen` |
+| Default placement | bottom right, 0.28 of the frame, no key |
+| Cost | one compute pass; no decoder, so no `maxVideoLayers` slot |
+| Default | off |
+
+**It is not a stage.** `prism_overlay` already does aspect-preserving placement, scale, offset, rotation, mirror, opacity, chroma and luma keying, and behind-the-subject gating against the shared person mask. A dedicated picture-in-picture kernel would be that kernel again, byte for byte, and a second one to keep in step with it forever. So a picture-in-picture is a layer: it inherits every control §5.8 already has, including standing *behind* you, which is how a screen becomes a background you are presenting in front of.
+
+**Whichever feed is not the picture is the layer.** Only one capture drives the pipeline; the other publishes into `LiveFeeds`, and the overlay stage reads it on the frame queue. Nothing is published for the feed that *is* the source, so a layer pointed at it draws nothing — a picture-in-picture of the picture is a picture of itself, and the surfaces say so rather than showing a recursive rectangle. Adding one is therefore a single action rather than a choice (§8.7): the button offers the other feed, and names it.
+
+**The hold is the correctness point.** A live layer sits at `.overlay`, far downstream of clip, replay and freeze. Left alone it would keep moving under a picture the user believes is held — freeze the screen and your face carries on talking in the corner; freeze the camera and the screen keeps scrolling behind it. That is the most damaging failure this app can produce, and it is the same failure in both directions, so it gets one answer: **while any substituting stage is engaged, the feeds are held.** The layer's texture is snapshotted and every frame published behind it is dropped until the substitution ends. This covers freeze, replay, the away loop, the lag switch and panic without any of them knowing the feature exists, because all five reach the picture through `.clip`, `.replay` or `.freeze`.
+
+The snapshot is a copy rather than a retained reference. Capture pools are shallow — three slots for ScreenCaptureKit — and a freeze can last minutes; holding one of their buffers that long starves the session that owns it. The copy costs one private texture per held feed, paid only while held, which is the trade `FreezeStage` already makes for the same reason. A feed with nothing on screen when the hold engages stays empty: handing it the next frame that arrives would be the same failure one beat later.
+
+The decision is taken at the layers' own position in the chain walk, once every substituting stage has had its say. `ChainRegistrationTests` asserts that the substituting set is complete and that every member of it runs before `.overlay` — a stage added later that replaces the picture and forgets to join the set would be exactly the bug this paragraph exists to prevent, and it would not show up until it happened on someone's call.
 
 ---
 
@@ -1218,7 +1270,13 @@ Three grants, in this order:
 2. **System Extension approval** for the camera extension, via `OSSystemExtensionManager.shared.submitRequest`. Sends the user to System Settings → Privacy & Security.
 3. **Admin authentication** for the `.pkg` installing the audio HAL plug-in.
 
-`OnboardingView` drives these as an explicit state machine. A half-approved install produces confusing symptoms — camera works, microphone missing — so the popover shows a persistent setup banner until all three are satisfied. Each step has its own row with a state indicator and an action button.
+…and a fourth that is conditional:
+
+4. **Screen Recording TCC**, for §5.24. Never requested at launch — the feature ships off, and a permission dialog for something nobody has asked for is how an app loses that grant for good. `CGRequestScreenCaptureAccess()` is called the first time a screen or window is chosen, and `CGPreflightScreenCaptureAccess()` reports the state after that. Unlike the other three PRISM cannot grant this by prompting: macOS only offers to open the pane, and the grant takes effect at the next launch. The copy says so.
+
+`OnboardingView` drives these as an explicit state machine. A half-approved install produces confusing symptoms — camera works, microphone missing — so the popover shows a persistent setup banner until all of them are satisfied. Each step has its own row with a state indicator and an action button.
+
+The screen row is the one exception to "until all of them are satisfied": it appears while something is actually asking for a screen — a screen source chosen, or a picture-in-picture layer looking at one — and goes away with it (`SetupStatus.screenRecordingNeeded`). A banner that never clears because of a feature the user has not switched on is a banner people learn to ignore, which would cost the other three rows their meaning.
 
 Document these operational hazards in the README and surface them in-app where relevant:
 
