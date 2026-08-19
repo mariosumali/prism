@@ -32,7 +32,8 @@ public struct AudioDeviceInfo: Identifiable, Equatable, Hashable {
 /// The signing ID is the identity — it is what per-app rules match on, and
 /// what survives an app being renamed — while the display name is only what
 /// a human is shown. Carrying both means neither surface has to re-derive
-/// the other, and a friendly name can never be mistaken for an identity.
+/// the other, and a friendly name can never be mistaken for an identity: two
+/// apps can both render as "Studio".
 public struct CameraClient: Identifiable, Equatable, Hashable {
     public var signingID: String
     public var displayName: String
@@ -42,6 +43,12 @@ public struct CameraClient: Identifiable, Equatable, Hashable {
     public init(signingID: String, displayName: String) {
         self.signingID = signingID
         self.displayName = displayName
+    }
+
+    /// The usual construction: the name is derived, not supplied.
+    public init(signingID: String) {
+        self.signingID = signingID
+        self.displayName = CMIOSink.displayName(forSigningID: signingID)
     }
 }
 
@@ -105,12 +112,14 @@ public struct WarningMessage: Equatable, Identifiable {
     public enum Action: Equatable {
         case raiseBudget          // §3.4 pinned chain over budget
         case armBuffer            // §5.9 replay/away asked for without a buffer
+        /// §5.18 — a per-app block is refusing a client right now. The
+        /// action lifts every block rather than opening the rules pane: this
+        /// is the one state in PRISM that can leave an app without a camera,
+        /// so the way out belongs in the row that reports it.
+        case clearBlocks
         case openSettings
         /// Stills have nowhere writable to go.
         case chooseCaptureFolder
-        /// A client was turned away by a per-app rule, and the rule is the
-        /// only place that can be undone.
-        case openAppRules
         /// Screen capture needs its own grant, and the picker is useless
         /// until it is given.
         case openScreenRecordingSettings
@@ -164,20 +173,6 @@ public struct NoticeMessage: Equatable, Identifiable {
         self.symbolName = symbolName
         self.fileURL = fileURL
         self.action = action
-        self.date = date
-    }
-}
-
-/// A client a per-app rule turned away. Recorded because a block nobody is
-/// told about is indistinguishable from a camera that does not work, and the
-/// support thread that follows is about the wrong thing.
-public struct BlockedAttempt: Equatable, Identifiable {
-    public var id = UUID()
-    public var client: CameraClient
-    public var date: Date
-
-    public init(client: CameraClient, date: Date = Date()) {
-        self.client = client
         self.date = date
     }
 }

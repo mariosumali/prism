@@ -59,6 +59,7 @@ struct PresetsPane: View {
 
     private func row(for preset: Preset) -> some View {
         let isActive = state.activePresetID == preset.id
+        let ruleApp = ruleAppName(for: preset)
         return HStack(spacing: Metrics.itemGap) {
             Circle()
                 .fill(isActive ? Color.accentColor : .clear)
@@ -66,7 +67,14 @@ struct PresetsPane: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(preset.name)
                     .font(.body)
-                if preset.isBuiltIn {
+                // §5.18: the same "why is this one on air" answer the
+                // popover's chips give, in the roomier form this pane has
+                // space for.
+                if let ruleApp {
+                    Text("Applied by a rule for \(ruleApp)")
+                        .font(.caption2)
+                        .foregroundStyle(Color.accentColor)
+                } else if preset.isBuiltIn {
                     Text("Built-in")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -84,7 +92,8 @@ struct PresetsPane: View {
         .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(preset.name)
-        .accessibilityValue(isActive ? "active" : "inactive")
+        .accessibilityValue(ruleApp.map { "active, applied by a rule for \($0)" }
+                            ?? (isActive ? "active" : "inactive"))
         .contextMenu {
             Button("Apply") { state.selectPreset(preset.id) }
             Button("Rename…") {
@@ -102,6 +111,11 @@ struct PresetsPane: View {
             Divider()
             Button("Export as JSON…") { exportPreset(preset) }
         }
+    }
+
+    private func ruleAppName(for preset: Preset) -> String? {
+        guard let rule = state.activeAppRule, rule.presetID == preset.id else { return nil }
+        return state.appRuleName(rule.signingID)
     }
 
     private func hotkeyMenu(for preset: Preset) -> some View {

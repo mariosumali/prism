@@ -67,6 +67,10 @@ public final class AppState: ObservableObject {
     /// The same clients as names, in the same order. A projection rather
     /// than a second stored array, so the two can never disagree.
     public var clientsInUse: [String] { clients.map(\.displayName) }
+    /// §5.18 — apps the extension is refusing right now. Non-empty only
+    /// while a block is actually biting, which is exactly when the user needs
+    /// to be told why an app's video is dark.
+    @Published public var blockedClients: [CameraClient] = []
     @Published public var warning: WarningMessage?
     /// The second row under the status line, and deliberately not the
     /// warning slot: there is only one warning, and evicting a
@@ -131,6 +135,12 @@ public final class AppState: ObservableObject {
                 micWatch.apply(studio.micWatch)
                 refreshMutedTalkingNotice()
             }
+            // §5.18: the extension keeps enforcing whatever it last
+            // persisted, so every edit to the rule list has to reach it.
+            if studio.apps != oldValue.apps {
+                publishAccessPolicy()
+                reconcileAppRules()
+            }
             // §5.12: dragging the delay while engaged retargets it live —
             // whichever knob owns the current delay. During a catch-up the
             // rate is the control, so the slider waits its turn.
@@ -187,6 +197,20 @@ public final class AppState: ObservableObject {
     // Presets
     @Published public var presets: [Preset] = []
     @Published public var activePresetID: UUID?
+    /// §5.18 per-app rules. Behaviour rather than look, so they live in
+    /// `StudioSettings` alongside replay and panic: a preset that carried
+    /// rules could apply itself. Projected rather than stored a second time,
+    /// so `studio` stays the single persisted home and the two can never
+    /// disagree; writing through here fires the `studio` didSet, which is
+    /// where the republish and re-resolve happen.
+    public var appRules: AppRulesSettings {
+        get { studio.apps }
+        set { studio.apps = newValue }
+    }
+    /// Non-nil while a rule — not the user — is responsible for the active
+    /// preset. Every preset surface reads this so "why did my look change"
+    /// is answerable without opening a pane.
+    @Published public private(set) var activeAppRule: AppRuleMatch?
     // Sections
     @Published public var expandedSections: Set<PopoverSection> = [] {
         didSet { persistExpandedSections() }
@@ -279,6 +303,8 @@ public final class AppState: ObservableObject {
     private var lastCameraFrameAt = Date.distantPast
     private let lastFrameLock = NSLock()
     private var formatsPublishedToExtension = false
+    /// Dirty flag for the §5.18 'polc' write, same shape as the one above.
+    private var appRulePolicyPublished = false
     /// One-shot: the automatic extension activation request for this launch.
     private var autoRequestedExtension = false
     /// Last client-negotiated format observed via 'afmt'; only *changes* are
@@ -300,6 +326,15 @@ public final class AppState: ObservableObject {
     /// releasing it releases only the delay it engaged — never one the user
     /// asked for separately with the lag switch.
     private var connectionEngagedLag = false
+
+    /// The look to put back when the rule-driven client stops streaming.
+    /// Taken once, on the transition from "no rule in effect" to "a rule is
+    /// in effect", so a Zoom → Teams handover in one sitting still returns
+    /// to what the user had before any of it started.
+    private var appRuleRestore: PipelineConfiguration?
+    /// The preset that was active before a rule took over, so the chips go
+    /// back to reading the way the user left them.
+    private var appRuleRestorePresetID: UUID?
 
     private enum DefaultsKey {
         static let configuration = "PRISM.configuration"
@@ -570,6 +605,12 @@ public final class AppState: ObservableObject {
             self.clients = list
             self.updateMenuBarState()
             self.reconcileCaptures()       // a first client starts capture
+            self.reconcileAppRules()       // §5.18: who is watching decides the look
+        }
+        cmioSink.onBlockedClientsChanged = { [weak self] blocked in
+            guard let self else { return }
+            self.blockedClients = blocked
+            self.updateBlockedWarning()
         }
     }
 
@@ -703,6 +744,14 @@ public final class AppState: ObservableObject {
                 formatManager.publish(formatManager.publishedFormats, via: cmioSink)
         }
 
+        // §5.18: same dirty-flag treatment for 'polc', and it matters more —
+        // the extension keeps enforcing the last policy it persisted, so a
+        // write that never lands leaves the user's *previous* blocks in force
+        // while the UI shows the new list. Retried every tick until it sticks.
+        if !appRulePolicyPublished, cmioSink.isConnected {
+            publishAccessPolicy()
+        }
+
         // §3.2 "ordinary client negotiation": when a client negotiates a
         // different published format on the source stream, retarget the
         // pipeline (and physical capture pick) to it. Only *changes* are
@@ -728,6 +777,7 @@ public final class AppState: ObservableObject {
             clients = []
             updateMenuBarState()
             reconcileCaptures()
+            reconcileAppRules()
         }
 
         // §5.17: suppression is acknowledged on the RT thread, so the mic can
@@ -2134,6 +2184,11 @@ public final class AppState: ObservableObject {
         if draftConfig != nil {
             updateDraft(mutate)
         } else {
+            // Editing the look by hand takes the wheel back from a §5.18
+            // rule, exactly as picking a preset does. Without this, reverting
+            // when the app disconnects would throw away everything the user
+            // adjusted during the call.
+            clearAppRuleOverride()
             updateConfig(mutate)
         }
     }
@@ -2167,6 +2222,7 @@ public final class AppState: ObservableObject {
         draft.cameraID = previous.cameraID
         draft.microphoneID = previous.microphoneID
         pipeline?.beginCrossfade(durationMs: 200)   // preset-style switch (§5.5)
+        clearAppRuleOverride()                      // same reason as updateEditing
         updateConfig { $0 = draft }
         // pipeline.apply just reset every stage's isEnabled from the applied
         // flags, superseding any degradation decision — clear ALL latches to
@@ -2252,8 +2308,7 @@ public final class AppState: ObservableObject {
                 self.formatManager.publish(sorted, via: self.cmioSink)
             self.publishedFormats = sorted
             self.formatManager.persist()
-            if !self.clientsInUse.isEmpty {
-                let first = self.clientsInUse.first ?? "your video app"
+            if let first = self.clientsInUse.first {
                 self.postNotification(
                     body: "Reselect PRISM Camera in \(first) to use the new format")
             }
@@ -2324,7 +2379,20 @@ public final class AppState: ObservableObject {
 
     public func selectPreset(_ id: UUID) {
         guard let preset = presetStore.presets.first(where: { $0.id == id }) else { return }
-        activePresetID = id
+        // Choosing a preset by hand takes the wheel back from a §5.18 rule:
+        // the rule stops being in effect and there is nothing left to revert
+        // to, because the user has just told us what they want.
+        clearAppRuleOverride()
+        applyPreset(preset, mayRepublishFormats: true)
+    }
+
+    /// The shared body of "put this preset on air". `mayRepublishFormats` is
+    /// false for rule-driven applications: `requestPublishedFormatsChange`
+    /// can raise a modal alert, and a modal nobody asked for — thrown up
+    /// because an app started streaming — is not something a user can be
+    /// expected to answer.
+    private func applyPreset(_ preset: Preset, mayRepublishFormats: Bool) {
+        activePresetID = preset.id
         // A preset is an explicit "switch the whole look" — a stale draft
         // must not sit above it waiting to clobber it on apply.
         discardDraft()
@@ -2353,7 +2421,7 @@ public final class AppState: ObservableObject {
 
         if formatAvailable, wantedFormat != formatManager.activeFormat {
             setActiveFormat(wantedFormat)   // in-set switch, no reconnect
-        } else if !formatAvailable {
+        } else if !formatAvailable, mayRepublishFormats {
             requestPublishedFormatsChange(publishedFormats + [wantedFormat])
             // §5.5: on confirm (runModal is synchronous) the preset's format
             // is now in the published set — make it active. On cancel the
@@ -2368,12 +2436,186 @@ public final class AppState: ObservableObject {
         // Mid-draft, "current" is the look the user is previewing — saving
         // the live config would silently omit every staged edit. Mid-panic,
         // "current" is a "back in a bit" card, which nobody means to save as
-        // a preset, so the pre-panic snapshot wins over the live config.
-        var cfg = draftConfig ?? panicRestore ?? config
+        // a preset, so the pre-panic snapshot wins over the live config. A
+        // §5.18 rule-driven look is somebody else's preset already, and
+        // saving a copy of it under a new name is nobody's intent either.
+        var cfg = draftConfig ?? appRuleRestore ?? panicRestore ?? config
         cfg.format = formatManager.activeFormat
         let preset = Preset(name: name, configuration: cfg)
         presetStore.add(preset)
         activePresetID = preset.id
+    }
+
+    // MARK: - Intents: per-app rules (§5.18)
+
+    /// Recomputes what the rule list wants, given who is streaming, and moves
+    /// the look to match. Idempotent: called on every client change and on
+    /// every edit to the list, and does nothing when the answer is unchanged.
+    private func reconcileAppRules() {
+        let match = AppRuleResolver.presetMatch(
+            clients: clients.map(\.signingID), in: appRules)
+        guard match != activeAppRule else { return }
+
+        guard let match else {
+            activeAppRule = nil
+            restoreFromAppRule()
+            return
+        }
+        guard let preset = presetStore.presets.first(where: { $0.id == match.presetID }) else {
+            // The preset was deleted out from under the rule. Leaving the
+            // look alone beats guessing at a replacement; the rule editor
+            // shows the row as dangling, so this is visible rather than
+            // mysterious.
+            return
+        }
+        // Taken once, on the way in. A Zoom → Teams handover inside one
+        // sitting still returns to what the user had before any of it began.
+        if activeAppRule == nil {
+            appRuleRestore = panicRestore ?? config
+            appRuleRestorePresetID = activePresetID
+        }
+        activeAppRule = match
+        applyPreset(preset, mayRepublishFormats: false)
+        if appRules.announcesPresetChanges {
+            // §8.4: name the app and the preset, once, and then be quiet.
+            postNotification(
+                body: "\(appRuleName(match.signingID)) connected — \(preset.name) preset applied")
+        }
+    }
+
+    /// What to call the app in copy: the label on its own rule when the user
+    /// gave it one, otherwise the name PRISM knows the signing ID by.
+    public func appRuleName(_ signingID: String) -> String {
+        appRules.rules.first { $0.matches(signingID) }?.displayName
+            ?? CMIOSink.displayName(forSigningID: signingID)
+    }
+
+    private func restoreFromAppRule() {
+        guard let restore = appRuleRestore else { return }
+        let presetID = appRuleRestorePresetID
+        appRuleRestore = nil
+        appRuleRestorePresetID = nil
+
+        pipeline?.beginCrossfade(durationMs: 200)
+        let previousCamera = config.cameraID
+        let previousMic = config.microphoneID
+        updateConfig { $0 = restore }
+        if restore.cameraID != previousCamera { selectCamera(restore.cameraID) }
+        if restore.microphoneID != previousMic { selectMicrophone(restore.microphoneID) }
+        activePresetID = presetID
+    }
+
+    /// Forgets that a rule was ever in effect, without touching the look.
+    private func clearAppRuleOverride() {
+        activeAppRule = nil
+        appRuleRestore = nil
+        appRuleRestorePresetID = nil
+    }
+
+    /// Ships the flattened policy over 'polc'. Called on every edit and
+    /// retried from pollTick until the extension acknowledges it.
+    private func publishAccessPolicy() {
+        let policy = AppRuleResolver.policy(for: appRules)
+        cmioSink.isPolicyEnforcing = !policy.isAllowAll
+        guard let json = policy.jsonData else {
+            appRulePolicyPublished = false
+            return
+        }
+        appRulePolicyPublished = cmioSink.writeAccessPolicy(json)
+        if policy.isAllowAll, !blockedClients.isEmpty {
+            blockedClients = []
+            updateBlockedWarning()
+        }
+    }
+
+    /// The refusal is invisible from inside the app being refused — it just
+    /// sees a camera that will not start. PRISM is the only place that knows
+    /// why, so it says so, and offers the way out in the same row.
+    private func updateBlockedWarning() {
+        if let first = blockedClients.first {
+            warning = WarningMessage(
+                text: "PRISM is blocking \(first.displayName) from using PRISM Camera",
+                action: .clearBlocks)
+        } else if warning?.action == .clearBlocks {
+            warning = nil
+        }
+    }
+
+    public func setAppRulesEnabled(_ on: Bool) {
+        appRules.isEnabled = on
+    }
+
+    public func setAppRulesDefaultAccess(_ access: AppAccess) {
+        appRules.defaultAccess = access
+    }
+
+    public func setAppRulesAnnounce(_ on: Bool) {
+        appRules.announcesPresetChanges = on
+    }
+
+    public func addAppRule(signingID: String,
+                           access: AppAccess = .allow,
+                           presetID: UUID? = nil) {
+        let trimmed = signingID.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        // One app, one rule: a second row for the same signing ID could never
+        // win (first match decides) and would read as a setting that does
+        // nothing. Editing the existing row is what the user meant.
+        if let index = appRules.rules.firstIndex(where: { $0.matches(trimmed) }) {
+            var rule = appRules.rules[index]
+            rule.access = access
+            rule.presetID = presetID
+            appRules.rules[index] = rule
+            return
+        }
+        // Seeded, not derived on every draw: the label is the user's to edit,
+        // and a name PRISM guessed once is a better starting point than the
+        // signing ID for the apps PRISM happens to know.
+        appRules.rules.append(
+            AppRule(signingID: trimmed,
+                    name: CMIOSink.displayName(forSigningID: trimmed),
+                    presetID: presetID,
+                    access: access))
+    }
+
+    public func updateAppRule(_ id: UUID, _ mutate: (inout AppRule) -> Void) {
+        guard let index = appRules.rules.firstIndex(where: { $0.id == id }) else { return }
+        var rule = appRules.rules[index]
+        mutate(&rule)
+        appRules.rules[index] = rule
+    }
+
+    public func removeAppRule(_ id: UUID) {
+        appRules.rules.removeAll { $0.id == id }
+    }
+
+    /// SwiftUI `onMove` semantics, same as PresetStore.move. Order is the
+    /// conflict rule, so this is how the user says which app matters more.
+    public func moveAppRules(fromOffsets: IndexSet, toOffset: Int) {
+        appRules.rules.move(fromOffsets: fromOffsets, toOffset: toOffset)
+    }
+
+    /// The escape hatch. Every block is lifted and the default goes back to
+    /// allow, while preset assignments survive — the failure this recovers
+    /// from is "my camera is dead", not "I regret my presets".
+    ///
+    /// Reachable from the warning row the block itself raises, so a user who
+    /// locked themselves out never has to find a pane to get out.
+    public func clearAllBlocks() {
+        var next = appRules
+        next.defaultAccess = .allow
+        for index in next.rules.indices {
+            next.rules[index].access = .allow
+        }
+        appRules = next
+        blockedClients = []
+        updateBlockedWarning()
+    }
+
+    /// True while blocking this app would take a camera away from a call
+    /// that is happening right now. The editor asks before doing that.
+    public func isStreamingNow(_ signingID: String) -> Bool {
+        clients.contains { $0.signingID.caseInsensitiveCompare(signingID) == .orderedSame }
     }
 
     // MARK: - Intents: misc
@@ -2559,8 +2801,12 @@ public final class AppState: ObservableObject {
     /// on air — but it must not survive a quit. Persisting the pre-panic
     /// snapshot means relaunching after panicking leaves you where you were,
     /// not stuck behind a "back in a bit" card with no memory of why.
+    /// A §5.18 rule-driven look is no more the user's saved configuration
+    /// than a panic backdrop is: both are temporary substitutions the user
+    /// did not choose for keeps. The pre-rule snapshot is the outer one — it
+    /// is taken from `panicRestore ?? config` — so it wins when both exist.
     private func persistConfig() {
-        if let data = try? JSONEncoder().encode(panicRestore ?? config) {
+        if let data = try? JSONEncoder().encode(appRuleRestore ?? panicRestore ?? config) {
             UserDefaults.standard.set(data, forKey: DefaultsKey.configuration)
         }
     }

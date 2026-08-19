@@ -4,8 +4,8 @@
 // CoreMediaIO C-API client. Finds the PRISM Camera extension device, copies
 // the sink stream's buffer queue, and pushes processed frames into it
 // (SPEC §3.2). Also speaks the custom-property control channel ('pfmt',
-// 'clnt', 'hoff') defined in CONTRACTS.md, and polls it at 1 Hz while
-// connected.
+// 'clnt', 'hoff', 'afmt', 'polc', 'blkd') defined in CONTRACTS.md, and polls
+// it at 1 Hz while connected.
 //
 // Licensed under the Apache License, Version 2.0.
 
@@ -28,12 +28,34 @@ public final class CMIOSink {
     public private(set) var isConnected: Bool = false
 
     /// Streaming clients decoded from 'clnt', each carrying both the signing
-    /// ID the extension reported and the name a human is shown. Fired on the
-    /// main thread whenever the set changes.
+    /// ID the extension reported (what §5.18 rules match on) and the name a
+    /// human is shown (what §8.4 copy shows). Fired on the main thread
+    /// whenever the set changes.
     public var onClientsChanged: (([CameraClient]) -> Void)?
+
+    /// Clients the extension refused under the §5.18 policy in the last
+    /// 30 s, decoded from 'blkd'. Fired on the main thread on change.
+    public var onBlockedClientsChanged: (([CameraClient]) -> Void)?
 
     /// Frames dropped because the sink queue was full (§3.2: drop + count).
     public private(set) var droppedFrames: Int = 0
+
+    /// True while the published §5.18 policy could refuse someone. Gates the
+    /// 1 Hz 'blkd' read: an extension holding no policy always answers "[]",
+    /// and paying a round trip per second for that answer is waste on the
+    /// overwhelmingly common path where the feature is off.
+    public var isPolicyEnforcing: Bool {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return policyEnforcing
+        }
+        set {
+            stateLock.lock()
+            policyEnforcing = newValue
+            stateLock.unlock()
+        }
+    }
 
     public init() {}
 
@@ -221,6 +243,37 @@ public final class CMIOSink {
         return try? JSONDecoder().decode([String].self, from: data)
     }
 
+    /// app → extension: publish the §5.18 access policy as UTF-8 JSON.
+    ///
+    /// Returns false when the device is absent or the write is refused — the
+    /// caller must treat that as "the extension is still enforcing whatever
+    /// it had", because it is.
+    public func writeAccessPolicy(_ json: Data) -> Bool {
+        let device = currentDeviceID()
+        guard device != 0, !json.isEmpty else { return false }
+        var address = Self.globalAddress(Self.selectorPOLC)
+        let status = json.withUnsafeBytes { raw -> OSStatus in
+            CMIOObjectSetPropertyData(
+                device, &address, 0, nil,
+                UInt32(json.count), raw.baseAddress!)
+        }
+        if status != 0 {
+            Self.log.error("'polc' write failed: OSStatus \(status) (device \(device))")
+        }
+        return status == 0
+    }
+
+    /// extension → app: signing IDs refused by policy recently. Empty rather
+    /// than nil when the extension answers with an empty list.
+    public func readBlockedClients() -> [String]? {
+        let device = currentDeviceID()
+        guard device != 0 else { return nil }
+        guard let data = readRawProperty(Self.selectorBLKD, on: device, label: "blkd") else {
+            return nil
+        }
+        return try? JSONDecoder().decode([String].self, from: data)
+    }
+
     /// Maps signing IDs to friendly names ("us.zoom.xos" → "Zoom").
     public static func displayName(forSigningID signingID: String) -> String {
         switch signingID {
@@ -258,6 +311,8 @@ public final class CMIOSink {
     private static let selectorCLNT = fourCC("clnt")
     private static let selectorHOFF = fourCC("hoff")
     private static let selectorAFMT = fourCC("afmt")
+    private static let selectorPOLC = fourCC("polc")
+    private static let selectorBLKD = fourCC("blkd")
 
     /// Serialises connect/retry/poll bookkeeping. Timer state, retry flags,
     /// and the last-seen client list are confined to this queue.
@@ -276,12 +331,14 @@ public final class CMIOSink {
     private var formatWidth = 0
     private var formatHeight = 0
     private var lastHandoffMs: Double?
+    private var policyEnforcing = false
 
     // Confined to controlQueue:
     private var connectRequested = false
     private var retryTimer: DispatchSourceTimer?
     private var pollTimer: DispatchSourceTimer?
     private var lastClientIDs: [String]?
+    private var lastBlockedIDs: [String]?
     private var pollFailureCount = 0
 
     private func currentDeviceID() -> CMIOObjectID {
@@ -345,6 +402,7 @@ public final class CMIOSink {
 
         pollFailureCount = 0
         lastClientIDs = nil
+        lastBlockedIDs = nil
         stopRetryTimer()
         startPollTimer()
     }
@@ -356,15 +414,23 @@ public final class CMIOSink {
         // reality — a stale non-empty list would hold captureDemand true and
         // keep the camera running for nobody.
         let hadClients = !(lastClientIDs ?? []).isEmpty
+        // Same argument for refusals: without a device to ask, "Zoom is being
+        // blocked right now" is a claim PRISM can no longer stand behind.
+        let hadBlocked = !(lastBlockedIDs ?? []).isEmpty
 
         connectRequested = false
         stopRetryTimer()
         stopPollTimer()
         lastClientIDs = nil
+        lastBlockedIDs = nil
         pollFailureCount = 0
 
         if hadClients {
             let callback = onClientsChanged
+            DispatchQueue.main.async { callback?([]) }
+        }
+        if hadBlocked {
+            let callback = onBlockedClientsChanged
             DispatchQueue.main.async { callback?([]) }
         }
 
@@ -418,12 +484,26 @@ public final class CMIOSink {
 
         if let clients, clients != lastClientIDs {
             lastClientIDs = clients
-            let resolved = clients.map {
-                CameraClient(signingID: $0,
-                             displayName: Self.displayName(forSigningID: $0))
-            }
+            let resolved = clients.map(CameraClient.init(signingID:))
             let callback = onClientsChanged
             DispatchQueue.main.async { callback?(resolved) }
+        }
+
+        // Only worth asking about while a policy could be refusing anything;
+        // an extension with no policy always answers "[]" and the 1 Hz round
+        // trip buys nothing.
+        if isPolicyEnforcing {
+            let blocked = readBlockedClients() ?? []
+            if blocked != lastBlockedIDs {
+                lastBlockedIDs = blocked
+                let list = blocked.map(CameraClient.init(signingID:))
+                let callback = onBlockedClientsChanged
+                DispatchQueue.main.async { callback?(list) }
+            }
+        } else if lastBlockedIDs?.isEmpty == false {
+            lastBlockedIDs = []
+            let callback = onBlockedClientsChanged
+            DispatchQueue.main.async { callback?([]) }
         }
     }
 

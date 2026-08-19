@@ -1,8 +1,9 @@
 // DeviceSource.swift
 // PRISMCameraExtension — the "PRISM Camera" device. Owns the source and sink
-// streams, declares and serves the pfmt/clnt/hoff custom properties
-// (docs/CONTRACTS.md "CMIO custom properties"), and persists the published
-// format list inside the extension's sandbox container.
+// streams, declares and serves the pfmt/clnt/hoff/afmt/polc/blkd custom
+// properties (docs/CONTRACTS.md "CMIO custom properties"), and persists the
+// published format list and the per-app access policy inside the extension's
+// sandbox container.
 //
 // Licensed under the Apache License, Version 2.0.
 
@@ -57,6 +58,11 @@ enum PRISMDeviceProperty {
     /// negotiated. Lets the app retarget its pipeline to the negotiated
     /// output (SPEC §3.2 "ordinary client negotiation").
     static let activeFormat = CMIOExtensionProperty(rawValue: "4cc_afmt_glob_0000")
+    /// App → extension. UTF-8 JSON of the per-app access policy (§5.18).
+    static let accessPolicy = CMIOExtensionProperty(rawValue: "4cc_polc_glob_0000")
+    /// Extension → app. UTF-8 JSON array of signing IDs refused recently, so
+    /// the app can say *why* an app's video is dark.
+    static let blockedClients = CMIOExtensionProperty(rawValue: "4cc_blkd_glob_0000")
 }
 
 // MARK: - ExtFormat
@@ -71,6 +77,146 @@ struct ExtFormat: Codable, Equatable {
 
     var frameDuration: CMTime {
         CMTime(value: 1, timescale: CMTimeScale(max(1, frameRate)))
+    }
+}
+
+// MARK: - ExtAccessPolicy (§5.18)
+
+/// Local Codable mirror of the app's `AccessPolicy`. Key names are the
+/// contract; the extension must not link app sources (SPEC §3.1).
+///
+/// Every field is optional and every decode failure is survivable, because
+/// this is the one payload in PRISM whose failure mode is a camera that
+/// does not work. See `PRISMAccessPolicy.isAllowed` for the fail-open rules.
+struct ExtAccessPolicy: Codable {
+    var version: Int?
+    var defaultAccess: String?
+    var blocked: [String]?
+    var allowed: [String]?
+}
+
+/// The extension's answer to "may this client start streaming".
+///
+/// **Fail open, always.** The app runs as the user and may be quit, crashed,
+/// or never installed; the extension runs as root and outlives all of that.
+/// So: no policy, an unreadable policy, a policy from a future version, or a
+/// missing signing ID all resolve to *allow*. The only way to be refused is
+/// an intact policy that names you, or an intact policy that says allow-list
+/// and does not.
+///
+/// The policy is persisted next to formats.json rather than kept in memory.
+/// CMIO extensions are launched on demand and torn down when idle, so an
+/// in-memory policy would be cleared by quitting and reopening the very app
+/// the user blocked — a block anyone can bypass by accident is not a block.
+final class PRISMAccessPolicy {
+
+    /// PRISM.app itself writes the sink stream and is never policed.
+    static let selfSigningID = "horse.prism.PRISM"
+    /// Highest wire version this build understands.
+    private static let supportedVersion = 1
+
+    private let lock = NSLock()
+    private var policy: ExtAccessPolicy?
+    /// Signing IDs refused recently, newest last, with the host time of the
+    /// refusal. Bounded — this is a UI hint, not an audit log.
+    private var refusals: [(signingID: String, atNs: UInt64)] = []
+    private static let refusalWindowNs: UInt64 = 30_000_000_000
+    private static let refusalLimit = 8
+
+    init() {
+        policy = Self.loadPersisted()
+    }
+
+    /// Returns true when the client may stream. Anything unclear is a yes.
+    func isAllowed(_ signingID: String?) -> Bool {
+        // Case-folded on both sides: the app matches signing IDs
+        // case-insensitively (AppRule.matches) and ships the lists folded, so
+        // folding here is what keeps the two ends agreeing about one app.
+        guard let signingID else { return true }
+        let folded = signingID.lowercased()
+        guard folded != Self.selfSigningID.lowercased() else { return true }
+        lock.lock()
+        let current = policy
+        lock.unlock()
+        guard let current else { return true }
+        // A payload written by a newer PRISM may mean something this build
+        // cannot evaluate; guessing at it is how you refuse a client you were
+        // supposed to admit.
+        guard (current.version ?? Self.supportedVersion) <= Self.supportedVersion else {
+            return true
+        }
+        if current.allowed?.contains(folded) == true { return true }
+        if current.blocked?.contains(folded) == true { return false }
+        return current.defaultAccess != "block"
+    }
+
+    func noteRefused(_ signingID: String) {
+        let now = DispatchTime.now().uptimeNanoseconds
+        lock.lock()
+        refusals.removeAll { $0.signingID == signingID }
+        refusals.append((signingID: signingID, atNs: now))
+        if refusals.count > Self.refusalLimit {
+            refusals.removeFirst(refusals.count - Self.refusalLimit)
+        }
+        lock.unlock()
+    }
+
+    /// Refusals inside the last 30 s. Blocked apps retry, so this stays
+    /// populated while the user is actually looking at a dark tile and
+    /// empties out once they stop.
+    func recentRefusals() -> [String] {
+        let now = DispatchTime.now().uptimeNanoseconds
+        lock.lock()
+        defer { lock.unlock() }
+        return refusals
+            .filter { now &- $0.atNs < Self.refusalWindowNs }
+            .map(\.signingID)
+    }
+
+    /// Replaces the policy from a 'polc' write. Throws only on payloads that
+    /// are not JSON at all — the app must hear that its write did nothing.
+    func apply(_ data: Data) throws {
+        let decoded = try JSONDecoder().decode(ExtAccessPolicy.self, from: data)
+        lock.lock()
+        policy = decoded
+        lock.unlock()
+        Self.persist(data)
+        prismLog.notice("access policy updated: default \(decoded.defaultAccess ?? "allow", privacy: .public), \(decoded.blocked?.count ?? 0) blocked")
+    }
+
+    // MARK: Persistence
+
+    private static var policyFileURL: URL {
+        let base = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory())
+                .appendingPathComponent("Library/Application Support", isDirectory: true)
+        return base
+            .appendingPathComponent("PRISM", isDirectory: true)
+            .appendingPathComponent("policy.json", isDirectory: false)
+    }
+
+    private static func loadPersisted() -> ExtAccessPolicy? {
+        guard let data = try? Data(contentsOf: policyFileURL) else { return nil }
+        guard let decoded = try? JSONDecoder().decode(ExtAccessPolicy.self, from: data) else {
+            // A corrupt file must not outlive this launch: leaving it on disk
+            // would fail open forever without ever saying why.
+            prismLog.error("ignoring unreadable access policy; allowing every client")
+            try? FileManager.default.removeItem(at: policyFileURL)
+            return nil
+        }
+        return decoded
+    }
+
+    private static func persist(_ data: Data) {
+        do {
+            let url = policyFileURL
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            try data.write(to: url, options: .atomic)
+        } catch {
+            prismLog.error("failed to persist access policy: \(String(describing: error), privacy: .public)")
+        }
     }
 }
 
@@ -122,6 +268,9 @@ final class PRISMDeviceSource: NSObject, CMIOExtensionDeviceSource {
     private var extFormats: [ExtFormat]
     private var streamingClients: [(clientID: UUID, signingID: String)] = []
     private let handoff = RollingMean(window: 60)
+    /// §5.18 — owns its own locking; deliberately not behind `stateLock`, so
+    /// an authorization check never waits on a format republish.
+    let accessPolicy = PRISMAccessPolicy()
     /// Format most recently negotiated by a client on the source stream;
     /// nil until a client negotiates (and cleared on republish).
     private var negotiatedFormat: ExtFormat?
@@ -153,7 +302,9 @@ final class PRISMDeviceSource: NSObject, CMIOExtensionDeviceSource {
          PRISMDeviceProperty.formatList,
          PRISMDeviceProperty.clients,
          PRISMDeviceProperty.handoffMs,
-         PRISMDeviceProperty.activeFormat]
+         PRISMDeviceProperty.activeFormat,
+         PRISMDeviceProperty.accessPolicy,
+         PRISMDeviceProperty.blockedClients]
     }
 
     func deviceProperties(forProperties properties: Set<CMIOExtensionProperty>) throws
@@ -185,12 +336,36 @@ final class PRISMDeviceSource: NSObject, CMIOExtensionDeviceSource {
                 CMIOExtensionPropertyState(value: activeFormatJSON() as NSData as AnyObject),
                 forProperty: PRISMDeviceProperty.activeFormat)
         }
+        if properties.contains(PRISMDeviceProperty.accessPolicy) {
+            // Write-only in practice: the app is the author of the policy and
+            // has no use for a copy of what it just sent. Served as empty
+            // data so the property is still a legal read.
+            deviceProperties.setPropertyState(
+                CMIOExtensionPropertyState(value: Data() as NSData as AnyObject),
+                forProperty: PRISMDeviceProperty.accessPolicy)
+        }
+        if properties.contains(PRISMDeviceProperty.blockedClients) {
+            deviceProperties.setPropertyState(
+                CMIOExtensionPropertyState(value: blockedClientsJSON() as NSData as AnyObject),
+                forProperty: PRISMDeviceProperty.blockedClients)
+        }
         return deviceProperties
     }
 
     func setDeviceProperties(_ deviceProperties: CMIOExtensionDeviceProperties) throws {
-        // 'pfmt' is the only settable property; 'clnt' and 'hoff' are
-        // extension → app and any writes to them are ignored.
+        // 'pfmt' and 'polc' are the settable properties; 'clnt', 'hoff',
+        // 'afmt' and 'blkd' are extension → app and writes to them are
+        // ignored.
+        if let state = deviceProperties.propertiesDictionary[PRISMDeviceProperty.accessPolicy] {
+            guard let data = state.value as? Data else {
+                throw Self.propertyError("'polc' value must be UTF-8 JSON data")
+            }
+            do {
+                try accessPolicy.apply(data)
+            } catch {
+                throw Self.propertyError("'polc' JSON did not decode: \(error.localizedDescription)")
+            }
+        }
         guard let state = deviceProperties.propertiesDictionary[PRISMDeviceProperty.formatList] else {
             return
         }
@@ -272,6 +447,19 @@ final class PRISMDeviceSource: NSObject, CMIOExtensionDeviceSource {
         if changed { notifyClientsChanged() }
     }
 
+    /// §5.18 — the source stream refused this client. Recorded and published
+    /// on 'blkd' so PRISM can explain a dark tile the user is staring at.
+    func noteClientRefused(_ client: CMIOExtensionClient) {
+        let signingID = client.signingID ?? "unknown"
+        accessPolicy.noteRefused(signingID)
+        prismLog.notice("refused client by policy: \(signingID, privacy: .public)")
+        guard let device else { return }
+        device.notifyPropertiesChanged([
+            PRISMDeviceProperty.blockedClients:
+                CMIOExtensionPropertyState(value: blockedClientsJSON() as NSData as AnyObject),
+        ])
+    }
+
     func noteClientDisconnected(_ client: CMIOExtensionClient) {
         stateLock.lock()
         let before = streamingClients.count
@@ -342,6 +530,10 @@ final class PRISMDeviceSource: NSObject, CMIOExtensionDeviceSource {
             ids.append(entry.signingID)
         }
         return (try? JSONEncoder().encode(ids)) ?? Data("[]".utf8)
+    }
+
+    private func blockedClientsJSON() -> Data {
+        (try? JSONEncoder().encode(accessPolicy.recentRefusals())) ?? Data("[]".utf8)
     }
 
     private func handoffData() -> Data {

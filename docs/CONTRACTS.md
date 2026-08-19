@@ -13,10 +13,12 @@ in the repo — read them before writing code:
   `PipelineConfiguration`, `Preset`, `HotkeyCombo`
 - `PRISM/AppStateTypes.swift` — `CameraDeviceInfo`, `AudioDeviceInfo`,
   `CameraClient`, `MenuBarState`, `PermissionState`, `ExtensionStatus`,
-  `SetupStatus`, `WarningMessage`, `NoticeMessage`, `BlockedAttempt`,
+  `SetupStatus`, `WarningMessage`, `NoticeMessage`,
   `CapturePhase`, `CaptureResult`, `PresenceState`, `VideoSourceKind`,
   `VideoSourceSelection`, `ScreenSourceInfo`, `GestureEvent`, `ClipState`,
   `StageStatus`, `PopoverSection`
+- `PRISM/Pipeline/Settings/AppRuleSettings.swift` — `AppAccess`, `AppRule`,
+  `AppRulesSettings`, `AppRuleMatch`, `AppRuleResolver`, `AccessPolicy` (§5.18)
 - `PRISMKernels/KernelTypes.h` — kernel parameter structs (bridged to Swift)
 
 Language: Swift 5.9, macOS 13.0 deployment target. No Swift 6 concurrency
@@ -55,11 +57,15 @@ selectors:
 | `'pfmt'` | format list | UTF-8 JSON data | app → extension | published format set: `[{"width":1920,"height":1080,"frameRate":30},…]`. Extension re-publishes both streams and persists the list in its own container. |
 | `'clnt'` | clients | UTF-8 JSON data | extension → app | array of streaming client signing IDs, e.g. `["us.zoom.xos"]`. Updated on start/stop stream. |
 | `'hoff'` | handoff ms | Float64 (8 bytes) | extension → app | rolling mean sink-receive → source-emit, milliseconds. |
+| `'afmt'` | active format | UTF-8 JSON data | extension → app | the single format a client most recently negotiated on the source stream; empty until one has. |
+| `'polc'` | access policy | UTF-8 JSON data | app → extension | §5.18 per-app policy: `{"version":1,"defaultAccess":"allow","blocked":[…],"allowed":[…]}`. Extension persists it and enforces it in `authorizedToStartStream`. Write-only in practice — reads serve empty data. |
+| `'blkd'` | blocked clients | UTF-8 JSON data | extension → app | signing IDs refused by policy in the last 30 s, e.g. `["us.zoom.xos"]`. Lets the app explain a dark tile. |
 
 CMIOExtension side declares these as
 `CMIOExtensionProperty(rawValue: "4cc_pfmt_glob_0000")` (same pattern for
-`clnt`, `hoff`) in `availableProperties` of the **device** source, handles
-them in `deviceProperties(forProperties:)` / `setDeviceProperties(_:)`.
+`clnt`, `hoff`, `afmt`, `polc`, `blkd`) in `availableProperties` of the
+**device** source, handles them in `deviceProperties(forProperties:)` /
+`setDeviceProperties(_:)`.
 App side reads/writes them with the CMIO C API
 (`CMIOObjectGetPropertyData` / `CMIOObjectSetPropertyData`) using
 `CMIOObjectPropertyAddress(mSelector: fourCC, mScope:
@@ -70,6 +76,19 @@ The extension defines its own tiny Codable mirror of the format entry
 (`struct ExtFormat: Codable { var width: Int; var height: Int; var
 frameRate: Int }`) — it must not link app sources. JSON keys must match
 `VideoFormat`'s (`width`, `height`, `frameRate`).
+
+It mirrors `AccessPolicy` the same way as `ExtAccessPolicy`, with **every
+field optional**. Signing IDs travel case-folded, and the extension folds
+before comparing, so its set test agrees with `AppRule.matches` on the app
+side. `'polc'` is the one payload whose failure mode is a camera
+that will not start, so the extension fails open on all of: no policy ever
+received, an unreadable file, a `version` above what it understands, and a
+signing ID the policy does not mention under `defaultAccess: "allow"`. A
+corrupt policy file is deleted rather than left to fail open forever in
+silence. The policy is persisted (`policy.json`, beside `formats.json` in the
+extension container) because CMIO extensions are launched on demand: an
+in-memory policy would be cleared by quitting and reopening the very app the
+user blocked.
 
 ---
 
@@ -747,8 +766,12 @@ public final class DeviceMonitor {
 public final class CMIOSink {
     public private(set) var isConnected: Bool
     /// Clients decoded from 'clnt': the signing ID the extension reported
-    /// (what app rules match on) plus the name a human is shown.
+    /// (what §5.18 rules match on) plus the name a human is shown.
     public var onClientsChanged: (([CameraClient]) -> Void)? // main thread
+    /// Clients refused by the §5.18 policy, decoded from 'blkd'.
+    public var onBlockedClientsChanged: (([CameraClient]) -> Void)? // main thread
+    /// Gates the 1 Hz 'blkd' read; set false while nothing can be refused.
+    public var isPolicyEnforcing: Bool
     public init()
     /// Finds the PRISM Camera device + sink stream via the CMIO C API,
     /// copies the buffer queue, starts the stream. Retries internally at
@@ -762,6 +785,8 @@ public final class CMIOSink {
     public func writeFormatList(_ json: Data) -> Bool
     public func readHandoffMs() -> Double?
     public func readClients() -> [String]?
+    public func writeAccessPolicy(_ json: Data) -> Bool     // 'polc', §5.18
+    public func readBlockedClients() -> [String]?           // 'blkd', §5.18
     /// Maps signing IDs to friendly names ("us.zoom.xos" → "Zoom").
     public static func displayName(forSigningID: String) -> String
 }
@@ -1048,6 +1073,7 @@ public final class AppState: ObservableObject {
     @Published public var latency: LatencyReport
     @Published public var clients: [CameraClient]         // signing ID + name
     public var clientsInUse: [String] { get }             // names, projected
+    @Published public var blockedClients: [CameraClient]  // §5.18, refused now
     @Published public var warning: WarningMessage?
     /// A second slot, never the warning's: a notice must never evict a fact.
     /// Events (§5.15, §5.16) expire on a timer; conditions (§5.17) are
@@ -1096,6 +1122,11 @@ public final class AppState: ObservableObject {
     // Presets
     @Published public var presets: [Preset]
     @Published public var activePresetID: UUID?
+    // Per-app rules (§5.18) — behaviour, so they ride in `studio`, not in a
+    // preset. `appRules` is a read/write projection of `studio.apps`; there
+    // is one stored copy and one persisted home.
+    public var appRules: AppRulesSettings { get set }
+    @Published public private(set) var activeAppRule: AppRuleMatch?
     // Sections
     @Published public var expandedSections: Set<PopoverSection>
     // Popover / preview
@@ -1170,6 +1201,16 @@ public final class AppState: ObservableObject {
     public func selectMicrophone(_ id: String?)
     public func selectPreset(_ id: UUID)                   // 200ms crossfade, §5.5
     public func saveCurrentAsPreset(named: String)
+    // §5.18 — every mutation republishes 'polc' and re-resolves the look
+    public func setAppRulesEnabled(_ on: Bool)
+    public func setAppRulesDefaultAccess(_ access: AppAccess)
+    public func setAppRulesAnnounce(_ on: Bool)
+    public func addAppRule(signingID: String, access: AppAccess, presetID: UUID?)
+    public func updateAppRule(_ id: UUID, _ mutate: (inout AppRule) -> Void)
+    public func removeAppRule(_ id: UUID)
+    public func moveAppRules(fromOffsets: IndexSet, toOffset: Int)
+    public func clearAllBlocks()                           // the escape hatch
+    public func isStreamingNow(_ signingID: String) -> Bool
     public func importLUT(from url: URL)
     public func setStyleEffect(_ effect: StyleEffect)      // .normal = same intent as off
     public func raiseBudgetOneStep()                       // policy pressure action
@@ -1254,16 +1295,22 @@ Standalone — links only CoreMediaIO/CoreVideo/AppKit-safe frameworks
   CMIOExtensionProviderSource`; one device.
 - `DeviceSource.swift` — `PRISMDeviceSource: CMIOExtensionDeviceSource`;
   device name "PRISM Camera", UID above; owns both streams; declares and
-  handles the three custom properties; persists the published format list to
-  its sandbox container (`~/Library/Application Support/PRISM/formats.json`
-  inside the extension container); on 'pfmt' set → update both stream
-  format arrays and notify clients.
+  handles the six custom properties; persists the published format list and
+  the §5.18 access policy to its sandbox container (`formats.json` and
+  `policy.json` under `~/Library/Application Support/PRISM/` inside the
+  extension container); on 'pfmt' set → update both stream format arrays and
+  notify clients; on 'polc' set → replace and persist the access policy.
+  `PRISMAccessPolicy` owns the fail-open evaluation and the bounded list of
+  recent refusals served on 'blkd'.
 - `StreamSource.swift` — `PRISMStreamSource` (source) and
   `PRISMSinkStreamSource` (sink), both `CMIOExtensionStreamSource`.
   Sink: on client start, repeatedly `stream.consumeSampleBuffer(from:)`;
   each received buffer → stamp receive time → `sourceStream.send(...)` →
   record handoff ms rolling mean; notifyScheduledOutputChanged after send.
-  Source: on start with no sink data for 1000ms → placeholder timer at 1fps.
+  Source: on start with no sink data for 1000ms → placeholder timer at 1fps;
+  `authorizedToStartStream` consults the §5.18 policy and returns false for a
+  refused client — one source stream fans out to every consumer, so a
+  per-client placeholder card is not expressible.
 - `PlaceholderRenderer.swift` — draws the card (§3.2: system background
   color — use a neutral dark gray #1E1E1E equivalent via CGColor, PRISM
   wordmark centered via CoreText, `PRISM is not running` 32pt 60% white

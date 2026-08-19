@@ -72,10 +72,16 @@ struct StudioPane: View {
         return line
     }
 
+    /// Same composition as the popover's, including the §5.18 refusal — both
+    /// surfaces answer "who is watching" identically.
     private var inUseLine: String {
-        state.clientsInUse.isEmpty
+        var line = state.clientsInUse.isEmpty
             ? "Not in use"
             : "In use by \(state.clientsInUse.joined(separator: ", "))"
+        if !state.blockedClients.isEmpty {
+            line += " · blocking \(state.blockedClients.map(\.displayName).joined(separator: ", "))"
+        }
+        return line
     }
 
     private func warningRow(_ warning: WarningMessage) -> some View {
@@ -93,12 +99,18 @@ struct StudioPane: View {
             case .armBuffer:
                 Button("Turn on") { state.setBufferArmed(true) }
                     .controlSize(.small)
+            // The one warning whose fix is a single decision rather than a
+            // place to go: a block refusing a live client is exactly the
+            // state the user needs out of, so the way out is in the row.
+            case .clearBlocks:
+                Button("Unblock all") { state.clearAllBlocks() }
+                    .controlSize(.small)
             case .openScreenRecordingSettings:
                 Button("Open Settings") { openScreenRecordingSettings() }
                     .controlSize(.small)
-            // The capture folder and the app rules both live in this window,
-            // so from here the warning row has nowhere to send anyone.
-            case .chooseCaptureFolder, .openAppRules, .openSettings, .none:
+            // The capture folder lives in this window, so from here the
+            // warning row has nowhere to send anyone.
+            case .chooseCaptureFolder, .openSettings, .none:
                 EmptyView()
             }
         }
