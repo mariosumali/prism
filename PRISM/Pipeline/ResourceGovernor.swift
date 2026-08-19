@@ -153,9 +153,16 @@ public enum ResourceGovernor {
     /// switches on background blur is not a budget.
     static let reservedMB: Double = 80
 
-    /// Vision's staging buffers: three modalities × two 720p BGRA slots, plus
-    /// the three-deep mask texture pool. Fixed, because every request's input
-    /// is capped at 720p regardless of the negotiated format (§5.4).
+    /// Vision's staging buffers, itemised because the line used to read
+    /// "three modalities × two 720p slots" and two of the four modalities are
+    /// not at 720p: two BGRA slots each for segmentation and landmarks at
+    /// 720p (7.0 MB each), two at 640×360 for presence (1.8 MB), two at
+    /// 960×540 for hand pose (4.0 MB — fingers need more lines than a torso
+    /// does, §5.31), and the three-deep mask pool, which is R8 rather than
+    /// BGRA (2.6 MB). 22.4 MB against a reservation that was already 24, so
+    /// the fourth modality fits inside the rounding the old sentence was
+    /// carrying rather than costing the freeze window a slot. Fixed, because
+    /// every request's input is capped regardless of the negotiated format.
     static let visionStagingMB: Double = 24
 
     /// Full-frame buffers the chain cannot run without: four in the output
@@ -164,6 +171,19 @@ public enum ResourceGovernor {
     /// the fit scratch a crossfade lands in. Not elastic — dropping any of
     /// them stops the pipeline rather than shrinking it.
     static let structuralFrames: Int = 7
+
+    /// Style's own working-resolution textures (§5.29): the motion-effect
+    /// history, and the scratch a stacked second pass lands in. Two frames,
+    /// counted always rather than only while the stage is on.
+    ///
+    /// Counting them on demand was the obvious alternative and it is the
+    /// wrong one: the freeze window would then change length when the user
+    /// picked Underwater, and a freeze that reaches back four tenths of a
+    /// second on Tuesday and three on Wednesday is worse to reason about
+    /// than one that is permanently two slots shorter. This costs 1080p
+    /// roughly three slots of ring, which is the honest price of the second
+    /// pass and is written down here rather than discovered later.
+    static let styleFrames: Int = 2
 
     /// Never fewer slots than this, whatever the arithmetic says. Two of any
     /// ring are unavailable at any instant — the one being written and the
@@ -214,7 +234,7 @@ public enum ResourceGovernor {
         // memory that is already spent.
         let screenDepth = demand.screenSourceActive ? ScreenCapture.queueDepth : 0
         let fixed = reservedMB + visionStagingMB
-            + Double(structuralFrames + screenDepth) * frame
+            + Double(structuralFrames + styleFrames + screenDepth) * frame
 
         let floor = minimumFreezeDepth
         let preferred = preferredDepth(for: format)

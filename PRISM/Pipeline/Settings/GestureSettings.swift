@@ -36,6 +36,13 @@ public enum GestureAction: String, Codable, CaseIterable {
     case toggleFreeze
     case takeStill
     case startReplay
+    /// §5.11, and the one action here that takes the picture away entirely.
+    /// Offered because a hand is exactly what is free at the moment panic is
+    /// wanted, and shipped bound to nothing because a camera that blanks
+    /// itself because somebody gestured while talking is the worst thing this
+    /// app could do. It carries its own longer hold on top of every other
+    /// rule — see `dwellSeconds(for:)`.
+    case panic
 
     public var displayName: String {
         switch self {
@@ -43,7 +50,21 @@ public enum GestureAction: String, Codable, CaseIterable {
         case .toggleMute: return "Mute or unmute"
         case .toggleFreeze: return "Freeze or unfreeze"
         case .takeStill: return "Take a still"
-        case .startReplay: return "Play the replay"
+        case .startReplay: return "Play or stop the replay"
+        case .panic: return "Panic"
+        }
+    }
+
+    /// One line of consequence, for the surface that offers it. Nil where the
+    /// name already says everything.
+    public var caption: String? {
+        switch self {
+        case .panic:
+            return "Blanks the camera and mutes the microphone. Held twice as long as the others, and still the one binding worth thinking twice about."
+        case .toggleMute:
+            return "The gesture works while you are already muted, which is the case it exists for."
+        default:
+            return nil
         }
     }
 }
@@ -100,6 +121,26 @@ public struct GestureSettings: Codable, Equatable {
     public var clampedHoldSeconds: Double { min(max(holdSeconds, 0.3), 3) }
     public var clampedCooldownSeconds: Double { min(max(cooldownSeconds, 0.5), 10) }
     public var clampedConfidence: Double { min(max(confidence, 0.5), 1) }
+
+    /// The shortest hold panic will ever accept, whatever the user set the
+    /// general one to. Panic is the only action here that takes the picture
+    /// away, so it is the only one where a hold long enough to be tedious is
+    /// cheaper than a hold short enough to be an accident — and 0.3 s, which
+    /// the slider does allow, is inside the range a hand passing the lens
+    /// occupies.
+    public static let panicHoldFloorSeconds: Double = 1.5
+
+    /// How long a pose must be held before it fires this action. One number
+    /// for everything except panic, which takes the longer of the user's hold
+    /// and its own floor. A second control for it would have been the
+    /// obvious alternative and is the wrong shape (§8.7): nobody has an
+    /// opinion about panic's dwell that is not already expressed by whether
+    /// they bound it at all.
+    public func dwellSeconds(for action: GestureAction) -> Double {
+        action == .panic
+            ? max(clampedHoldSeconds, Self.panicHoldFloorSeconds)
+            : clampedHoldSeconds
+    }
 
     /// The recogniser runs only when the switch is on AND some pose is
     /// actually bound to something — an enabled feature where every binding

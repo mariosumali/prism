@@ -150,10 +150,19 @@ public protocol EffectStage: AnyObject {
     /// (e.g. Geometry at identity) may return false so the pipeline can skip
     /// the pass entirely. Default: true when enabled.
     func wantsEncode() -> Bool
+
+    /// How many times its table weight the stage actually encoded this frame
+    /// (§3.4). Almost every stage runs a fixed number of passes and leaves
+    /// this at 1; Style runs one pass or two depending on whether the user
+    /// stacked (§5.29), and a static weight would tell the degradation
+    /// engine the second effect was free. Read on the frame queue,
+    /// immediately after `encode`.
+    var weightMultiplier: Double { get }
 }
 
 public extension EffectStage {
     func wantsEncode() -> Bool { isEnabled }
+    var weightMultiplier: Double { 1 }
 }
 
 public enum PipelineError: Error {

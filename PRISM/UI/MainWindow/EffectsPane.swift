@@ -5,7 +5,9 @@
 // enable + "require" (pin, §3.4 — exempt from automatic degradation) + live
 // measured cost, then every parameter. Adjust's five sliders, skin retouch's
 // one, LUT choice/strength/import, the Style catalogue grid with its
-// intensity slider, blur quality/radius. Edits stage into the draft (previewed
+// intensity slider, the second effect that stacks on top of it and the one
+// depth control behind "follow my voice" (§5.29, §5.30), blur quality/radius.
+// Edits stage into the draft (previewed
 // privately, applied from the Apply bar). Radius and strength are clamped
 // again by the stages, so the slider ranges here are UI ergonomics, not
 // safety.
@@ -104,10 +106,22 @@ struct EffectsPane: View {
                 styleGrid(title: "Looks",
                           effects: StyleEffect.looks)
                 PrismSliderRow(label: "Intensity",
-                               value: styleIntensityBinding,
+                               value: styleIntensityBinding(0),
                                range: 0...1,
                                defaultValue: 1,
                                fractionDigits: 2)
+                Toggle("Follow my voice", isOn: styleReactiveBinding(0))
+                secondEffectRows
+                if state.editingConfig.style.isAudioReactive {
+                    PrismSliderRow(label: "Voice depth",
+                                   value: styleAudioDepthBinding,
+                                   range: 0...1,
+                                   defaultValue: 0.7,
+                                   fractionDigits: 2)
+                    Text("How far your voice moves the intensity. Below 1 on purpose — an effect that vanished between sentences would read as a dropout rather than as an effect.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             Section("Background") {
                 // Blur is one answer to "what is behind me", and virtual
@@ -164,6 +178,58 @@ struct EffectsPane: View {
         }
     }
 
+    // MARK: - The second effect (§5.29)
+
+    /// One menu, not a second catalogue grid. The grid above is how a look is
+    /// browsed; the second slot is a modifier on a look already chosen, and
+    /// giving it equal billing would turn an effects picker into a rack of
+    /// two identical modules. It appears only once there is something to
+    /// stack onto, because "second effect" over an unstyled picture is a
+    /// control that cannot mean anything.
+    @ViewBuilder
+    private var secondEffectRows: some View {
+        let style = state.editingConfig.style
+        if style.layer(0).effect != .normal {
+            Picker("Then also", selection: styleEffectBinding(1)) {
+                Text(StyleEffect.normal.displayName).tag(StyleEffect.normal)
+                Section("Distortions") {
+                    ForEach(StyleEffect.distortions) { effect in
+                        Text(effect.displayName).tag(effect)
+                    }
+                }
+                // Motion effects disappear from the menu when the first slot
+                // is already running one, rather than being offered and then
+                // quietly dropped: there is one history texture, and a choice
+                // that cannot be honoured must not be presentable.
+                if style.acceptsTemporal(inSlot: 1) {
+                    Section("Motion") {
+                        ForEach(StyleEffect.motion) { effect in
+                            Text(effect.displayName).tag(effect)
+                        }
+                    }
+                }
+                Section("Looks") {
+                    ForEach(StyleEffect.looks) { effect in
+                        Text(effect.displayName).tag(effect)
+                    }
+                }
+            }
+            if style.layer(1).effect != .normal {
+                PrismSliderRow(label: "Its intensity",
+                               value: styleIntensityBinding(1),
+                               range: 0...1,
+                               defaultValue: 1,
+                               fractionDigits: 2)
+                Toggle("It follows my voice", isOn: styleReactiveBinding(1))
+            }
+            Text(style.acceptsTemporal(inSlot: 1)
+                 ? "A second effect runs over the first — Underwater with Afterimage on top of it, say. Two costs a second full-frame pass."
+                 : "\(style.layer(0).effect.displayName) is a motion effect, and only one of those can run at a time: they share the single frame of history that makes a trail.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
     // MARK: - Style catalogue grid
 
     /// Photo Booth's effect picker reduced to what it is: a grid of named
@@ -187,7 +253,11 @@ struct EffectsPane: View {
     }
 
     private func styleTile(_ effect: StyleEffect) -> some View {
-        let isSelected = state.editingConfig.style.effect == effect
+        let style = state.editingConfig.style
+        let isSelected = style.layer(0).effect == effect
+        // The same one-history rule from the other side: a motion tile is
+        // unavailable while the second slot is running one.
+        let blocked = effect.isTemporal && !style.acceptsTemporal(inSlot: 0)
         return Button {
             state.setStyleEffect(effect)
         } label: {
@@ -208,6 +278,8 @@ struct EffectsPane: View {
                         .strokeBorder(isSelected ? Color.accentColor : .clear))
         }
         .buttonStyle(.plain)
+        .disabled(blocked)
+        .help(blocked ? "Only one motion effect at a time — the second slot is already running one." : "")
         .accessibilityLabel(effect.displayName)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
@@ -258,12 +330,28 @@ struct EffectsPane: View {
             })
     }
 
-    private var styleIntensityBinding: Binding<Double> {
+    private func styleEffectBinding(_ slot: Int) -> Binding<StyleEffect> {
         Binding(
-            get: { state.editingConfig.style.intensity },
-            set: { intensity in
-                state.updateEditing { $0.style.intensity = intensity }
-            })
+            get: { state.editingConfig.style.layer(slot).effect },
+            set: { state.setStyleEffect($0, inSlot: slot) })
+    }
+
+    private func styleIntensityBinding(_ slot: Int) -> Binding<Double> {
+        Binding(
+            get: { state.editingConfig.style.layer(slot).intensity },
+            set: { state.setStyleIntensity($0, inSlot: slot) })
+    }
+
+    private func styleReactiveBinding(_ slot: Int) -> Binding<Bool> {
+        Binding(
+            get: { state.editingConfig.style.layer(slot).audioReactive },
+            set: { state.setStyleAudioReactive($0, inSlot: slot) })
+    }
+
+    private var styleAudioDepthBinding: Binding<Double> {
+        Binding(
+            get: { state.editingConfig.style.audioDepth },
+            set: { state.setStyleAudioDepth($0) })
     }
 
     // MARK: - LUT import

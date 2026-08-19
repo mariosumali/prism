@@ -139,6 +139,15 @@ final class DraftRenderer {
     /// auto-framer reads only the live blur stage), so draft segmentation
     /// without visible blur would be Vision cost at camera rate for output
     /// nobody reads.
+    /// §5.30 — the draft preview breathes off the same microphone the live
+    /// chain does. A preview showing a static intensity would be previewing a
+    /// look the user is not about to get, which is the one thing
+    /// preview-before-apply exists to prevent.
+    var audioLevelSource: (() -> Double)? {
+        get { styleStage.audioLevelSource }
+        set { styleStage.audioLevelSource = newValue }
+    }
+
     func apply(_ config: PipelineConfiguration) {
         adjustStage.settings = config.adjust
         retouchStage.settings = config.retouch

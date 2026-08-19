@@ -170,6 +170,13 @@ public final class AppState: ObservableObject {
             if studio.presence != oldValue.presence {
                 updatePresenceWatching()
             }
+            // §5.31: the same arrangement one modality along — the gesture
+            // switches ARE the demand gate for a Vision request, so they have
+            // to reach the recogniser now rather than on some later frame
+            // that happens to notice.
+            if studio.gestures != oldValue.gestures {
+                updateGestureWatching()
+            }
             // §5.18: the extension keeps enforcing whatever it last
             // persisted, so every edit to the rule list has to reach it.
             if studio.apps != oldValue.apps {
@@ -233,6 +240,10 @@ public final class AppState: ObservableObject {
     /// there. What it did is `presenceAction`; this is the bit every surface
     /// needs, which is that the user did not press anything for this.
     @Published public private(set) var presenceEngaged = false
+    /// §5.31 — the last gesture that fired, kept so a surface can say what
+    /// PRISM saw. A gesture that acts without saying so is indistinguishable
+    /// from a misfire, and gestures misfire.
+    @Published public private(set) var lastGesture: GestureEvent?
 
     // Pipeline / format
     @Published public var config = PipelineConfiguration()
@@ -454,6 +465,12 @@ public final class AppState: ObservableObject {
     /// from several places without churning the frame path.
     private var presenceWatching = false
     private var lastPresenceSequence: UInt64 = 0
+    /// §5.31. The dwell, debounce and cooldown live in GestureWatch; these
+    /// two are the same bookkeeping presence keeps — what the pipeline was
+    /// last told, and which sighting has already been counted.
+    private let gestureWatch = GestureWatch()
+    private var gestureWatching = false
+    private var lastGestureSequence: UInt64 = 0
     /// Whether the bad connection engaged the §5.12 delay itself (§5.14), so
     /// releasing it releases only the delay it engaged — never one the user
     /// asked for separately with the lag switch.
@@ -566,6 +583,7 @@ public final class AppState: ObservableObject {
         audioCapture.voiceCleanup.apply(studio.cleanup)
         micWatch.apply(studio.micWatch)
         updatePresenceWatching()
+        updateGestureWatching()
         monitor.setPolicy(config.latencyPolicy,
                           frameIntervalMs: formatManager.activeFormat.frameIntervalMs)
 
@@ -662,6 +680,19 @@ public final class AppState: ObservableObject {
         pipeline.presenceDetector.onSample = { [weak self] sample in
             Task { @MainActor [weak self] in self?.handlePresence(sample) }
         }
+        // §5.31, pushed for the same reason presence is: the watch integrates
+        // the gap between consecutive sightings, and a poll slower than the
+        // recogniser would make a held pose take twice as long to satisfy the
+        // dwell — or, worse, satisfy it in half the sightings the dwell was
+        // reasoned about.
+        pipeline.handTracker.onSample = { [weak self] sample in
+            Task { @MainActor [weak self] in self?.handleHandPose(sample) }
+        }
+        // §5.30: the frame path reads the microphone through the same
+        // lock-free mailbox the meter does — one acquire-load per frame, so
+        // the audio callback never waits on the frame queue and the frame
+        // queue never waits on anything.
+        pipeline.styleStage.audioLevelSource = Self.audioLevelSource(of: audioCapture)
         pipeline.onResourcePlan = { [weak self] plan in
             Task { @MainActor [weak self] in
                 guard let self, plan != self.resources else { return }
@@ -1070,7 +1101,36 @@ public final class AppState: ObservableObject {
     /// accumulation, no timer, no publishes.
     private var inputLevelDemand: Bool {
         guard started, audioCapture.isCapturing else { return false }
-        return previewActive || micIsOffAir
+        // §5.30 joins the audience: an audio-reactive style reads the same
+        // mailbox the meter does, and an unarmed mailbox publishes nothing —
+        // so a style set to pulse with the voice while PRISM sits in the menu
+        // bar would simply hold still, which looks exactly like a broken
+        // effect. It is the one audience with no surface on screen, which is
+        // precisely why it has to be named here.
+        return previewActive || micIsOffAir || styleWantsAudio
+    }
+
+    /// Whether anything is driving an effect from the microphone. Live chain
+    /// OR staged draft, deliberately: the draft counts because previewing a
+    /// look means previewing what it does with your voice, and the live chain
+    /// counts because a draft that happens not to use audio must not disarm
+    /// the meter underneath the picture that is actually on air.
+    private var styleWantsAudio: Bool {
+        func wants(_ configuration: PipelineConfiguration) -> Bool {
+            configuration.flags(for: .style).enabled
+                && configuration.style.isAudioReactive
+        }
+        return wants(config) || (draftConfig.map(wants) ?? false)
+    }
+
+    /// The level the style stage samples, mapped exactly as the meter maps
+    /// it so "the bar is halfway up" and "the effect is halfway on" are the
+    /// same statement. Static, and capturing only the capture object, so the
+    /// closure the frame queue calls holds nothing of AppState — a main-actor
+    /// hop per frame is precisely what this must never be.
+    nonisolated private static func audioLevelSource(
+        of capture: AudioCapture) -> () -> Double {
+        { MicCheck.displayLevel(rms: capture.inputLevelReading.rms) }
     }
 
     /// The microphone is not reaching the call. Mute is the obvious case;
@@ -2445,6 +2505,8 @@ public final class AppState: ObservableObject {
         // currently holding, since it can no longer see whether the user
         // came back.
         updatePresenceWatching()
+        // §5.31: and there are no hands in a screen share either.
+        updateGestureWatching()
         sessionLog.record(.device, "Source: \(videoSourceName)")
         updateMenuBarState()
     }
@@ -2872,7 +2934,127 @@ public final class AppState: ObservableObject {
                                action: .comeBack)
     }
 
-    // MARK: - Intents: gestures
+    // MARK: - Intents: gestures (§5.31)
+
+    /// The master switch. Off means no hand-pose request at all — the demand
+    /// closure is the only thing that makes the modality run, and a modality
+    /// nothing demands is inert (VisionCoordinatorTests).
+    public func setGesturesEnabled(_ enabled: Bool) {
+        studio.gestures.isEnabled = enabled
+    }
+
+    /// Binding a pose is the same intent as switching that binding on, and
+    /// binding it to "Nothing" is the same intent as switching it off — the
+    /// LUT / Neutral rule applied a third time. Any other pairing leaves a
+    /// row whose switch and whose menu disagree about whether a hand does
+    /// anything.
+    public func setGestureAction(_ action: GestureAction, for pose: HandPose) {
+        updateGestureBinding(pose) { binding in
+            binding.action = action
+            binding.isEnabled = action != .none
+        }
+    }
+
+    public func setGestureBindingEnabled(_ enabled: Bool, for pose: HandPose) {
+        updateGestureBinding(pose) { $0.isEnabled = enabled }
+    }
+
+    public func setGestureHoldSeconds(_ seconds: Double) {
+        studio.gestures.holdSeconds = seconds
+    }
+
+    public func setGestureCooldownSeconds(_ seconds: Double) {
+        studio.gestures.cooldownSeconds = seconds
+    }
+
+    public func setGestureConfidence(_ confidence: Double) {
+        studio.gestures.confidence = confidence
+    }
+
+    private func updateGestureBinding(_ pose: HandPose,
+                                      _ change: (inout GestureBinding) -> Void) {
+        var bindings = studio.gestures.bindings
+        if let index = bindings.firstIndex(where: { $0.pose == pose }) {
+            change(&bindings[index])
+        } else {
+            // A binding list that lost a pose (a hand-edited file, an older
+            // build's shape) gets it back rather than dropping the edit.
+            var fresh = GestureBinding(pose: pose)
+            change(&fresh)
+            bindings.append(fresh)
+        }
+        studio.gestures.bindings = bindings
+    }
+
+    /// The demand gate for the whole feature, and the same two conditions
+    /// presence uses: something must actually be bound (a switch wired to
+    /// nothing is not a reason to run a Vision request, §8.7), and the camera
+    /// must be the picture — there are no hands in a screen share.
+    private func updateGestureWatching() {
+        let watching = studio.gestures.isActive && videoSource.kind == .camera
+        guard watching != gestureWatching else { return }
+        gestureWatching = watching
+        pipeline?.setGestureWatching(watching)
+        if !watching {
+            // Standing down means the sightings stop arriving, so a pose
+            // half-held when it stopped watching must not complete later.
+            gestureWatch.reset()
+            lastGestureSequence = 0
+        }
+    }
+
+    /// One sighting from the recogniser, turned into at most one action by
+    /// the watch. Everything that makes a gesture safe — the confidence
+    /// floor, the dwell, the debounce, the cooldown — is in there rather
+    /// than here, so it can be tested against a clock instead of a hand.
+    private func handleHandPose(_ sample: HandTracker.Sample) {
+        guard gestureWatching else { return }
+        guard sample.sequence != lastGestureSequence else { return }
+        lastGestureSequence = sample.sequence
+
+        guard let fired = gestureWatch.observe(pose: sample.pose,
+                                               confidence: sample.confidence,
+                                               settings: studio.gestures,
+                                               at: sample.date) else { return }
+        performGesture(studio.gestures.action(for: fired), pose: fired)
+    }
+
+    /// Exhaustive on purpose, exactly like `perform(_:)` for chords: a
+    /// gesture action cannot be added without the compiler making someone say
+    /// what it does.
+    private func performGesture(_ action: GestureAction, pose: HandPose) {
+        switch action {
+        case .none:
+            return
+        case .toggleMute:
+            toggleMute()
+        case .toggleFreeze:
+            toggleFreeze()
+        case .takeStill:
+            takeSnapshot()
+        case .startReplay:
+            toggleReplay()
+        case .panic:
+            togglePanic()
+        }
+        let event = GestureEvent(pose: pose, action: action)
+        lastGesture = event
+        let line = "\(pose.displayName) → \(action.displayName)"
+        sessionLog.record(.onAir, line)
+        // Said out loud, every time. This is the only input PRISM has that
+        // the user cannot feel themselves make — a chord has a key under it
+        // and a tile has a click, and a hand in the air has neither — so a
+        // gesture that acted silently would be indistinguishable from the
+        // app doing something by itself.
+        notice = NoticeMessage(text: line, symbolName: "hand.raised")
+        noticeTimer?.invalidate()
+        let timer = Timer(timeInterval: 6, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.notice = nil }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        noticeTimer = timer
+        updateMenuBarState()
+    }
 
     // MARK: - Intents: voice cleanup (§5.17)
 
@@ -3134,10 +3316,18 @@ public final class AppState: ObservableObject {
     /// switch in visible disagreement about whether a look is applied (the
     /// LUT / Neutral rule applied to the style catalogue).
     public func setStyleEffect(_ effect: StyleEffect) {
+        setStyleEffect(effect, inSlot: 0)
+    }
+
+    /// The same intent for the second slot (§5.29). Enablement is read off
+    /// the whole stack rather than off the effect just picked: clearing the
+    /// first of two effects is not "switch Style off", and the switch would
+    /// otherwise take the surviving effect down with it.
+    public func setStyleEffect(_ effect: StyleEffect, inSlot slot: Int) {
         updateEditing { cfg in
-            cfg.style.effect = effect
+            cfg.style.mutate(slot: slot) { $0.effect = effect }
             var flags = cfg.flags(for: .style)
-            flags.enabled = effect != .normal
+            flags.enabled = !cfg.style.isNormal
             cfg.flags[.style] = flags
         }
         if draftConfig == nil {
@@ -3145,6 +3335,23 @@ public final class AppState: ObservableObject {
             status.autoDisabled = false
             stageStatus[.style] = status
         }
+    }
+
+    public func setStyleIntensity(_ intensity: Double, inSlot slot: Int) {
+        updateEditing { $0.style.mutate(slot: slot) { $0.intensity = intensity } }
+    }
+
+    /// §5.30. Arms the level mailbox on the spot rather than waiting for the
+    /// 1 Hz reconciliation: this is the one switch whose whole visible effect
+    /// is that the picture starts moving, and a second of stillness after
+    /// flipping it reads as the feature not working.
+    public func setStyleAudioReactive(_ reactive: Bool, inSlot slot: Int) {
+        updateEditing { $0.style.mutate(slot: slot) { $0.audioReactive = reactive } }
+        reconcileInputLevel()
+    }
+
+    public func setStyleAudioDepth(_ depth: Double) {
+        updateEditing { $0.style.audioDepth = depth }
     }
 
     public func setStagePinned(_ id: StageID, _ pinned: Bool) {
@@ -3268,6 +3475,7 @@ public final class AppState: ObservableObject {
         }
         renderer.setAutoFrameOffset(
             pipeline?.geometryStage.autoFrameOffset ?? (1, 0, 0))
+        renderer.audioLevelSource = Self.audioLevelSource(of: audioCapture)
         draftPreviewBox.setEnabled(true)
         // Seed with the latest live frame so the preview never flashes black
         // while the first draft frame renders (draft == live at begin).

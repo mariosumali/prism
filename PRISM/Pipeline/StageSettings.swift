@@ -605,33 +605,211 @@ public enum StyleEffect: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-public struct StyleSettings: Codable, Equatable {
+/// One slot of the style stack (§5.29): an effect, how much of it, and
+/// whether the microphone drives it. Two of these compose, in order.
+public struct StyleLayer: Codable, Equatable {
     public var effect: StyleEffect = .normal
     public var intensity: Double = 1       // 0…1
-    /// Drive the effect from the microphone level. Off by default: an effect
-    /// that pulses with your voice is a stunt, and a preset that silently
-    /// coupled the picture to the mic would be a surprise on a call.
+    /// Drive THIS effect's intensity from the microphone level (§5.30). Off
+    /// by default: an effect that pulses with your voice is a stunt, and a
+    /// preset that silently coupled the picture to the mic would be a
+    /// surprise on a call. Per slot rather than per stage because the pairing
+    /// people actually want is one effect breathing over one that holds
+    /// still; how *much* it breathes is one number for both (§8.7).
     public var audioReactive: Bool = false
-    /// How much of the intensity range the level controls. Below 1 so a
-    /// silent room still shows the effect — an audio-reactive style that
-    /// vanishes between sentences reads as a dropout, not as an effect.
-    public var audioDepth: Double = 0.7    // 0…1
-    public init() {}
+
+    public init(effect: StyleEffect = .normal, intensity: Double = 1,
+                audioReactive: Bool = false) {
+        self.effect = effect
+        self.intensity = intensity
+        self.audioReactive = audioReactive
+    }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         effect = c.tolerant(.effect, .normal)
         intensity = c.tolerant(.intensity, 1)
         audioReactive = c.tolerant(.audioReactive, false)
+    }
+
+    public var clampedIntensity: Double { min(max(intensity, 0), 1) }
+
+    /// A slot with nothing picked, or picked at zero, is a pass the stage
+    /// declines to encode — the Overlay `isRenderable` rule one catalogue
+    /// along.
+    public var isRenderable: Bool { effect != .normal && intensity > 0 }
+}
+
+public struct StyleSettings: Codable, Equatable {
+    /// Two effects, and the cap is a consequence rather than a preference.
+    /// Each extra slot is another full-frame pass and another
+    /// working-resolution texture off §7's ceiling, and the second one
+    /// already costs freeze three slots of its window (§5.23). Three would
+    /// buy an effect nobody can read on top of two, for a third pass — and
+    /// a style catalogue is a look, not a modular synth.
+    public static let maxLayers = 2
+
+    /// Exactly `maxLayers` slots, always, in render order: slot 0 is applied
+    /// to the picture and slot 1 to slot 0's output. Fixed-length rather than
+    /// a growable list so a slot is a stable place a control can point at —
+    /// the alternative is a picker whose meaning moves when the slot above it
+    /// is cleared.
+    public var layers: [StyleLayer] = [StyleLayer(), StyleLayer()]
+
+    /// How much of the intensity range the microphone controls (§5.30).
+    /// Below 1 so a silent room still shows the effect — an audio-reactive
+    /// style that vanishes between sentences reads as a dropout, not as an
+    /// effect. One depth for the whole stack: the question is "how much does
+    /// my voice move the picture", and it has one answer (§8.7).
+    public var audioDepth: Double = 0.7    // 0…1
+
+    public init() {}
+
+    public enum CodingKeys: String, CodingKey {
+        case layers, audioDepth
+        /// The pre-stack shape. Still written, still read — see below.
+        case effect, intensity, audioReactive
+    }
+
+    /// **Decoder precedence: `layers` wins whenever the key is present at
+    /// all, even as an empty array; the flat `effect`/`intensity`/
+    /// `audioReactive` triple builds slot 0 only when it is absent.**
+    ///
+    /// This is the one decode in the app with two live shapes, because every
+    /// preset and every saved configuration in existence holds the flat one.
+    /// The rule has to be this way round: a file this build wrote carries
+    /// *both*, and its flat keys describe only the first of two effects — so
+    /// preferring them would silently drop the second effect every time a
+    /// preset went through its own decoder. Present-but-empty counting as
+    /// "the user cleared the stack" is why this uses `decodeIfPresent`
+    /// directly rather than `tolerant`, which cannot tell absent from empty.
+    ///
+    /// And the flat keys are still *written*, mirroring slot 0, so a preset
+    /// exported from this build still loads its primary effect in a build
+    /// that predates the stack. Shared presets are how a community forms
+    /// around this (§5.5); one that reads as blank in an older build is a
+    /// worse failure than one that arrives with an effect missing.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
         audioDepth = c.tolerant(.audioDepth, 0.7)
+        if let stacked = ((try? c.decodeIfPresent([StyleLayer].self, forKey: .layers)) ?? nil) {
+            layers = Self.padded(stacked)
+        } else {
+            // Slot 0 is built even when the effect decodes to Normal: the
+            // intensity beside it is the user's, and a preset that named an
+            // effect this build no longer has must not also lose the number.
+            layers = Self.padded([StyleLayer(effect: c.tolerant(.effect, .normal),
+                                             intensity: c.tolerant(.intensity, 1),
+                                             audioReactive: c.tolerant(.audioReactive, false))])
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(layers, forKey: .layers)
+        try c.encode(audioDepth, forKey: .audioDepth)
+        let primary = layers.first ?? StyleLayer()
+        try c.encode(primary.effect, forKey: .effect)
+        try c.encode(primary.intensity, forKey: .intensity)
+        try c.encode(primary.audioReactive, forKey: .audioReactive)
+    }
+
+    /// Truncates a longer stack (a future build's) and fills a shorter one,
+    /// so `layers` is always exactly `maxLayers` however it arrived.
+    private static func padded(_ decoded: [StyleLayer]) -> [StyleLayer] {
+        var result = Array(decoded.prefix(maxLayers))
+        while result.count < maxLayers { result.append(StyleLayer()) }
+        return result
+    }
+
+    // MARK: Slot 0, by its old names
+
+    /// Slot 0's effect. Kept as a property rather than a migration because
+    /// "the style" is still one answer everywhere a single look is meant —
+    /// the catalogue grid, the popover picker, `setStyleEffect`.
+    public var effect: StyleEffect {
+        get { layers.first?.effect ?? .normal }
+        set { mutate(slot: 0) { $0.effect = newValue } }
+    }
+
+    public var intensity: Double {
+        get { layers.first?.intensity ?? 1 }
+        set { mutate(slot: 0) { $0.intensity = newValue } }
+    }
+
+    public var audioReactive: Bool {
+        get { layers.first?.audioReactive ?? false }
+        set { mutate(slot: 0) { $0.audioReactive = newValue } }
+    }
+
+    public mutating func mutate(slot: Int, _ change: (inout StyleLayer) -> Void) {
+        guard slot >= 0, slot < Self.maxLayers else { return }
+        layers = Self.padded(layers)
+        change(&layers[slot])
+    }
+
+    public func layer(_ slot: Int) -> StyleLayer {
+        guard slot >= 0, slot < layers.count else { return StyleLayer() }
+        return layers[slot]
+    }
+
+    // MARK: What the stage actually runs
+
+    /// The passes the stage encodes, in order. Three admissions, all of them
+    /// documented in the model rather than in the stage so both surfaces can
+    /// describe the same picture:
+    ///
+    /// - Nothing picked, or picked at zero, is not a pass.
+    /// - Never more than `maxLayers`.
+    /// - **At most one motion effect.** There is one history texture, and two
+    ///   feedback loops sharing it would each be trailing the other's ghosts
+    ///   — a second one would need its own full-frame texture for an effect
+    ///   that reads as mud on top of the first. The earlier slot keeps it.
+    public var renderableLayers: [StyleLayer] {
+        var result: [StyleLayer] = []
+        var hasTemporal = false
+        for layer in layers.prefix(Self.maxLayers) where layer.isRenderable {
+            if layer.effect.isTemporal {
+                guard !hasTemporal else { continue }
+                hasTemporal = true
+            }
+            result.append(layer)
+        }
+        return result
+    }
+
+    /// Whether a motion effect may be chosen in `slot` — false when another
+    /// slot is already running one. The pickers read this so the choice that
+    /// cannot be honoured is never offered, rather than accepted and dropped.
+    public func acceptsTemporal(inSlot slot: Int) -> Bool {
+        !layers.enumerated().contains { index, layer in
+            index != slot && index < Self.maxLayers
+                && layer.isRenderable && layer.effect.isTemporal
+        }
     }
 
     public var clampedAudioDepth: Double { min(max(audioDepth, 0), 1) }
 
+    /// Any slot listening to the microphone. The one gate on the level meter
+    /// this stage needs armed, and on the depth control being shown at all.
+    public var isAudioReactive: Bool {
+        renderableLayers.contains { $0.audioReactive }
+    }
+
     /// "Normal" IS the unstyled picture, so every surface treats
     /// "Style = Normal" and "Style off" as the same state (see `isInert`) —
-    /// the LUT / Neutral rule applied to the second catalogue.
-    public var isNormal: Bool { effect == .normal }
+    /// the LUT / Neutral rule applied to the second catalogue. True only when
+    /// *no* slot has picked anything.
+    public var isNormal: Bool {
+        layers.allSatisfy { $0.effect == .normal }
+    }
+
+    /// Slots holding an effect, whatever its intensity. What the inert
+    /// caption counts, so "both effects are at 0" is only said when there
+    /// really are two.
+    public var chosenCount: Int {
+        layers.prefix(Self.maxLayers).filter { $0.effect != .normal }.count
+    }
 }
 
 // MARK: - Stage flags
@@ -707,7 +885,7 @@ public struct PipelineConfiguration: Codable, Equatable {
         case .overlay:
             return overlay.renderableLayers.isEmpty
         case .style:
-            return style.isNormal || style.intensity <= 0
+            return style.renderableLayers.isEmpty
         case .retouch:
             return retouch.isInert
         case .blur, .background, .gaze, .clip, .replay, .freeze,
@@ -737,9 +915,10 @@ public struct PipelineConfiguration: Codable, Equatable {
         case .overlay:
             return "On, but no layer has a file or any text."
         case .style:
-            return style.intensity <= 0
-                ? "On, but intensity is 0."
-                : "On, but Normal is the unstyled picture."
+            if style.isNormal { return "On, but Normal is the unstyled picture." }
+            return style.chosenCount > 1
+                ? "On, but both effects are at intensity 0."
+                : "On, but intensity is 0."
         case .retouch:
             return "On, but the amount is 0."
         default:

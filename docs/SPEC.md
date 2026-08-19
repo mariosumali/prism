@@ -396,7 +396,7 @@ Sampling is bilinear below 2× zoom and Lanczos at or above it. Zoom, pan, and r
 
 **Skin retouch** (`Retouch.metal`, `.expensive`) — an edge-preserving smooth over skin only, one knob, off by default. Specified in full at §5.22.
 
-**Style** (`Style.metal`, `.moderate`) — one preset visual effect over the finished, composed scene: pick an effect from a catalogue, one intensity slider, nothing else to configure. Each effect is its own single-pass compute kernel, selected by name (`prism_style_<case>`), so the catalogue grows by adding a kernel and an enum case. The catalogue is curated toward what plays on a live call — warps, glitches and motion trails, plus a few gadget-camera looks — not color filters. 23 effects in three groups:
+**Style** (`Style.metal`, `.moderate`) — preset visual effects over the finished, composed scene: pick an effect from a catalogue, one intensity slider, nothing else to configure. Two of them can stack (§5.29), and either can be driven by the microphone (§5.30); both are off by default, and everything below describes a single effect because that is still what "a style" means. Each effect is its own single-pass compute kernel, selected by name (`prism_style_<case>`), so the catalogue grows by adding a kernel and an enum case. The catalogue is curated toward what plays on a live call — warps, glitches and motion trails, plus a few gadget-camera looks — not color filters. 23 effects in three groups:
 
 | Distortions | Motion | Looks |
 |---|---|---|
@@ -406,7 +406,7 @@ Sampling is bilinear below 2× zoom and Lanczos at or above it. Zoom, pan, and r
 
 **Motion effects are the one stateful family.** They feed on their own output: the stage keeps a history texture holding the previous styled frame and blits each frame's result into it inside the same command buffer (one extra blit — no second command buffer, §3.3). The first frame after any seed loss outputs the source untouched and seeds the feedback. Ghosts recorded before a gap never replay: the history (texture included) is dropped on effect change, stage disable, zero intensity, and size change, and — because flag-based invalidation cannot see every gap class (degradation disables, app naps) — trails additionally age out across any encoding gap longer than half a second, measured on the frame path. Undefined history contents must never reach the picture — `hasHistory` gates every read.
 
-Style runs after Overlay and before Bad connection (§3.3): the effect applies to everything the user composed, and a simulated bad connection degrades the styled picture rather than being painted over by it.
+Style runs after Overlay and before Bad connection (§3.3): the effect applies to everything the user composed, and a simulated bad connection degrades the styled picture rather than being painted over by it. There is exactly one history texture, which is why exactly one motion effect may be in a stack (§5.29).
 
 Each stage is individually bypassable and individually pinnable (§3.4). Chain order is fixed as specified in §3.3.
 
@@ -863,7 +863,7 @@ Every elastic allocation in PRISM was sized against §7's 250 MB ceiling indepen
 | `tier` | `full` / `reduced` / `minimum` / `exceeded` |
 | `plannedMB` | the sum, against `ceilingMB` |
 
-**The order of service is fixed**, which is what makes the degradation predictable: freeze's floor, then the still ring if the user armed it, then whatever is left widening the freeze window back toward half a second. Nothing is decided by which feature asked first. ScreenCaptureKit's queue is not in that order at all — it joins the structural frames, because PRISM cannot make it smaller than three and planning the freeze window against memory that is already spent is not planning.
+**The order of service is fixed**, which is what makes the degradation predictable: freeze's floor, then the still ring if the user armed it, then whatever is left widening the freeze window back toward half a second. Nothing is decided by which feature asked first. ScreenCaptureKit's queue is not in that order at all — it joins the structural frames, because PRISM cannot make it smaller than three and planning the freeze window against memory that is already spent is not planning. Style's two working-resolution textures — the motion history and the stack scratch (§5.29) — join them too, and are counted whether or not the stage is on: costing them on demand would make the freeze window change length when the user picked Underwater, and a window that reaches back four tenths of a second on Tuesday and three on Wednesday is worse to reason about than one that is permanently two slots shorter.
 
 **Freeze's floor is the guarantee, and it is never spent.** §5.2 promises the sharpest frame of the recent past. A ring too shallow to hold a choice turns that into "the frame at the moment you pressed it", which §5.2 says freeze is not. So: **never fewer than six slots, and never less than 200 ms of wall time.** Six, because two slots are unavailable at any instant — the one being written and the one whose command buffer has not landed. 200 ms, because a blink closes the eyes for 100–150 ms and a window shorter than one has nothing sharper to offer. Where those two pull against each other — 200 ms of 60 fps is twelve slots — the ring **strides**: six slots recording every second frame still span 200 ms and still hold a choice, for half the memory. A coarser choice inside the window is a far cheaper loss than a window narrower than a blink.
 
@@ -873,7 +873,7 @@ Every elastic allocation in PRISM was sized against §7's 250 MB ceiling indepen
 
 **The policy is legible or it is a mystery.** The Diagnostics pane shows the planned figure against the ceiling, how far back freeze reaches in seconds and frames, and the sentence explaining why. A change to the plan is a §5.21 session event, for the same reason an auto-disabled effect is: the freeze window shortening is invisible until somebody freezes and finds the picture came from less history than they expected.
 
-**Vision consolidation.** `VisionCoordinator` decides which Vision request runs on each frame. At most one request per modality per frame and at most one modality per frame; each modality declares its own duty cycle; each consumer declares its own standing demand, evaluated per frame rather than cached. The pick is the modality furthest past its own cadence, ties to the earlier-declared one — which reproduces the previous hard-coded even/odd alternation exactly when only the person mask and the face are demanded, and shares the slip proportionally when a third modality is. Modalities are `face`, `person`, `hands`; `hands` has a case but no registration until the gesture recogniser arrives, and an unregistered modality never runs however loudly it is demanded.
+**Vision consolidation.** `VisionCoordinator` decides which Vision request runs on each frame. At most one request per modality per frame and at most one modality per frame; each modality declares its own duty cycle; each consumer declares its own standing demand, evaluated per frame rather than cached. The pick is the modality furthest past its own cadence, ties to the earlier-declared one — which reproduces the previous hard-coded even/odd alternation exactly when only the person mask and the face are demanded, and shares the slip proportionally when a third modality is. Modalities are `face` (cadence 2), `person` (2), `hands` (3, §5.31) and `presence` (15, §5.28), in that declaration order — which is also the tie-break order, and the reason a slower modality declared later cannot take frames off the eye-contact warp. An unregistered modality never runs however loudly it is demanded, which is the seam every new recogniser arrives through.
 
 ### 5.24 Screen or window as the source
 
@@ -1012,6 +1012,89 @@ The away loop (§5.10) without the keystroke: when nobody has been in frame for 
 **Disclosure, because this is the one thing in PRISM that acts without being asked each time.** Armed, both surfaces print what will happen and after how long. Fired, the menu bar takes its existing `.away` glyph (or the freeze bar), the notice row says which action ran and why, and a system notification goes out — the user is by definition not at the keyboard. Every one of those carries the same one-tap escape, and the escape is also the Away and Freeze tiles themselves: turning off by hand what presence turned on releases the mute that went with it, which a user who unfroze themselves and stayed silently muted would have no way to connect. Presence undoes only what it did — a freeze the user engaged first stays engaged, and a mute they set themselves survives them walking back into shot. And it fires once per departure, not once per absent observation, which is what makes the manual escape stick: nothing comes back on until the user has been seen in frame and left again.
 
 **The nudge is the one presence behaviour that changes nothing on air**, which is why it can be switched on by itself with the action left at nothing: "you left your camera on", said once, in Notification Centre.
+
+### 5.29 Stacking two style effects
+
+One effect was always the plan and it is one effect too few: the pairing people reach for is a distortion with a trail on top of it — Underwater with Afterimage, Twirl with Echo — and neither half is available as a single kernel. So `StyleSettings` holds **two slots** rather than one effect. Slot 0 is applied to the picture, slot 1 to slot 0's output, and every other detail follows from those two sentences.
+
+| Property | Specification |
+|---|---|
+| Slots | exactly 2, always present; `Normal` in a slot means it runs nothing |
+| Order | slot 0 then slot 1, over the same frame, in one command buffer |
+| Motion effects | **at most one across both slots** — the earlier slot keeps it |
+| Cost | a second full-frame pass, charged as such (§3.4) |
+| Memory | one extra working-resolution texture, always counted (§5.23) |
+
+**Two, and the cap is a consequence rather than a preference.** Each slot is another full-frame compute pass and another working-resolution texture off §7's ceiling; the second one already costs freeze roughly three slots of its window at 1080p. A third would buy an effect nobody can read on top of two, for a third pass. A style catalogue is a look, not a modular synth.
+
+**A stage may encode twice, and a private texture is what makes that legal.** The pipeline hands every stage exactly one input and one output, ping-ponged between the two shared intermediates, so a second pass has nowhere of its own to land — and reading a texture the same pass is writing is undefined however careful the kernel is. Style therefore owns a scratch texture: slot 0 writes into it, slot 1 reads it and writes the real output, and the picture the chain carries forward is `output` whichever slots were filled. Both passes ride the frame's single command buffer; the one-command-buffer rule is about frames, not passes.
+
+**One motion effect, because there is one history texture.** The motion family feeds on its own output (§5.4), and two feedback loops sharing a single frame of history would each be trailing the other's ghosts. A second history would be another full-frame texture for a combination that reads as mud. So the model admits the first motion effect and drops the second, both pickers stop offering motion effects once one is running, and the caption says which effect is holding the history. The blit that publishes the history is taken from **that pass's** destination rather than the stage's, so a motion effect in slot 0 trails its own picture rather than whatever slot 1 painted over it.
+
+**A stack is charged for two passes, not averaged into one number.** `stageWeights[.style]` stays the weight of one pass and the stage reports how many it ran; the attribution multiplies. Averaging the two configurations was the tempting version and it is wrong for both — it would make a single effect look 60% dearer than it is, which is the degradation engine's cue to turn it off first.
+
+**Every existing preset holds the old single-effect shape, and this is the hard part.** The persisted struct now has two live shapes: the flat `effect` / `intensity` / `audioReactive` triple, and the `layers` array. The rule is one sentence: **`layers` wins whenever the key is present at all, even as an empty array; the flat keys build slot 0 only when it is absent.** It has to be this way round because a file this build writes carries *both*, and its flat keys describe only the first of two effects — preferring them would silently drop the second effect every time a preset went through its own decoder. Present-but-empty is a cleared stack rather than a missing key, which is why this one field cannot use the tolerant helper: that helper cannot tell absent from empty. And the flat keys are still **written**, mirroring slot 0, so a preset exported from this build still loads its primary effect in a build that predates the stack — shared presets are how a community forms around this (§5.5), and one that reads as blank in an older build is a worse failure than one that arrives with an effect missing.
+
+**In the interface it is one menu, not a second catalogue.** The grid is how a look is browsed; the second slot is a modifier on a look already chosen, so it is a `Then also` menu that appears only once there is something to stack onto, with its own intensity beneath it. Both surfaces carry the menu; the intensity sliders live in the main window, exactly as the first slot's already does.
+
+### 5.30 Style that moves with your voice
+
+An effect that pulses when you speak, off by default. The microphone level PRISM already publishes for the meter (§5.17) drives the style intensity, so a Twirl breathes with a sentence instead of sitting at a constant.
+
+| Property | Specification |
+|---|---|
+| Source | `InputLevelMailbox` — the same lock-free scalar the meter reads |
+| Sampling | once per frame, on the frame queue: one acquire-load |
+| Envelope | attack 60 ms, release 350 ms, stepped on the frame clock |
+| Opt-in | **per slot** (§5.29); a stack can have one effect breathing over one that holds still |
+| Depth | **one** control for the whole stack, 0…1, default 0.7 |
+| Mapping | `intensity × (1 − depth + depth × envelope)` |
+| Default | off, and the depth below 1 so a silent room still shows the effect |
+
+**Neither thread waits for the other, and that is the whole data path.** The RT capture callback already publishes one packed word per 21 ms window through a release-store; the frame path takes one acquire-load of it. No queue, no callback, no allocation, nothing the audio thread can block on and nothing the frame queue can block on. The level arrives through a closure the stage samples, so the pipeline layer never learns that a capture session exists.
+
+**The envelope is the difference between an effect and a fault.** A raw RMS window lands about 47 times a second and jumps by half its range between two of them; driving a warp straight off it looks like a broken cable. Attack fast enough to arrive with the word, release slow enough to ride over the consonant gaps inside it — the asymmetry is the musicality, and it is the shape a compressor's envelope has for the same reason. One frame may only advance the envelope by 100 ms, so a nap does not put a full-strength pulse on the first frame back; a gap longer than half a second resets it outright, alongside the trail history it already resets.
+
+**Depth is one number because it is one question** (§8.7): "how much does my voice move the picture". It sits below 1 by default so silence dims the effect rather than removing it — an audio-reactive style that vanished between sentences would read as a dropout.
+
+**It is an audience for the level meter, and the only one with no surface on screen.** §5.17 arms the mailbox on demand: a preview showing the bar, or the muted-and-talking watch. An audio-reactive style joins that list, because an unarmed mailbox publishes nothing and a style set to pulse would simply hold still — which looks exactly like a broken effect. Turning the switch on arms it immediately rather than at the next reconciliation, since the whole visible consequence is that the picture starts moving.
+
+No kernel knows any of this exists: it is a multiply into `PRISMStyleParams.intensity` at encode time.
+
+### 5.31 Gesture triggers
+
+Hand poses as a second hotkey surface, for the moments when the keyboard is not where your hands are. **Ships off, and ships with nothing bound.**
+
+| Property | Specification |
+|---|---|
+| Detector | `VNDetectHumanHandPoseRequest`, up to two hands, on a 960×540 downsample |
+| Scheduling | a `VisionCoordinator` modality of its own at cadence 3 (§5.23) |
+| Demand | only while the switch is on **and** a pose is bound to something, **and** the camera is the source |
+| Poses | open palm, Victory, fist |
+| Actions | nothing / mute / freeze / still / replay / panic — **all `.none` by default** |
+| Confidence floor | 0.5–1, default **0.85** |
+| Dwell | 0.3–3 s, default **0.8 s**; panic never less than **1.5 s** |
+| Cooldown | 0.5–10 s, default **2 s** |
+| Debounce | one held pose is one action, until the pose is seen to end |
+
+**The whole feature lives or dies on false positives, and the failure is not symmetric.** A gesture that does not fire costs a raised hand and a second try. A gesture that fires by itself mutes a call nobody asked to mute. People talk with their hands: an open palm is what you make while explaining something, and a fist is what a hand resting on a mouse looks like from a webcam — both of those happen while the user is saying words they expect to be heard. So four independent rules have to agree before anything happens, and every one of them is asymmetric in the same direction as §5.28's hysteresis.
+
+- **The confidence floor** is high on purpose. Below it there is not a weak sighting of a pose; there is no observation, so it cannot accumulate a dwell however long the hand stays there, and one flaky reading mid-hold restarts the hold rather than being smoothed over.
+- **The dwell** is what talking hands cannot pass. Gesticulation is never still for eight tenths of a second; a hand raised to do something is.
+- **The debounce** makes one held pose one action. After firing, the recogniser latches until it has seen the pose actually end — a palm held for four seconds is one mute, not forty.
+- **The cooldown** is refractory across every pose, so a gesture cannot be followed instantly by another one, including the one that would undo it. That is how a flickering recogniser becomes a strobing mute.
+
+And the clock advances only on observations, capped at a quarter second each, for the reason §5.28's does: a gap in the stream is not evidence that a hand was held through it. Ten minutes between two sightings does not satisfy an eight-tenths-of-a-second hold.
+
+**Panic is bound to nothing, and it is guarded twice.** A hand is exactly what is free at the moment panic is wanted, so refusing to offer it would be its own kind of failure — but a camera that blanks itself because somebody gestured while talking is the worst thing this app could do. So: nothing is bound out of the box, which means the master switch alone cannot arm anything at all; and once somebody binds it deliberately, panic takes a hold of its own — 1.5 s, which the general dwell slider cannot lower, because 0.3 s is inside the range a hand passing the lens occupies. A second slider for panic's dwell was the alternative and is the wrong shape (§8.7): nobody has an opinion about it that is not already expressed by whether they bound it at all.
+
+**The pose classifier names three shapes and refuses everything else.** Each finger is read radially — the tip further from the wrist than its middle joint means extended, back inside it means folded — which is invariant to how the hand is rolled in frame, the one thing a webcam guarantees will vary. Between the two ratios a finger is not read at all, so a hand in transit cannot resolve into a pose on its way past, and a partly seen hand is not a pose at all: guessing the missing finger is exactly how a wave becomes a Victory. The thumb is deliberately ignored — it sits nearly as far from the wrist folded as extended, and none of the three poses needs it. Nil is by far the commonest answer and is the point: a classifier that always names its closest match turns every gesticulation into an input.
+
+**It runs against the camera frame, not the composed picture.** A virtual background erases the hand outright, a crop can put it outside the frame, and a freeze would hold a gesture on screen forever — so a recogniser reading the finished picture would fail exactly when the effects are on, which is when a keyboard-free control is most wanted. Same reason §5.28's detector reads `source`.
+
+**Cadence 3, and that number is the bargain with eye contact.** The `hands` modality has existed since §5.23's schedule replaced the two hard-coded parities, deliberately unregistered, with a test asserting that an unregistered modality never runs however loudly it is demanded — so this feature arrives as a registration and one demand closure rather than as a change to the schedule. Three rather than the face's two because a gesture is held for the better part of a second and only has to be *seen* several times, while the eye-contact warp is applied to every frame and slips visibly the moment its landmarks age. Even at one frame in five under full contention that is six sightings inside the shortest hold the settings allow.
+
+**Every gesture says so out loud.** A chord has a key under it and a tile has a click; a hand in the air has neither, so a gesture that acted silently would be indistinguishable from the app doing something by itself. Every firing names the pose and the action in the notice row and in the §5.21 session log, and the Gestures pane shows the last one.
 
 ---
 

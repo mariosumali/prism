@@ -175,6 +175,10 @@ public final class VideoPipeline {
     /// and demanding segmentation for it would pin the most expensive request
     /// in the pipeline on for a question that needs one bit a second.
     public let presenceDetector: PresenceDetector
+    /// What shape the hand is in (§5.31). Like presence, its own modality
+    /// rather than a reader of anything else, demanded only while gesture
+    /// triggers are switched on and bound to something.
+    public let handTracker: HandTracker
     /// Decides which of them runs this frame, and which frames a modality
     /// added later gets. One request per modality per frame, at most one
     /// modality per frame.
@@ -249,6 +253,10 @@ public final class VideoPipeline {
     /// picture. Set from AppState, read on the frame queue, exactly like
     /// `autoFrameNeedsMask` above.
     private var presenceWatching = false
+    /// §5.31 — gesture triggers are switched on, bound to something, and the
+    /// camera is the picture. Set from AppState, read on the frame queue,
+    /// exactly like `presenceWatching` above.
+    private var gestureWatching = false
     /// Whether this frame came from a camera at all. The no-camera heartbeat
     /// feeds the chain a flat dark texture (§5.2/§5.3), and a presence
     /// detector pointed at it would report an empty room every frame — which
@@ -293,11 +301,17 @@ public final class VideoPipeline {
     /// separable blur passes plus the composite, hence 12. Eye contact is a
     /// single full-frame warp on the GPU but drags a Vision landmark request
     /// behind it, and the degradation engine has to see that cost somewhere.
-    /// Overlay carries several layer kinds now, each its own full-frame pass.
-    /// Style can run a second pass when looks stack. Both are weighted for the
-    /// typical case rather than the worst one; a maximal scene under-reports
-    /// somewhat, which is the acceptable direction — the model is
-    /// proportional, not a measurement.
+    /// Overlay carries several layer kinds now, each its own full-frame pass,
+    /// and is weighted for the typical case rather than the worst one; a
+    /// maximal scene under-reports somewhat, which is the acceptable
+    /// direction — the model is proportional, not a measurement.
+    ///
+    /// Style's 5 is the weight of ONE pass, and it stays one pass because the
+    /// stage reports how many it ran (§5.29): a stacked pair multiplies this
+    /// by two rather than averaging the two configurations into a number that
+    /// is wrong for both. Averaging was the tempting version, and it would
+    /// have made a single effect look 60% dearer than it is — which is the
+    /// degradation engine's cue to turn it off first.
     ///
     /// Retouch's 9 was 5 while the stage was a registered skeleton, which was
     /// a guess. Measured at 1080p it costs 0.64 ms at the default amount and
@@ -358,6 +372,7 @@ public final class VideoPipeline {
         segmenter = try PersonSegmenter(metal: metal)
         faceTracker = try FaceTracker(metal: metal)
         presenceDetector = try PresenceDetector(metal: metal)
+        handTracker = try HandTracker(metal: metal)
         replayBuffer = try ReplayBuffer(metal: metal)
         replayPlayer = ReplayPlayer(metal: metal, buffer: replayBuffer)
         liveFeeds = LiveFeeds(metal: metal)
@@ -405,6 +420,13 @@ public final class VideoPipeline {
         // enters, which is the point of giving it a cadence of its own rather
         // than letting it compete for the frames eye contact needs.
         vision.register(.presence, cadence: 15)
+        // §5.31. Three rather than the face's two: a gesture is held for the
+        // better part of a second and only has to be seen several times,
+        // while the eye-contact warp is applied every frame and slips
+        // visibly the moment its landmarks age. Even at one frame in five
+        // under full contention this produces six sightings inside the
+        // shortest hold the settings allow.
+        vision.register(.hands, cadence: 3)
         let gaze = gazeStage, overlay = overlayStage
         let blur = blurStage, background = backgroundStage
         vision.addConsumer(of: .face) { gaze.wantsEncode() }
@@ -426,6 +448,13 @@ public final class VideoPipeline {
         vision.addConsumer(of: .presence) { [weak self] in
             guard let self else { return false }
             return self.presenceWatching && self.frameHasCamera
+        }
+        // §5.31: the same shape, and for the same second reason — a hand
+        // cannot be in the flat dark texture the no-camera heartbeat feeds
+        // the chain, so asking is spending a slot on a certainty.
+        vision.addConsumer(of: .hands) { [weak self] in
+            guard let self else { return false }
+            return self.gestureWatching && self.frameHasCamera
         }
 
         configure(outputFormat: initialFormat)
@@ -642,6 +671,14 @@ public final class VideoPipeline {
         presenceWatching = watching
     }
 
+    /// §5.31 — arms or disarms the hand-pose recogniser, for exactly the
+    /// reasons `setPresenceWatching` is separate from `apply`: it is
+    /// behaviour rather than a look, and it is the whole demand gate for a
+    /// Vision request, so a preset switch must never be able to start one.
+    public func setGestureWatching(_ watching: Bool) {
+        gestureWatching = watching
+    }
+
     /// §5.24 — a screen capture session is running (as the source, or behind
     /// a picture-in-picture layer). Separate from `apply` because it is not a
     /// look: it is a capture session whose frame queue is a real allocation,
@@ -817,6 +854,11 @@ public final class VideoPipeline {
         // working-resolution intermediates; `current` is never the same
         // texture as the destination by construction.
         var encoded: [StageID] = []
+        // Parallel to `encoded`: the table weight scaled by what the stage
+        // actually ran this frame. Collected here rather than looked up in
+        // the completed handler because a stage's pass count is a property of
+        // the frame, and by then the next one may have changed it.
+        var encodedWeights: [Double] = []
         var current = source
         var useA = true
         var segmentationDone = false
@@ -839,6 +881,21 @@ public final class VideoPipeline {
         } else if visionDecision.ended.contains(.presence) {
             presenceDetector.isDemanded = false
             presenceDetector.invalidate()
+        }
+        // §5.31 runs against `source` for the same reason, and one more: the
+        // hand has to be found in the picture the user is actually waving at,
+        // not in the one the chain produced. A virtual background erases the
+        // hand outright, a crop can put it outside the frame, and a freeze
+        // would hold a gesture on screen forever — so a recogniser reading
+        // the composed picture would fail exactly when the effects are on,
+        // which is when a keyboard-free control is most wanted.
+        if visionDecision.demanded.contains(.hands) {
+            handTracker.isDemanded = true
+            handTracker.update(commandBuffer: commandBuffer, input: source,
+                               capture: visionDecision.running == .hands)
+        } else if visionDecision.ended.contains(.hands) {
+            handTracker.isDemanded = false
+            handTracker.invalidate()
         }
         // The face is measured pre-Geometry and the layers land post-Geometry,
         // so the overlay stage needs this frame's crop to put a prop back on
@@ -900,6 +957,8 @@ public final class VideoPipeline {
             current = dst
             useA.toggle()
             encoded.append(stage.id)
+            encodedWeights.append((Self.stageWeights[stage.id] ?? 1)
+                                  * max(1, stage.weightMultiplier))
         }
 
         // Output buffer at the negotiated format.
@@ -945,6 +1004,7 @@ public final class VideoPipeline {
             try outputFitStage.encode(commandBuffer: commandBuffer, input: current, output: outTexture)
         }
         encoded.append(.outputFit)
+        encodedWeights.append(Self.stageWeights[.outputFit] ?? 1)
 
         // §5.16: the still ring takes a reference to the finished frame — no
         // copy, no extra pass — and one threadgroup scores it. The slot is
@@ -975,7 +1035,8 @@ public final class VideoPipeline {
                 self.stillRing.publish(slot: stillSlot)
             }
             let gpuMs = max(0, (finished.gpuEndTime - finished.gpuStartTime) * 1000)
-            let stageMs = Self.attribute(totalGpuMs: gpuMs, to: encoded)
+            let stageMs = Self.attribute(totalGpuMs: gpuMs, to: encoded,
+                                         weights: encodedWeights)
             self.stateLock.lock()
             self.lastOutput = (outBuffer, outTexture)
             self.lastOutputHostSeconds = CACurrentMediaTime()
@@ -1138,9 +1199,11 @@ public final class VideoPipeline {
         return status == kCVReturnSuccess ? pool : nil
     }
 
-    private static func attribute(totalGpuMs: Double, to encoded: [StageID]) -> [StageID: Double] {
-        guard !encoded.isEmpty else { return [:] }
-        let weights = encoded.map { stageWeights[$0] ?? 1 }
+    /// Internal rather than private so ChainRegistrationTests can prove a
+    /// stage that ran two passes is charged for two.
+    static func attribute(totalGpuMs: Double, to encoded: [StageID],
+                          weights: [Double]) -> [StageID: Double] {
+        guard !encoded.isEmpty, weights.count == encoded.count else { return [:] }
         let sum = weights.reduce(0, +)
         guard sum > 0 else { return [:] }
         var result: [StageID: Double] = [:]

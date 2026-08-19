@@ -10,7 +10,18 @@ in the repo — read them before writing code:
 - `PRISM/Pipeline/EffectStage.swift` — `StageID`, `StageCost`, `LatencyPolicy`,
   `EffectStage`, `LatencyReport`, `PipelineError`
 - `PRISM/Pipeline/StageSettings.swift` — per-stage Codable settings,
-  `PipelineConfiguration`, `Preset`, `HotkeyCombo`
+  `PipelineConfiguration`, `Preset`, `HotkeyCombo`. Includes `StyleLayer` and
+  `StyleSettings`, the one persisted struct with **two live shapes** (§5.29):
+  `layers` wins whenever the key is present at all, even as an empty array,
+  and the flat `effect` / `intensity` / `audioReactive` triple builds slot 0
+  only when it is absent — and is still *written*, mirroring slot 0, so a
+  preset exported here still loads its primary effect in a build that
+  predates the stack. `renderableLayers` is what the stage runs: no `Normal`,
+  no zero intensity, at most two, at most one motion effect
+- `PRISM/Pipeline/Settings/GestureSettings.swift` — `HandPose`,
+  `GestureAction`, `GestureBinding`, `GestureSettings` (§5.31); `isActive` is
+  the demand gate for the recogniser, and `dwellSeconds(for:)` floors panic
+  at 1.5 s whatever the hold slider says
 - `PRISM/AppStateTypes.swift` — `CameraDeviceInfo`, `AudioDeviceInfo`,
   `CameraClient`, `MenuBarState`, `PermissionState`, `ExtensionStatus`,
   `SetupStatus`, `WarningMessage`, `NoticeMessage`,
@@ -190,6 +201,13 @@ public final class VideoPipeline {
     static let substitutingStages: Set<StageID>
     /// §5.24 — an SCStream is running, so §5.23 charges its queue.
     public func setScreenSourceActive(_ active: Bool)
+    /// §5.31 — the gesture recogniser's demand gate, separate from `apply`
+    /// for the reason `setPresenceWatching` is: a preset switch must never
+    /// be able to start a Vision request.
+    public func setGestureWatching(_ watching: Bool)
+    /// §5.31 — what shape the hand is in. Like presence, run against
+    /// `source` rather than at a position in the chain.
+    public let handTracker: HandTracker
 
     /// Post-effects output: IOSurface-backed buffer ready for the sink,
     /// plus the final texture for the preview. Called on the capture queue.
@@ -251,6 +269,23 @@ sampling. Simpler alternative (acceptable): encode one command buffer but
 also read `MTLCommandBufferDescriptor`-less per-encoder timing is
 unavailable, so keep the proportional model. Keep it deterministic and
 documented in code.
+
+The weight a stage contributes is `stageWeights[id] × stage.weightMultiplier`,
+collected as the chain is walked rather than looked up afterwards — a pass
+count is a property of the frame, and by the completed handler the next frame
+may have changed it. `weightMultiplier` defaults to 1 for every stage whose
+pass count is fixed; Style returns its live pass count (§5.29), so a stacked
+pair is charged for two passes rather than averaged into a number that is
+wrong for both configurations.
+
+```swift
+public protocol EffectStage: AnyObject {
+    // …
+    var weightMultiplier: Double { get }        // default 1; read after encode()
+}
+static func attribute(totalGpuMs: Double, to encoded: [StageID],
+                      weights: [Double]) -> [StageID: Double]
+```
 
 ### FrameRing (`PRISM/Pipeline/FrameRing.swift`)
 
@@ -331,6 +366,13 @@ joins the *structural* frames rather than the order of service: PRISM cannot
 make ScreenCaptureKit's queue smaller, so it is spent before anything elastic
 is handed out.
 
+`styleFrames` (2) joins them too — StyleStage's motion history and its stack
+scratch (§5.29) — and is counted whether or not the stage is on. Costing them
+on demand would make the freeze window change length when the user picked an
+effect, and a window that reaches back four tenths of a second on Tuesday and
+three on Wednesday is worse to reason about than one permanently two slots
+shorter.
+
 ### VisionCoordinator (`PRISM/Pipeline/VisionCoordinator.swift`)
 
 Decides which Vision request runs on this frame (§5.23). Frame-queue-confined,
@@ -351,8 +393,9 @@ public final class VisionCoordinator {
     }
 
     public init()
-    /// Registering is what makes a modality eligible; `hands` has a case and
-    /// no registration until the gesture recogniser arrives.
+    /// Registering is what makes a modality eligible; an unregistered one is
+    /// inert however loudly it is demanded, which is the seam a new
+    /// recogniser arrives through.
     public func register(_ modality: Modality, cadence: Int)
     /// Evaluated once per frame — never cached, because a stage's enabled
     /// flag has six writers.
@@ -370,11 +413,13 @@ alternation exactly, which is what keeps eye contact's smoothing unchanged.
 decision and run their per-frame work regardless — the smoothing has to
 resolve at frame rate, not at detection rate.
 
-Registered cadences: `face` 2, `person` 2, `presence` 15. `hands` has a case
-and no registration until the gesture recogniser arrives. Presence is declared
-last and cadenced slowest on purpose (§5.28) — it loses every tie it enters
-and still runs about once a second, against a threshold measured in seconds,
-so it cannot take frames off the eye-contact warp.
+Registered cadences: `face` 2, `person` 2, `hands` 3 (§5.31), `presence` 15.
+Presence is declared last and cadenced slowest on purpose (§5.28) — it loses
+every tie it enters and still runs about once a second, against a threshold
+measured in seconds, so it cannot take frames off the eye-contact warp. Hands
+sit between: a gesture is held for the better part of a second and only has to
+be seen several times, and even at one frame in five under full contention
+that is six sightings inside the shortest hold §5.31 allows.
 
 ### PresenceDetector (`PRISM/Pipeline/Stages/PresenceDetector.swift`)
 
@@ -413,6 +458,86 @@ public final class PresenceDetector {
 because the answer is a box area compared against a few percent. Largest
 observation wins, as it does for faces. A request that threw publishes
 nothing: a failure cannot support the claim that the room is empty.
+
+### HandTracker (`PRISM/Pipeline/Stages/HandTracker.swift`)
+
+What shape the hand is in (§5.31). Same shape and threading as
+PresenceDetector: `update` on the frame queue, Vision on a private serial
+queue, two rotating downsample slots. Runs against the pipeline's `source`
+texture — a virtual background erases the hand, a crop can put it outside the
+frame, and a freeze would hold a gesture on screen forever.
+
+```swift
+public final class HandTracker {
+    public struct Sample: Equatable {
+        public var pose: HandPose?         // nil = ran, recognised nothing
+        public var confidence: Double      // weakest required landmark's
+        public var date: Date
+        public var sequence: UInt64        // consumers must not integrate one twice
+    }
+    public var isDemanded: Bool
+    public var onSample: ((Sample) -> Void)?               // Vision queue
+    public var latestSample: Sample? { get }               // thread-safe
+    public init(metal: MetalContext) throws
+    public func update(commandBuffer: MTLCommandBuffer, input: MTLTexture,
+                       capture: Bool)
+    public func invalidate()                               // demand went to zero
+    static let minimumJointConfidence: Float = 0.5
+    static func bestPose(in: [VNHumanHandPoseObservation]) -> (HandPose?, Double)
+}
+```
+
+`VNDetectHumanHandPoseRequest`, `maximumHandCount = 2`, capped at 960×540 —
+more lines than presence's 640×360 because this has to separate a ring finger
+from a little finger. Nine landmarks are required (wrist plus tip and PIP of
+four fingers) and the reading's confidence is the WEAKEST of them: averaging
+lets three clean fingers carry one invented one over the floor. Most confident
+recognised pose wins across hands — the one held up deliberately is the one
+Vision is sure about; the one holding a coffee is not. A request that threw
+publishes nothing: ending a dwell on the strength of a failure is not an
+observation.
+
+### GestureWatch (`PRISM/Pipeline/GestureWatch.swift`)
+
+The §5.31 pose geometry and the four false-positive rules, as pure logic — no
+Vision, no frame path, no AppState. The joints arrive as plain points because
+`VNRecognizedPoint` cannot be constructed outside the framework, which is what
+makes the classifier testable.
+
+```swift
+public enum HandJoint: String, CaseIterable, Hashable {
+    case wrist
+    case indexTip, indexPIP, middleTip, middlePIP
+    case ringTip, ringPIP, littleTip, littlePIP
+}
+
+public enum HandPoseClassifier {
+    /// nil for everything that is not one of the three poses — which is most
+    /// of the time, and is the point.
+    public static func classify(joints: [HandJoint: CGPoint]) -> HandPose?
+    static let extensionRatio: CGFloat = 1.15   // tip past PIP, measured from the wrist
+    static let foldRatio: CGFloat = 0.95        // tip inside PIP; between the two, unread
+}
+
+public final class GestureWatch {
+    public private(set) var holding: HandPose?
+    /// Feeds ONE real observation. "The request did not run this frame" is
+    /// not a sighting of an empty desk and must not be passed as one.
+    @discardableResult
+    public func observe(pose: HandPose?, confidence: Double,
+                        settings: GestureSettings, at now: Date) -> HandPose?
+    public func reset()
+    static let maximumStepSeconds: Double = 0.25
+}
+```
+
+Order inside `observe`: below `clampedConfidence` is no observation at all;
+anything that is not the latched pose releases the debounce latch; a changed
+or absent pose zeroes the dwell rather than decaying it; the cooldown is
+checked BEFORE the dwell, so a pose held straight through it does not fire the
+instant it lapses; then `settings.dwellSeconds(for:)`, which floors panic at
+1.5 s whatever the slider says. Radial finger test, so the poses survive any
+roll; a partly seen hand is not a pose.
 
 ### PresenceWatcher (`PRISM/Pipeline/PresenceWatcher.swift`)
 
@@ -1203,18 +1328,37 @@ public final class BlurStage: EffectStage {        // id .blur, cost .expensive
     public var maskOnlyMode: Bool { get set }
 }
 public final class StyleStage: EffectStage {       // id .style, cost .moderate
-    /// Setting a new effect compiles (and caches) its pipeline off the
-    /// frame path; declines to encode at Normal or zero intensity. Motion
-    /// effects (StyleEffect.isTemporal) feed on a stage-owned history
-    /// texture (previous styled output, refreshed by a dst → history blit
-    /// in the same command buffer). Stale ghosts never replay: history is
-    /// dropped (texture released) on effect change, disable, zero
-    /// intensity, and size change, and ages out across any encoding gap
-    /// > 0.5s. Pipeline/texture-layout/history change together under one
-    /// lock — encode() snapshots them once and re-validates before
-    /// publishing history, so a mid-encode switch can never pair one
-    /// effect's kernel with another's texture bindings.
+    /// Setting new settings rebuilds the pass plan off the frame path
+    /// (MetalContext caches compiled pipelines); declines to encode when no
+    /// slot is renderable. UP TO TWO PASSES (§5.29): slot 0 into a
+    /// stage-private scratch, slot 1 into `output`, both on the frame's one
+    /// command buffer. Motion effects (StyleEffect.isTemporal) feed on a
+    /// stage-owned history texture, refreshed by a blit from THAT pass's
+    /// destination — there is one history, hence at most one motion effect
+    /// in a stack. Stale ghosts never replay: history is dropped (texture
+    /// released) whenever the set of effects being run changes, on disable
+    /// and size change, and ages out across any encoding gap > 0.5s — the
+    /// same gap that resets the level envelope. Plan, depth, history and
+    /// scratch change together under one lock; encode() snapshots them once
+    /// and re-validates before publishing history, so a mid-encode switch
+    /// can never pair one effect's kernel with another's texture bindings.
     public var settings: StyleSettings { get set }
+    /// §5.30 — normalised 0…1 microphone loudness, sampled ONCE PER FRAME
+    /// ON THE FRAME QUEUE. Whatever is installed must not block, allocate or
+    /// take a lock the audio thread holds; the shipped one is a single
+    /// acquire-load out of InputLevelMailbox. nil reads as silence.
+    public var audioLevelSource: (() -> Double)?
+    /// 1 or 2 — the live pass count (§3.4).
+    public var weightMultiplier: Double { get }
+}
+/// §5.30's attack/decay follower, pure so it can be tested without a
+/// microphone. Attack 60 ms, release 350 ms, one frame may advance it by at
+/// most 100 ms so a nap cannot saturate it.
+public struct StyleLevelEnvelope: Equatable {
+    public private(set) var value: Double         // 0…1
+    @discardableResult
+    public mutating func step(level: Double, elapsed: Double) -> Double
+    public mutating func reset()
 }
 public final class ConnectionStage: EffectStage {  // id .connection, cost .cheap
     public var settings: ConnectionSettings        // pushed by applyStudio
@@ -1557,6 +1701,10 @@ public final class AppState: ObservableObject {
     /// §5.28 — presence automation put something on air and is holding it
     /// there. The bit every surface needs: the user pressed nothing for this.
     @Published public private(set) var presenceEngaged: Bool
+    /// §5.31 — the last gesture that fired, so a surface can say what PRISM
+    /// saw. A gesture that acts without saying so is indistinguishable from
+    /// a misfire, and gestures misfire.
+    @Published public private(set) var lastGesture: GestureEvent?
     // Clip
     @Published public var clipState: ClipState
     @Published public var clipDuration: Double
@@ -1666,6 +1814,18 @@ public final class AppState: ObservableObject {
     /// detector agrees the user is back yet, and never touches a freeze or a
     /// mute the user engaged themselves.
     public func comeBack()
+    // Gesture triggers (§5.31). Watching is gated on the switch being on AND
+    // a pose being bound to something AND the camera being the source — the
+    // same shape as presence, and likewise the whole demand for a Vision
+    // request. Every firing is announced: a hand in the air has no click.
+    public func setGesturesEnabled(_ enabled: Bool)
+    /// Binding a pose enables it; binding it to `.none` disables it. Any
+    /// other pairing leaves a row whose switch and menu disagree.
+    public func setGestureAction(_ action: GestureAction, for pose: HandPose)
+    public func setGestureBindingEnabled(_ enabled: Bool, for pose: HandPose)
+    public func setGestureHoldSeconds(_ seconds: Double)
+    public func setGestureCooldownSeconds(_ seconds: Double)
+    public func setGestureConfidence(_ confidence: Double)
     // Lag switch (§5.12)
     public func engageLag()
     public func releaseLag()
@@ -1699,7 +1859,17 @@ public final class AppState: ObservableObject {
     public func clearAllBlocks()                           // the escape hatch
     public func isStreamingNow(_ signingID: String) -> Bool
     public func importLUT(from url: URL)
-    public func setStyleEffect(_ effect: StyleEffect)      // .normal = same intent as off
+    // Style (§5.4, §5.29, §5.30). Slot 0 is "the style"; slot 1 stacks over
+    // it. Enablement follows the whole stack, not the slot just edited —
+    // clearing the first of two effects is not "switch Style off".
+    public func setStyleEffect(_ effect: StyleEffect)      // slot 0; .normal = same intent as off
+    public func setStyleEffect(_ effect: StyleEffect, inSlot slot: Int)
+    public func setStyleIntensity(_ intensity: Double, inSlot slot: Int)
+    /// Arms the level mailbox on the spot rather than at the next 1 Hz
+    /// reconciliation: the whole visible consequence of this switch is that
+    /// the picture starts moving.
+    public func setStyleAudioReactive(_ reactive: Bool, inSlot slot: Int)
+    public func setStyleAudioDepth(_ depth: Double)        // one depth for the stack
     public func raiseBudgetOneStep()                       // policy pressure action
     public func toggleSection(_ s: PopoverSection)
     // Capture (§5.15, §5.16)

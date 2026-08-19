@@ -24,7 +24,7 @@ struct EffectsSection: View {
                 effectRow(.lut, title: "LUT") {
                     lutPicker
                 }
-                effectRow(.style, title: "Style") {
+                effectRow(.style, title: "Style", extra: { secondStylePicker }) {
                     stylePicker
                 }
                 effectRow(.blur, title: "Blur") {
@@ -50,9 +50,10 @@ struct EffectsSection: View {
     }
 
     @ViewBuilder
-    private func effectRow<Accessory: View>(
+    private func effectRow<Accessory: View, Extra: View>(
         _ id: StageID,
         title: String,
+        @ViewBuilder extra: () -> Extra = { EmptyView() },
         @ViewBuilder accessory: () -> Accessory
     ) -> some View {
         let status = state.stageStatus[id] ?? StageStatus()
@@ -77,6 +78,7 @@ struct EffectsSection: View {
                         .frame(width: 44, alignment: .trailing)
                 }
             }
+            extra()
             if status.autoDisabled {
                 Text("Off to keep video smooth")
                     .font(.caption2)
@@ -108,7 +110,7 @@ struct EffectsSection: View {
                 Button("Set adjustments…") { state.showMainWindow() }
                     .buttonStyle(.link)
                     .font(.caption2)
-            } else if id == .style, state.editingConfig.style.intensity <= 0 {
+            } else if id == .style, !state.editingConfig.style.isNormal {
                 Button("Set intensity…") { state.showMainWindow() }
                     .buttonStyle(.link)
                     .font(.caption2)
@@ -134,16 +136,45 @@ struct EffectsSection: View {
     }
 
     private var stylePicker: some View {
-        Picker("Style", selection: styleEffectBinding) {
+        styleMenu(slot: 0, label: "Style")
+    }
+
+    /// The second slot (§5.29), on its own line under the row rather than
+    /// beside the first: two menus and a switch on one line is where a
+    /// popover starts wrapping, and the second effect is a modifier on the
+    /// first rather than a peer of it. Hidden until there is something to
+    /// stack onto, exactly as it is in the main window — the two surfaces
+    /// have to be answering the same question with the same controls, even
+    /// when only one of them holds the intensity sliders.
+    @ViewBuilder
+    private var secondStylePicker: some View {
+        if state.editingConfig.style.layer(0).effect != .normal {
+            HStack(spacing: Metrics.itemGap) {
+                Text("Then also")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+                styleMenu(slot: 1, label: "Second effect")
+            }
+        }
+    }
+
+    private func styleMenu(slot: Int, label: String) -> some View {
+        let style = state.editingConfig.style
+        return Picker(label, selection: styleEffectBinding(slot)) {
             Text(StyleEffect.normal.displayName).tag(StyleEffect.normal)
             Section("Distortions") {
                 ForEach(StyleEffect.distortions) { effect in
                     Text(effect.displayName).tag(effect)
                 }
             }
-            Section("Motion") {
-                ForEach(StyleEffect.motion) { effect in
-                    Text(effect.displayName).tag(effect)
+            // One history texture, one motion effect: the choice that cannot
+            // be honoured is not offered (§5.29).
+            if style.acceptsTemporal(inSlot: slot) {
+                Section("Motion") {
+                    ForEach(StyleEffect.motion) { effect in
+                        Text(effect.displayName).tag(effect)
+                    }
                 }
             }
             Section("Looks") {
@@ -156,7 +187,7 @@ struct EffectsSection: View {
         .labelsHidden()
         .controlSize(.small)
         .fixedSize()
-        .accessibilityLabel("Style")
+        .accessibilityLabel(label)
     }
 
     private var blurQualityPicker: some View {
@@ -206,10 +237,10 @@ struct EffectsSection: View {
             set: { name in state.setLUTName(name) })
     }
 
-    private var styleEffectBinding: Binding<StyleEffect> {
+    private func styleEffectBinding(_ slot: Int) -> Binding<StyleEffect> {
         Binding(
-            get: { state.editingConfig.style.effect },
-            set: { state.setStyleEffect($0) })
+            get: { state.editingConfig.style.layer(slot).effect },
+            set: { state.setStyleEffect($0, inSlot: slot) })
     }
 
     private var blurQualityBinding: Binding<BlurQuality> {
