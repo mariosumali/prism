@@ -2,8 +2,9 @@
 // PRISM
 //
 // Preview-only render of a pending (draft) configuration. While the main
-// window stages edits, this runs its own copies of the user stages
-// (Geometry → Adjust → LUT → Blur, then output fit) over the same camera
+// window stages edits, this runs its own copies of every user stage in the
+// §3.3 order (Eye contact → Geometry → Skin retouch → Adjust → LUT → Blur →
+// Virtual background → Overlay → Style, then output fit) over the same camera
 // frames the live pipeline gets — so the user previews the draft while
 // every client app keeps seeing the applied look. Deliberately not a
 // VideoPipeline: no FrameRing, no sharpness scoring, no output pool, no

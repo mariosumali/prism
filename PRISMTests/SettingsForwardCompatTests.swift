@@ -32,6 +32,11 @@ final class SettingsForwardCompatTests: XCTestCase {
     /// `flags`: JSONEncoder writes a dictionary whose key is neither String
     /// nor Int as a flat alternating array, and StageID is a String *enum*,
     /// not a String — so this is an array, and it has to stay one.
+    ///
+    /// It names eight stages, because that build's `StageID` had eight it
+    /// could switch. Anything this programme added is absent here on purpose:
+    /// a name that build could not write is a name no file on disk carries,
+    /// and pencilling one in would make this fixture a capture of ourselves.
     private let configFixture = #"""
     {
       "adjust" : {
@@ -52,7 +57,6 @@ final class SettingsForwardCompatTests: XCTestCase {
       "blur" : { "quality" : "balanced", "radius" : 18 },
       "flags" : [
         "background", { "enabled" : false, "pinned" : false },
-        "retouch", { "enabled" : false, "pinned" : false },
         "blur", { "enabled" : false, "pinned" : false },
         "adjust", { "enabled" : false, "pinned" : false },
         "overlay", { "enabled" : false, "pinned" : false },
@@ -269,6 +273,13 @@ final class SettingsForwardCompatTests: XCTestCase {
         XCTAssertEqual(config.retouch.amount, 0)
         XCTAssertEqual(config.retouch.detail, 0.55)
 
+        // A stage the old table could not name arrives absent, not off-by-
+        // accident: every reader goes through `flags(for:)`, which reads an
+        // absent stage as switched off, so the ninth switch means exactly
+        // what it should on a file written before it existed.
+        XCTAssertNil(config.flags[.retouch])
+        XCTAssertEqual(config.flags(for: .retouch), StageFlags())
+
         XCTAssertFalse(config.style.audioReactive)
         XCTAssertEqual(config.style.audioDepth, 0.7)
 
@@ -289,7 +300,55 @@ final class SettingsForwardCompatTests: XCTestCase {
             OverlayLayer(id: UUID(uuidString: "11111111-2222-3333-4444-555555555555")!,
                          name: "Hat", assetPath: "/tmp/hat.png"),
         ]
+        // The one honest difference: that build's table had eight stages, so
+        // the file has eight and today's default table has nine. The gap is
+        // the assertion, not a mismatch to paper over — an absent stage reads
+        // as off, and the alternative was editing the fixture to claim the
+        // old build wrote a stage name it had no case for.
+        expected.flags[.retouch] = nil
         XCTAssertEqual(try decode(PipelineConfiguration.self, configFixture), expected)
+    }
+
+    /// The suite is only evidence while its fixtures are captures rather than
+    /// constructions, and the cheapest way to lose that is to pencil a new
+    /// stage into an old `flags` array so an equality assertion goes green.
+    /// This walks the fixtures as raw JSON and refuses any stage name the
+    /// pre-programme build had no case for — the edit the header forbids,
+    /// caught as a failure instead of as a review comment.
+    func testFixturesNameOnlyStagesThePreFoundationBuildCouldWrite() throws {
+        for (label, json) in [("configuration", configFixture),
+                              ("edited configuration", editedConfigFixture),
+                              ("preset", presetFixture)] {
+            let root = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any],
+                "\(label): fixture is not a JSON object")
+            // The preset fixture wraps its configuration; the others are one.
+            let configuration = (root["configuration"] as? [String: Any]) ?? root
+            XCTAssertNil(configuration["stageFlags"],
+                         "\(label): stageFlags is this build's shape, not that one's")
+            let array = try XCTUnwrap(configuration["flags"] as? [Any],
+                                      "\(label): flags is a flat alternating array")
+            for name in array.compactMap({ $0 as? String }) {
+                XCTAssertNotNil(PreFoundationStageID(rawValue: name),
+                                "\(label): '\(name)' is a stage that build could not name")
+            }
+        }
+    }
+
+    /// And the two all-defaults fixtures carry that build's whole table, so
+    /// the decode they pin is a full one rather than a lucky subset.
+    func testDefaultFixturesCarryThePreFoundationTableWhole() throws {
+        for (label, json) in [("configuration", configFixture),
+                              ("preset", presetFixture)] {
+            let root = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+            let configuration = (root["configuration"] as? [String: Any]) ?? root
+            let array = try XCTUnwrap(configuration["flags"] as? [Any])
+            let names = Set(array.compactMap { $0 as? String })
+            XCTAssertEqual(names,
+                           Set(PipelineConfiguration.legacyFlagStages.map(\.rawValue)),
+                           "\(label): the old default table was these stages exactly")
+        }
     }
 
     // MARK: - StudioSettings
@@ -465,7 +524,6 @@ final class SettingsForwardCompatTests: XCTestCase {
         "blur" : { "quality" : "balanced", "radius" : 18 },
         "flags" : [
           "geometry", { "enabled" : false, "pinned" : false },
-          "retouch", { "enabled" : false, "pinned" : false },
           "adjust", { "enabled" : false, "pinned" : false },
           "lut", { "enabled" : true, "pinned" : false },
           "gaze", { "enabled" : false, "pinned" : false },

@@ -38,27 +38,46 @@ Replace `horse.prism` with your own reverse-DNS prefix and `TEAMID` with your Ap
 
 ```
 PRISM/
-├── PRISM.xcodeproj
+├── PRISM.xcodeproj                 # generated; project.yml is the source
+├── project.yml                     # XcodeGen: targets, sources, entitlements
 ├── PRISM/                          # Menu bar agent
 │   ├── PRISMApp.swift              # @main, MenuBarExtra
 │   ├── AppState.swift              # ObservableObject, single source of truth
+│   ├── AppStateTypes.swift         # the state vocabulary every surface reads
 │   ├── Capture/
 │   │   ├── CameraCapture.swift     # AVCaptureSession wrapper
+│   │   ├── ScreenCapture.swift     # ScreenCaptureKit source, §5.24
 │   │   ├── AudioCapture.swift      # HAL input AudioUnit wrapper
+│   │   ├── AudioDelayLine.swift    # the deliberate delay, §5.12
+│   │   ├── VoiceChanger.swift      # pitch/formant effects, §5.13
+│   │   ├── VoiceCleanup.swift      # gate, de-esser, ducking, §5.17
+│   │   ├── MicCheck.swift          # listen back to yourself, §5.13
+│   │   ├── InputLevel.swift        # RT → UI level mailbox, §5.17
 │   │   └── DeviceMonitor.swift     # hot-plug, default-device changes
 │   ├── Pipeline/
 │   │   ├── VideoPipeline.swift     # frame graph orchestration
-│   │   ├── EffectStage.swift       # protocol
-│   │   ├── Stages/                 # Geometry, Adjust, LUT, Style, Blur, Freeze, Clip
+│   │   ├── DraftRenderer.swift     # second chain previewing a staged edit
+│   │   ├── EffectStage.swift       # protocol, StageID, chain order
+│   │   ├── Stages/                 # one file per stage in the §3.3 chain
+│   │   ├── StageSettings.swift     # per-stage settings, PipelineConfiguration
+│   │   ├── StudioSettings.swift    # replay, away, panic, lag, voice, connection
+│   │   ├── Settings/               # behaviour settings a preset must not carry
+│   │   │                           #   (incl. AppRuleSettings: §5.18 rules + resolver)
 │   │   ├── FrameRing.swift         # sharpest-frame buffer (camera side)
 │   │   ├── StillRing.swift         # a few finished frames, scored, for stills
+│   │   ├── ReplayBuffer.swift      # rolling compressed seconds, §5.9
+│   │   ├── ReplayPlayer.swift      # the one replay / away / lag transport
+│   │   ├── PresenceWatcher.swift   # are you still there, §5.28
+│   │   ├── GestureWatch.swift      # hand poses as triggers, §5.31
 │   │   ├── ResourceGovernor.swift  # who gets the memory ceiling (§5.23, §7)
 │   │   ├── VisionCoordinator.swift # which Vision request runs this frame
 │   │   ├── FormatManager.swift     # advertised format set, negotiation
 │   │   ├── PresetStore.swift       # named user configurations
-│   │   ├── Settings/               # behaviour settings a preset must not carry
-│   │   │                           #   (incl. AppRuleSettings: §5.18 rules + resolver)
 │   │   └── LatencyMonitor.swift    # per-stage timing, budget enforcement
+│   ├── Media/                      # everything on air that is not the camera
+│   │   ├── LayerSource.swift       # image / video decode for a layer, §5.8
+│   │   ├── LiveFeeds.swift         # a camera or screen as a layer, §5.25
+│   │   └── TextRasterizer.swift    # Core Text → MTLTexture, §5.26
 │   ├── Sinks/
 │   │   ├── CMIOSink.swift          # push frames to camera extension
 │   │   └── AudioSink.swift         # write PCM to shared ring buffer
@@ -71,14 +90,21 @@ PRISM/
 │   │   ├── ClipDisclosure.swift      # what a saved clip would reveal
 │   │   └── StillExporter.swift       # CGImageDestination PNG / HEIC
 │   ├── UI/
-│   │   ├── PopoverView.swift
+│   │   ├── PopoverView.swift       # the menu bar surface, §8.3
+│   │   ├── *Section.swift          # one collapsible section per area
+│   │   ├── MainWindow/             # the full window; one pane per area
+│   │   │   ├── MainWindowController.swift
+│   │   │   ├── MainWindowView.swift
+│   │   │   └── *Pane.swift         # the same areas with room to breathe
 │   │   ├── PreviewView.swift       # MTKView wrapper
+│   │   ├── PanePreview.swift       # the preview a pane hosts
 │   │   ├── ControlTile.swift
-│   │   ├── EffectsSection.swift
-│   │   ├── FormatSection.swift     # resolution, fps, framing
+│   │   ├── MenuBarIcon.swift       # MenuBarState → glyph, §8.2
 │   │   ├── LatencyMeter.swift      # live readout + per-stage breakdown
 │   │   ├── PresetBar.swift
 │   │   ├── HotkeyRecorder.swift    # chord recorder + shared list, §5.19
+│   │   ├── PrompterPanel.swift     # the always-on-top script, §5.27
+│   │   ├── SettingsView.swift
 │   │   ├── OnboardingView.swift
 │   │   └── DesignSystem.swift      # tokens, §8.1
 │   ├── System/
@@ -100,22 +126,38 @@ PRISM/
 │   ├── StreamSource.swift          # source + sink CMIOExtensionStreamSource
 │   └── PlaceholderRenderer.swift   # "PRISM not running" card
 ├── PRISMAudioPlugIn/
-│   ├── PRISM_PlugIn.cpp            # AudioServerPlugInDriverInterface
+│   ├── PRISM_PlugIn.cpp / .h       # AudioServerPlugInDriverInterface
 │   ├── PRISM_Device.cpp
 │   ├── PRISM_Stream.cpp
 │   └── Info.plist
-├── PRISMShared/
+├── PRISMShared/                    # compiled into app, tests and plug-in
 │   ├── RingBuffer.h / .c           # lock-free SPSC, shared by app + plug-in
 │   ├── SharedTypes.h               # SHM name, control block layout
 │   └── PixelFormats.swift
 ├── PRISMKernels/
-│   ├── LUT.metal
+│   ├── KernelTypes.h               # the param structs Swift and Metal share
 │   ├── Adjust.metal
 │   ├── Blur.metal
-│   └── Composite.metal
+│   ├── Composite.metal
+│   ├── Gaze.metal
+│   ├── Geometry.metal
+│   ├── Layers.metal
+│   ├── LUT.metal
+│   ├── Retouch.metal
+│   └── Style.metal
+├── PRISMTests/                     # one suite per contract in CONTRACTS.md
+├── docs/
+│   ├── SPEC.md
+│   └── CONTRACTS.md                # moves in lockstep with behaviour
 └── Tools/
     ├── latency_harness/            # measures end-to-end added latency
+    ├── driver_smoke/               # the audio plug-in without the app
+    ├── mic_probe/                  # what the HAL actually hands us
     ├── build_pkg.sh
+    ├── install_audio.sh
+    ├── rebuild.sh
+    ├── run_local.sh
+    ├── make_icon.swift
     └── notarize.sh
 ```
 
@@ -205,14 +247,16 @@ All stages encode into a **single** `MTLCommandBuffer` per frame. One commit, on
 Stage order is fixed:
 
 ```
-Clip → Replay → Freeze → Eye contact → Geometry → Adjust → LUT →
-Background blur → Virtual background → Overlay → Style → Bad connection →
-Output fit → Push
+Clip → Replay → Freeze → Eye contact → Geometry → Skin retouch → Adjust →
+LUT → Background blur → Virtual background → Overlay → Style →
+Bad connection → Output fit → Push
 ```
 
 The three substituting stages come first because they replace the source; everything downstream applies to whatever the source ends up being. They are ordered by escalating authority: a replay overrides a playing clip, and a freeze overrides a replay — each is a more deliberate "stop showing me live" than the one before it. Since every substituting stage writes the whole frame, chain position *is* precedence.
 
 Eye contact precedes Geometry so the warp happens in the same space Vision measured its landmarks in; putting it after zoom and rotation would mean transforming every landmark through the geometry matrix just to stay aligned. Geometry precedes color so that crop and zoom do not change how a LUT reads.
+
+Skin retouch (§5.22) sits between Geometry and Adjust, and that is the only place it can sit. Its gate is skin chroma, not a face rectangle: Geometry above it only moves pixels around and leaves the gate reading exactly what the camera reported, while any colour stage above it — an exposure lift, a warmer temperature, a LUT — would detune the gate, so the smoothing would drift off the face precisely when the user warms the picture.
 
 Background blur, Virtual background and Overlay all consume the same person mask and composite over the finished look, so they run last. Blur and Virtual background are mutually exclusive — they answer the same question — and the UI presents them as one control (§8.7). Overlay follows Virtual background so a foreground layer sits above a replaced background.
 
@@ -246,7 +290,13 @@ enum LatencyPolicy: String, CaseIterable {
 | Balanced | 6.7ms | 13.3ms | 16.7ms |
 | Maximum quality | 11.7ms | 23.3ms | 29.2ms |
 
-**Degradation.** When the 60-frame mean total GPU time exceeds the budget, disable the most expensive currently-enabled stage (`.expensive` before `.moderate` before `.cheap`; ties broken by later position in the chain), post a UI warning naming the disabled stage, and mark it `autoDisabled`. Re-enable automatically when the mean drops below 60% of budget for 120 consecutive frames.
+**Degradation.** When the 60-frame mean total GPU time exceeds the budget, disable the most expensive stage the engine is allowed to give up (`.expensive` before `.moderate` before `.cheap`; ties broken by later position in the chain), post a UI warning naming the disabled stage, and mark it `autoDisabled`. Re-enable automatically when the mean drops below 60% of budget for 120 consecutive frames, most recently disabled first.
+
+**What it is allowed to give up is a look, and only a look.** The substituting stages (clip, replay, freeze) and Bad connection are engaged by intent, never by a preset, and auto-disabling one of them would put the live camera back on air behind the user's back — the one failure this app must never produce. Output fit is structural. Everything else is a candidate, and three filters sit on top of the pick, composing in a fixed order.
+
+A **pinned** stage is exempt outright (below). A stage the engine has just **restored** is held for 30 seconds and cannot be sacrificed again inside that window: without the hold, a chain that is over budget with a look on and under 60% of budget with it off disables it, waits out the 120-frame quiet streak, restores it, and disables it again — a look flickering on and off forever, which reads as a bug and is worse than either steady state.
+
+The **last-resort** stage — the virtual background, `StageID.isLastResort` — is weighed only when no ordinary look is *enabled at all*. Cost-first with a later-position tie-break would otherwise pick it first among the expensive stages, which is precisely backwards: §5.7 requires every degraded path to err toward covering the room the user chose to hide, and switching the backdrop off reveals it. "No ordinary look left" deliberately means none is **enabled**, which is not the same test as none being **available this round**: a look inside its restore hold is still on air, and reading its absence from the round's candidates as an empty pool would hand the room back to the call in order to protect a style from flicker. When every ordinary look is merely held, the round has nothing to give and raises policy pressure instead, which is what the hold was always for. The exemption is a delay, not a veto: once no ordinary look is left, the backdrop is the candidate and does go.
 
 The user can pin any stage as **required**, which exempts it from automatic disabling. If a pinned chain cannot meet budget, PRISM degrades the *policy* instead — surfacing `Effects are exceeding your latency budget` with a one-tap action to raise it — rather than dropping frames.
 
@@ -1275,9 +1325,8 @@ enum Metrics {
 | Bad connection | Filled prism with wifi badge |
 | Lagging | Filled prism with hourglass badge |
 | Frozen | Filled prism with pause bar |
-| Muted while talking | Filled prism with slash, `.orange` tint |
-| Muted | Filled prism with slash |
 | Muted while talking | Filled prism with slash, `.red` tint |
+| Muted | Filled prism with slash |
 | Sharing a screen | Filled prism with display badge |
 | Panic engaged | Filled prism with raised-hand badge, `.red` tint |
 | Error | Filled prism, `.red` tint |
