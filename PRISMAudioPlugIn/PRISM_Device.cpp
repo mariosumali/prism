@@ -723,6 +723,15 @@ OSStatus PRISM_Device_DoIOOperation(AudioObjectID inStreamObjectID,
                                              memory_order_acquire);
     const uint64_t lowBound = wr > PRISM_RING_CAPACITY
                             ? wr - PRISM_RING_CAPACITY : 0;
+    // mSampleTime is a sample *frame* count, not a count of interleaved
+    // samples — one unit per stereo pair, so it shares the ring index's unit
+    // and kPRISM_ChannelCount must not appear in any of the arithmetic below.
+    // GetZeroTimeStamp above is the proof: it advances sample time by
+    // kPRISM_ZeroTimeStampPeriod over kPRISM_ZeroTimeStampPeriod /
+    // kPRISM_SampleRate seconds, i.e. 48000 units per second at 48 kHz.
+    // Dividing this by the channel count (a plausible-looking "unit fix")
+    // halves the read rate against the write head, which forces a re-anchor
+    // several times a second and garbles the stream.
     const int64_t stBase = (int64_t)inIOCycleInfo->mInputTime.mSampleTime;
     bool shortfall = false;
 
@@ -739,8 +748,7 @@ OSStatus PRISM_Device_DoIOOperation(AudioObjectID inStreamObjectID,
     // the same way to trim latency. One slide is a ~21ms splice in the
     // stream, paid only at repair moments. All arithmetic is modular
     // uint64; the CAS keeps a concurrent StartIO reset authoritative.
-    const int64_t stBaseFrames = stBase / (int64_t)kPRISM_ChannelCount;
-    const int64_t stEnd = stBaseFrames + (int64_t)frameCount;
+    const int64_t stEnd = stBase + (int64_t)frameCount;
     if (stEnd > 0) {
         const int64_t cushion = (int64_t)(wr - anchor) - stEnd;
         if (cushion < 0 || cushion > (int64_t)kPRISM_MaxCushionFrames) {
@@ -758,14 +766,10 @@ OSStatus PRISM_Device_DoIOOperation(AudioObjectID inStreamObjectID,
     }
 
     for (UInt32 i = 0; i < frameCount; ++i) {
-        // stBase is in samples; frame 0 of this cycle starts at sample stBase.
-        // The sample time for frame i is stBase + i*PRISM_CHANNELS.
-        // Convert to frame index by dividing by PRISM_CHANNELS.
-        const int64_t sampleTime = stBase + (int64_t)i * (int64_t)kPRISM_ChannelCount;
-        const int64_t frameTime = sampleTime / (int64_t)kPRISM_ChannelCount;
+        const int64_t rel = stBase + (int64_t)i;
         const float* src = nullptr;
-        if (frameTime >= 0) {
-            const uint64_t pos = anchor + (uint64_t)frameTime;
+        if (rel >= 0) {
+            const uint64_t pos = anchor + (uint64_t)rel;
             if (pos >= lowBound && pos < wr) {
                 const uint32_t idx = (uint32_t)(pos & (PRISM_RING_CAPACITY - 1));
                 src = &gDevice_Ring->data[(size_t)idx * kPRISM_ChannelCount];
@@ -787,7 +791,7 @@ OSStatus PRISM_Device_DoIOOperation(AudioObjectID inStreamObjectID,
     // Advance readIndex as a consumption high-water mark only (never past
     // the write index, never backwards) so the producer's overrun accounting
     // keeps working; it is not a read cursor and reads never depend on it.
-    const int64_t endRel = stBaseFrames + (int64_t)frameCount;
+    const int64_t endRel = stBase + (int64_t)frameCount;
     if (endRel > 0) {
         uint64_t end = anchor + (uint64_t)endRel;
         if (end > wr) {

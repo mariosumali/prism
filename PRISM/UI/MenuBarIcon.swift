@@ -3,7 +3,7 @@
 //
 // Maps MenuBarState to the menu bar glyph (§8.2): outline prism when idle
 // or live pass-through, filled when effects are active, pause/slash badge
-// overlays for frozen/muted, red tint on error.
+// overlays for frozen/muted, red tint on error, 40% opacity when idle.
 // Uses the template PDF assets when present, SF Symbols otherwise.
 //
 // Licensed under the Apache License, Version 2.0.
@@ -15,15 +15,20 @@ struct MenuBarIcon: View {
     let state: MenuBarState
 
     /// Asset check: custom glyphs inherit menu bar tinting and dark mode
-    /// automatically as template images. In menu bar context, rely on
-    /// SF Symbols as a reliable fallback since asset loading can be flaky.
+    /// automatically as template images. Check on every render to catch
+    /// asset unloading under memory pressure (and ensure both exist before
+    /// using either).
     private var hasCustomGlyphs: Bool {
-        false
+        guard NSImage(named: "PrismGlyph") != nil &&
+              NSImage(named: "PrismGlyphFilled") != nil else {
+            return false
+        }
+        return true
     }
 
     var body: some View {
         baseImage
-            .opacity(1.0)
+            .opacity(state == .idle ? 0.4 : 1.0)
             .foregroundStyle(isAlerting
                              ? AnyShapeStyle(.red)
                              : AnyShapeStyle(.primary))
