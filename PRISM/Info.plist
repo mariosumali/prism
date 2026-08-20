@@ -24,11 +24,12 @@
 	<string>1</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
-	<!-- MenuBarExtra requires LSUIElement = true (menu bar only, no Dock icon).
-	     The menu bar icon is the primary UI; the Settings window can be accessed
-	     from the menu bar popover without needing a Dock icon. -->
+	<!-- SPEC §1 specifies LSUIElement = true (menu bar only, no Dock icon).
+	     Overridden deliberately: PRISM shows in the Dock *and* the menu bar.
+	     Clicking the Dock icon opens Settings (see PRISMAppDelegate), since a
+	     menu bar agent has no main window to raise. -->
 	<key>LSUIElement</key>
-	<true/>
+	<false/>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.video</string>
 	<key>NSCameraUsageDescription</key>
