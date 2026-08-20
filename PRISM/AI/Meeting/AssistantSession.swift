@@ -233,8 +233,7 @@ public final class AssistantSession: ObservableObject {
                 guard let self, self.isStreaming else { return }
                 self.streamTask?.cancel()
                 self.streamTask = nil
-                self.fail(LLMError.stalled(seconds: seconds).localizedDescription
-                          ?? "The provider stopped responding.")
+                self.fail(LLMError.stalled(seconds: seconds).localizedDescription)
             }
         }
     }

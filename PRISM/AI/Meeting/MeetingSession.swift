@@ -580,9 +580,19 @@ public final class MeetingSession: ObservableObject {
         record.actionItems = items
         if let title, !title.isEmpty { record.title = title }
         self.record = record
+        // The notes themselves are ready — they are held on `record` and the
+        // pane renders them from there — so the phase is honest even if the
+        // write below fails. What must not be silent is losing them on disk:
+        // `try?` here discarded both the URL and the error, so a full disk or
+        // an unwritable folder took the meeting's notes with it and said
+        // nothing. Same shape as the transcript save in `finish()`.
         notesPhase = .ready
-        try? store.save(record)
-        try? store.saveNotes(markdown, for: record)
+        do {
+            try store.save(record)
+            try store.saveNotes(markdown, for: record)
+        } catch {
+            notice = "PRISM couldn't save the meeting notes — \(error.localizedDescription)"
+        }
     }
 
     public func setNotesPhase(_ phase: NotesPhase) { notesPhase = phase }
