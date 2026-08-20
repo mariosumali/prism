@@ -53,7 +53,39 @@ PRISM/
 │   │   ├── VoiceCleanup.swift      # gate, de-esser, ducking, §5.17
 │   │   ├── MicCheck.swift          # listen back to yourself, §5.13
 │   │   ├── InputLevel.swift        # RT → UI level mailbox, §5.17
+│   │   ├── SystemAudioCapture.swift # the far end, audio-only SCStream, §5.32
 │   │   └── DeviceMonitor.swift     # hot-plug, default-device changes
+│   ├── AI/                         # §5.32 transcript, §5.33 assistant
+│   │   ├── Speech/
+│   │   │   ├── SpeechRecognizing.swift    # the seam + engine registry
+│   │   │   ├── SpeechModelCatalog.swift   # models, sizes, where they live
+│   │   │   ├── SpeechResampler.swift      # 48k → 16k, anti-aliased
+│   │   │   ├── SpeechVAD.swift            # energy VAD + chunk policy
+│   │   │   ├── RollingSpeechBuffer.swift  # the decode window, absolute times
+│   │   │   └── LocalAgreement.swift       # confirm rule for live hypotheses
+│   │   ├── Engines/                # the ONLY directory importing WhisperKit
+│   │   │   └── WhisperKitEngine.swift
+│   │   ├── Transcript/
+│   │   │   ├── TranscriptTypes.swift        # word, delta, line, channel
+│   │   │   ├── TranscriptChannelState.swift # watermark dedup + stitching
+│   │   │   ├── TranscriptRenderer.swift     # the two-stream merge
+│   │   │   ├── TranscriptSanitizer.swift    # hallucination filters
+│   │   │   └── TranscriptStore.swift        # transcripts on disk, never audio
+│   │   ├── LLM/
+│   │   │   ├── LLMProvider.swift            # protocol + request/event types
+│   │   │   ├── LLMTransport.swift           # the ONLY networking file, §7
+│   │   │   ├── SSEParser.swift              # three wire formats, no sockets
+│   │   │   ├── AnthropicProvider.swift
+│   │   │   ├── OllamaProvider.swift
+│   │   │   ├── OpenAICompatibleProvider.swift
+│   │   │   ├── TranscriptChunker.swift      # map-reduce routing
+│   │   │   ├── NoteTemplate.swift           # note structure as data
+│   │   │   └── Prompts.swift                # every prompt string, cited
+│   │   └── Meeting/
+│   │       ├── MeetingSession.swift         # the live transcript machine
+│   │       ├── AssistantSession.swift       # push-to-ask + stall watchdog
+│   │       ├── MeetingNoteWriter.swift      # notes, one pass or map-reduce
+│   │       └── QuestionDetector.swift       # lights a control, never sends
 │   ├── Pipeline/
 │   │   ├── VideoPipeline.swift     # frame graph orchestration
 │   │   ├── DraftRenderer.swift     # second chain previewing a staged edit
@@ -104,7 +136,6 @@ PRISM/
 │   │   ├── PresetBar.swift
 │   │   ├── HotkeyRecorder.swift    # chord recorder + shared list, §5.19
 │   │   ├── PrompterPanel.swift     # the always-on-top script, §5.27
-│   │   ├── SettingsView.swift
 │   │   ├── OnboardingView.swift
 │   │   └── DesignSystem.swift      # tokens, §8.1
 │   ├── System/
@@ -115,6 +146,7 @@ PRISM/
 │   │   ├── KeyCodeNames.swift        # keycode → glyph via the active layout
 │   │   ├── PrismIntents.swift        # App Intents, §5.20
 │   │   ├── SessionLog.swift          # in-memory session history, §5.21
+│   │   ├── Keychain.swift            # the one secret PRISM holds, §5.33
 │   │   └── Permissions.swift         # AVCaptureDevice authorization
 │   └── Resources/
 │       ├── Assets.xcassets
@@ -1180,6 +1212,71 @@ And the clock advances only on observations, capped at a quarter second each, fo
 
 **Every gesture says so out loud.** A chord has a key under it and a tile has a click; a hand in the air has neither, so a gesture that acted silently would be indistinguishable from the app doing something by itself. Every firing names the pose and the action in the notice row and in the §5.21 session log, and the Gestures pane shows the last one.
 
+
+### 5.32 Meeting transcript
+
+What was said, written down on this Mac.
+
+| Property | Specification |
+|---|---|
+| Mechanism | WhisperKit (Core ML) running locally; one model downloaded once |
+| Sources | the microphone always; the far end optionally, via an audio-only `SCStream` |
+| Signal | tapped after conversion to 48 kHz, **before** §5.17 cleanup and §5.13 effects |
+| Off air | nothing is transcribed while muted — the tap receives nothing at all |
+| Storage | `~/Library/Application Support/PRISM/Meetings`; the transcript only, never audio |
+| Network | none, for the transcript. Notes are a separate, user-pressed action |
+| Persistence | `MeetingSettings` in `StudioSettings`, never in a preset |
+| Trigger | the Meeting section, the Meeting pane, and ⌃⌥⌘M |
+| Default | off; far end off; a stock build downloads nothing |
+
+**Nothing is transcribed while you are muted, and that is architecture rather than policy.** The transcription tap sits after the mute and suppression early returns in the RT callback, so a muted microphone does not deliver silence to the recogniser — it delivers nothing, and there is no buffer holding what was said before. A promise implemented as a check somewhere is a promise that survives until somebody moves the check. This one is a consequence of where three lines sit.
+
+**The transcript is tapped before the voice changer, and the mic check is tapped after it, for opposite reasons.** §5.13 exists to play back exactly what the call receives, so its tap belongs at the end of the chain. A recogniser wants the opposite: Chipmunk, Robot and Telephone make speech unintelligible, and a transcript that changed because somebody picked a voice effect would be a transcript of the effect. It is also ahead of §5.17 cleanup, so a noise gate cannot clip a word onset. Whisper is robust to a noisy room; it is not robust to a ring modulator.
+
+**Two streams beat one model.** "Who said what" is normally a diarization problem — cluster the voices in a mixed recording and hope. PRISM does not have a mixed recording: it owns the microphone and captures the far end separately, so the physical origin of every word is known before any model sees it. The near side is labelled *You* and the far side gets whatever the user calls them, and on a 1:1 call that is the whole of speaker attribution, exactly right, for free. This is the one place where PRISM's architecture — a resident agent that already sits on the microphone — makes something cheap that is expensive for everybody else.
+
+**The far end is ScreenCaptureKit, and that is a floor decision rather than a preference.** A Core Audio process tap is the better API in every respect that matters, and it is macOS 14.4 in practice. PRISM's floor is 13.0, and the people most likely to be on Ventura are the ones already running a camera extension and a HAL plug-in. So: an audio-only `SCStream`, with no `.screen` output registered and nothing ever decoded, and the tap path as a runtime-gated fast path later. macOS calls the permission Screen Recording; PRISM captures no pixels for it, and the pane says so rather than letting the name speak for itself.
+
+**Silence is not transcribed, because a model asked about silence answers anyway.** Whisper was trained on subtitles and hallucinates their furniture — "Thank you.", subtitle credits, a phrase repeated until the chunk is full. The cheapest defence by a wide margin is not to ask: an RMS gate runs *before* the recogniser, and a sanitizer catches what still gets through. The gate's threshold is calibrated rather than guessed, and it deliberately does not drop "yes", "no" or "ok" — those are real one-word answers, and a filter that eats the answer is worse than no filter.
+
+**A gap is a gap.** When the microphone goes off air, or the tap ring laps because the reader stalled, the buffer is broken rather than stitched. Two halves of a sentence minutes apart, joined, is a sentence nobody said — and it would be indistinguishable from one they did.
+
+**A row of the session log may say that PRISM was transcribing. It may never say what it heard.** §5.21's redaction rule is absolute here and gets its own test: a transcript is the most sensitive string this application will ever hold, and an exported log is a plain-text file people attach to support threads. The log names the fact, the duration, and the application being listened to — all things the pickers already show. Nothing else.
+
+**Notes are the one moment this feature uses the network, and only because a button was pressed.** The transcript is written and kept locally with no provider configured at all; *Write notes* sends it to whichever provider the user chose (§5.33), once, and puts the result in a markdown file beside the transcript. Where the transcript fits in one pass it goes in one pass, because every seam in a map-reduce is a place a decision gets summarised twice or missed. The action-items table carries a quoted line and its timestamp for every row, which is the cheapest grounding measure available: a model made to cite the line cannot invent the owner.
+
+**Audio is never written to disk, under any setting.** There is no switch for this and no code path to it. A recording of a conversation is a different object with a different consent story, and this feature does not need one to do its job.
+
+
+### 5.33 Meeting assistant
+
+An answer only you can see, while you are still in the conversation.
+
+| Property | Specification |
+|---|---|
+| Mechanism | a floating `NSPanel` with `sharingType = .none`, as §5.27 |
+| Trigger | ⌃⌥⌘A, push-to-ask. Detection lights a control and never sends anything |
+| Provider | Claude, Ollama on this Mac, or any OpenAI-compatible endpoint; none by default |
+| Sent | the last *n* transcript lines, the About-you text, and the question. Nothing else |
+| Key storage | Keychain, never `StudioSettings`, never an exported preset |
+| Persistence | `AssistantSettings` in `StudioSettings`; the open state is never restored |
+| Default | off, with no provider |
+
+**Push-to-ask, because every project that shipped automatic answering removed it.** The detector runs continuously over the far-end transcript and its entire output is a highlight on a control. cheating-daddy deleted its five-second capture loop and left the dead parameter behind; Amurex, the only fully automatic one, needed a server-side rate cap and a two-field guard to make the noise bearable. An assistant that answers unprompted talks over the meeting. The user presses the key.
+
+**A typed question travels with the conversation; a detected one travels alone.** This asymmetry is the highest-leverage idea in the design and it is counter-intuitive. When the user types, the question is *about* the discussion and the rolling transcript is context. When the far end asked something specific and PRISM already knows what it was, sending the transcript alongside it dilutes the answer rather than improving it, so the detected path sends the question and the About-you block and nothing else.
+
+**`sharingType = .none` is a real defence against one kind of capture and no defence against another, and the pane says which.** It is honoured by window-list capture — the mode Zoom, Teams and PRISM's own screen source use — and that is what keeps the panel out of an ordinary screen share. It is not honoured by a capture path that composites the framebuffer, and Apple has stated on the record that no public API prevents screen capture. PRISM cannot fix that. What it can do is not claim otherwise: the Assistant pane states the limit in those terms and presents the chord as the reliable way to put the panel away. §5.27 makes a stronger-sounding promise about the prompter; the difference is that an answer the user is about to say out loud is worth being more careful about than a script they wrote.
+
+**The chord never dismisses.** ⌃⌥⌘A opens the panel if it is closed and otherwise asks, for §5.27's reason: the key you reach for mid-sentence means "answer this", never "make it disappear", and dismissing something you cannot see you dismissed is unrecoverable.
+
+**Nothing about it opens itself.** `isEnabled` is hard-coded out of the decoder rather than merely defaulting off. PRISM launches at login for most people, and a panel that restored itself would put yesterday's answer over whatever they actually opened their Mac to do — floating, on every space.
+
+**The key is not a setting.** `StudioSettings` is JSON in a plist that any process running as this user can read, and it is what gets exported with a preset and attached to a support thread. The API key lives in the data-protection Keychain, is read once at launch because every `SecItem` call blocks the calling thread, and never reaches a view.
+
+**A stalled provider is a failure, not a state.** A stream that stops mid-answer without closing leaves the panel waiting forever and wedges every later question until the app is relaunched — glass has exactly this bug. A watchdog rearmed on every token turns it into a sentence the user can read.
+
+
 ---
 
 ## 6. Latency requirements
@@ -1259,7 +1356,7 @@ Zero dropped frames at 1080p30 with the full effects chain at Balanced policy, o
 | Resident memory, 4K | over the ceiling; the plan reports the figure |
 | Time from login to first valid virtual camera frame | < 2s |
 | Launch at login | `SMAppService.mainApp`, default enabled, user-disableable |
-| Network access | **None.** No analytics, no telemetry, no update check. |
+| Network access | **None for PRISM's own purposes.** No analytics, no telemetry, no crash reporting, no update check — unchanged, and not going to change. Two user-initiated exceptions exist (§5.32, §5.33), confined to one file. With no AI provider configured — the default — PRISM makes no connections at all. |
 
 **The memory ceiling is a policy, not a hope.** It was written as a number and nothing enforced it, so the elastic allocations grew past it independently and nobody could have said by how much. §5.23 is the enforcement: one function decides every depth from the negotiated format, the sum is checked in `ResourceGovernorTests`, and the formats that cannot be made to fit are the ones the table above now admits to. 4K30's output pool and working intermediates measured 126.6 MB before freeze holds a single frame; there is no depth that redeems that, and a requirement quietly false for one published format is worse than one that names it.
 
@@ -1269,9 +1366,19 @@ Zero dropped frames at 1080p30 with the full effects chain at Balanced policy, o
 
 **Crash isolation.** If PRISM.app crashes: the camera extension continues emitting the placeholder card, and the audio plug-in continues emitting silence. Neither client apps nor `coreaudiod` may be taken down with it. The `producerAlive` flag and heartbeat in §4.3 exist for exactly this.
 
-**No network access** is a verifiable property in an open-source repo and is the strongest trust argument PRISM has for an app that sits on your camera and microphone. Do not add a "check for updates" feature.
+**No network access PRISM did not ask you about** is a verifiable property in an open-source repo and is the strongest trust argument PRISM has for an app that sits on your camera and microphone. Do not add a "check for updates" feature.
 
-The property is checked two ways in CI, and the checks have to cover everything that ends up in a binary or they are worse than nothing, because they get quoted as evidence. The linker check (`otool -L`) only fires when a framework actually links, which every Foundation- and libSystem-provided path walks straight past — so the source grep is the real tripwire, and it scans **every** compiled directory, `PRISMShared` included. Shared C on the RT audio path is compiled into the app, the tests and the audio plug-in, and a BSD socket there would link nothing but libSystem.
+The property was once simply "none", and §5.32 and §5.33 changed it. It is worth being exact about how, because a promise that quietly becomes a smaller promise is worth less than one that never existed.
+
+What has not changed: PRISM sends nothing on its own behalf. No analytics, no telemetry, no crash reporting, no update check, no beacon at launch, nothing on a timer. A stock build, which ships with no AI provider configured, opens no sockets at all — transcription (§5.32) runs entirely on this Mac against a model on this Mac.
+
+What is new: a user may point PRISM at an AI provider, and PRISM will then send that provider what the user asked it to send — a transcript when they press *Write notes*, a question when they press the ask chord, and nothing otherwise. There is one further request: the speech model itself, downloaded once from Hugging Face after the user confirms the size.
+
+**Every byte leaves through one file**, `PRISM/AI/LLM/LLMTransport.swift`, at about 150 lines and written to be read in full before it is trusted. That is the whole of the enforcement, and CI is what keeps it true. The source grep that used to scan every compiled directory still does, with exactly one path allowlisted, so a networking call added anywhere else — `PRISMShared` included, where shared C on the RT audio path is compiled into the app, the tests and the plug-in and a BSD socket would link nothing but libSystem — still fails the build. A second step asserts that the allowlisted file names no endpoint outside the two hosts PRISM knows about. A third greps the whole tree for telemetry-shaped symbols.
+
+That third check is **new**. The amendment made the guarantee narrower in exactly one file and stronger everywhere else, which is the only shape of amendment worth accepting.
+
+The linker tripwire (`otool -L`) is **unchanged**, and that was a surprise worth recording. It was expected to need narrowing — a model download and HTTPS requests to a provider looked certain to pull in CFNetwork — but measured on the built binary, neither CFNetwork nor `Network.framework` links, because `URLSession` is reached through Foundation and the speech package pulls in nothing else. So the check stayed as it was. If a later change does make CFNetwork link, this failing is the correct outcome: it means something has started reaching the network by a route the source allowlist cannot see, which is exactly what the linker check is for.
 
 ---
 

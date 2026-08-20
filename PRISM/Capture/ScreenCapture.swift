@@ -317,9 +317,9 @@ public final class ScreenCapture: NSObject {
             try? await stream.stopCapture()
             return
         }
-        streamLock.lock()
-        self.stream = stream
-        streamLock.unlock()
+        // withLock rather than lock()/unlock(): this is an async context, and
+        // a bare lock there is an error in the Swift 6 language mode.
+        streamLock.withLock { self.stream = stream }
         currentSourceName = name
         currentSourceLogName = logName
         startRepeatTimer(frameRate: outputFormat.frameRate)

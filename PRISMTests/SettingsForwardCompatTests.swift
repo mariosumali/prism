@@ -493,6 +493,59 @@ final class SettingsForwardCompatTests: XCTestCase {
         XCTAssertFalse(studio.gestures.isEnabled)
         XCTAssertFalse(studio.gestures.isActive)
         XCTAssertEqual(studio.gestures.bindings.count, HandPose.allCases.count)
+
+        // §5.32/§5.33. The fixture predates both, so this is the real
+        // question rather than a round-trip: a settings file written before
+        // these existed must still decode, and must land with transcription
+        // off, no far end, and no AI provider — a user who upgrades does not
+        // acquire a feature that listens to their calls.
+        XCTAssertFalse(studio.meeting.transcribes)
+        XCTAssertFalse(studio.meeting.isActive)
+        XCTAssertEqual(studio.meeting.farEnd, .off)
+        XCTAssertFalse(studio.meeting.wantsFarEnd)
+        XCTAssertNil(studio.meeting.farEndBundleID)
+        XCTAssertEqual(studio.meeting.model, SpeechModelCatalog.defaultModel)
+        XCTAssertTrue(studio.meeting.savesTranscript)
+
+        XCTAssertEqual(studio.assistant.provider, .none)
+        XCTAssertFalse(studio.assistant.isEnabled)
+        XCTAssertFalse(studio.assistant.isActive)
+        XCTAssertFalse(studio.assistant.providerIsConfigured)
+        XCTAssertTrue(studio.assistant.aboutMe.isEmpty)
+    }
+
+    /// §5.33: the assistant panel's open state is hard-coded out of the
+    /// decoder rather than merely defaulting off, so a file that *does*
+    /// carry `isEnabled: true` still decodes to false.
+    ///
+    /// PRISM launches at login for most people, and a panel that restored
+    /// itself would put yesterday's answer over whatever they actually
+    /// opened their Mac to do — floating, on every space. A default would
+    /// not survive the first time somebody quit with the panel open.
+    func testAssistantPanelNeverRestoresItselfEvenWhenTheFileSaysItWasOpen() throws {
+        let json = #"{"isEnabled":true,"provider":"anthropic","aboutMe":"I ship a virtual camera."}"#
+        let settings = try decode(AssistantSettings.self, json)
+
+        XCTAssertFalse(settings.isEnabled, "a stored open panel must not reopen itself")
+        XCTAssertFalse(settings.isActive)
+        // Everything else on the same object still decodes, so this is a
+        // deliberate exception rather than a broken decoder.
+        XCTAssertEqual(settings.provider, .anthropic)
+        XCTAssertEqual(settings.aboutMe, "I ship a virtual camera.")
+    }
+
+    /// A partially-written meeting settings object — the shape a downgrade
+    /// or a hand-edit produces — keeps what it names and defaults the rest,
+    /// rather than throwing the whole struct away.
+    func testPartialMeetingSettingsKeepWhatTheyNameAndDefaultTheRest() throws {
+        let json = #"{"farEnd":"everything","farEndLabel":"The client"}"#
+        let settings = try decode(MeetingSettings.self, json)
+
+        XCTAssertEqual(settings.farEnd, .everything)
+        XCTAssertEqual(settings.resolvedFarEndLabel, "The client")
+        XCTAssertFalse(settings.transcribes)
+        XCTAssertEqual(settings.model, SpeechModelCatalog.defaultModel)
+        XCTAssertEqual(settings.clampedSilenceRMS, 0.005, accuracy: 1e-9)
     }
 
     func testPreFoundationStudioDefaultsStillDecodeToTheSameSettings() throws {

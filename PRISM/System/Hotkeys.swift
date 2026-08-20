@@ -62,6 +62,19 @@ public enum ShortcutAction: String, Codable, CaseIterable, Identifiable {
     /// never consumes, so a plain ⌥⌘T would also open the frontmost app's
     /// Show Fonts panel every time the prompter was toggled.
     case prompter               // ⌃⌥⌘T
+    /// §5.32: start or stop transcribing this call. ⌃ for the prompter's
+    /// reason — ⌥⌘M is already mute, and matching is exact over all four
+    /// modifiers, so these are two chords rather than one shadowing the
+    /// other.
+    case meeting                // ⌃⌥⌘M
+    /// §5.33: ask the assistant. Also ⌃-carrying, and deliberately not the
+    /// away loop's ⌥⌘A.
+    ///
+    /// The chord never dismisses the panel. Copying the prompter's
+    /// asymmetry: the key you reach for mid-sentence means "answer this",
+    /// never "make it disappear", because dismissing something you cannot
+    /// see you dismissed is unrecoverable.
+    case ask                    // ⌃⌥⌘A
 
     /// ANSI key codes: F = 3, M = 46, R = 15, A = 0, P = 35, E = 14,
     /// L = 37, B = 11, V = 9, S = 1, D = 2, T = 17.
@@ -95,6 +108,10 @@ public enum ShortcutAction: String, Codable, CaseIterable, Identifiable {
             return HotkeyCombo(keyCode: 2, option: true, command: true)
         case .prompter:
             return HotkeyCombo(keyCode: 17, option: true, command: true, control: true)
+        case .meeting:
+            return HotkeyCombo(keyCode: 46, option: true, command: true, control: true)
+        case .ask:
+            return HotkeyCombo(keyCode: 0, option: true, command: true, control: true)
         }
     }
 
@@ -114,6 +131,8 @@ public enum ShortcutAction: String, Codable, CaseIterable, Identifiable {
         case .snapshot: return "Take a still"
         case .screenSource: return "Share a screen"
         case .prompter: return "Prompter"
+        case .meeting: return "Transcribe this call"
+        case .ask: return "Ask the assistant"
         }
     }
 

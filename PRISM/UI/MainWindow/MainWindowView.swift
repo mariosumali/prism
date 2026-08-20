@@ -16,9 +16,36 @@ import UniformTypeIdentifiers
 enum MainPane: String, CaseIterable, Identifiable {
     case studio, scene, moments, capture, voice, framing, effects, format,
          devices, presets, apps, menuBar, shortcuts, general, prompter,
-         gestures, diagnostics, about
+         gestures, meeting, assistant, diagnostics, about
 
     var id: String { rawValue }
+
+    /// The pane's one-line answer to "why would I open this?", shown as the
+    /// sidebar row's tooltip. Twenty nouns cannot all be self-explanatory.
+    var summary: String {
+        switch self {
+        case .studio: return "The live picture, the tiles, and what is on air right now"
+        case .scene: return "Backgrounds, blur, and the keyed layers in front of and behind you"
+        case .moments: return "Instant replay, the away loop, the lag switch, bad connection"
+        case .capture: return "Save a still or the last few seconds to a file"
+        case .voice: return "Microphone cleanup, the voice changer, and the level meter"
+        case .framing: return "Zoom, pan, rotation, mirror, crop, auto-framing"
+        case .effects: return "Adjust, skin, LUTs, styles, blur — the whole chain"
+        case .format: return "Resolution, frame rate, latency policy, measured cost"
+        case .devices: return "Which camera, which microphone, or a screen instead"
+        case .presets: return "Saved looks, and the chords that recall them"
+        case .apps: return "Per-app rules: what each app gets when it opens PRISM"
+        case .menuBar: return "Which modules the menu bar dropdown shows, and in what order"
+        case .shortcuts: return "Global chords, and control from the Shortcuts app"
+        case .general: return "Launch at login, and quitting PRISM"
+        case .prompter: return "The script only you can see"
+        case .gestures: return "Drive PRISM with your hands instead of a chord"
+        case .meeting: return "Transcribe the call on this Mac, and write it up afterwards"
+        case .assistant: return "Answers only you can see, while you are still talking"
+        case .diagnostics: return "What PRISM has done this session"
+        case .about: return "Version and licence"
+        }
+    }
 
     var title: String {
         switch self {
@@ -38,6 +65,8 @@ enum MainPane: String, CaseIterable, Identifiable {
         case .general: return "General"
         case .prompter: return "Prompter"
         case .gestures: return "Gestures"
+        case .meeting: return "Meeting"
+        case .assistant: return "Assistant"
         case .diagnostics: return "Diagnostics"
         case .about: return "About"
         }
@@ -61,10 +90,55 @@ enum MainPane: String, CaseIterable, Identifiable {
         case .general: return "gearshape"
         case .prompter: return "doc.plaintext"
         case .gestures: return "hand.raised"
+        case .meeting: return "text.bubble"
+        case .assistant: return "sparkles"
         case .diagnostics: return "list.bullet.rectangle"
         case .about: return "info.circle"
         }
     }
+}
+
+/// The sidebar's five groups. Eighteen flat rows in one undifferentiated
+/// list is a list you read top to bottom every time, and the flat order had
+/// drifted into an arbitrary one — Prompter and Gestures sat below General,
+/// which is where a reader stops looking. Grouped, you pick a section and
+/// then a row inside it.
+enum MainPaneGroup: String, CaseIterable, Identifiable {
+    case onAir, recording, conversation, io, control, prism
+
+    var id: String { rawValue }
+
+    /// No header repeats a row inside it: a "Devices" section whose first
+    /// row is "Devices" tells you nothing twice.
+    var title: String {
+        switch self {
+        case .onAir: return "On air"
+        case .recording: return "Recording"
+        case .conversation: return "The conversation"
+        case .io: return "Sources & output"
+        case .control: return "Control"
+        case .prism: return "PRISM"
+        }
+    }
+
+    var panes: [MainPane] {
+        switch self {
+        // Everything that changes what other people see or hear.
+        case .onAir: return [.studio, .scene, .framing, .effects, .voice, .prompter]
+        // Both live off the rolling buffer: one plays it back, one saves it.
+        case .recording: return [.moments, .capture]
+        // §5.32/§5.33 — the only two panes about what was *said* rather
+        // than about how it looks or sounds going out.
+        case .conversation: return [.meeting, .assistant]
+        case .io: return [.devices, .format]
+        // Every way to drive PRISM without touching this window.
+        case .control: return [.presets, .shortcuts, .gestures, .apps, .menuBar]
+        case .prism: return [.general, .diagnostics, .about]
+        }
+    }
+
+    /// Every pane, in sidebar order.
+    static var allPanes: [MainPane] { allCases.flatMap(\.panes) }
 }
 
 struct MainWindowView: View {
@@ -75,13 +149,26 @@ struct MainWindowView: View {
     var body: some View {
         NavigationSplitView {
             List(selection: $selectedPane) {
-                ForEach(MainPane.allCases) { pane in
-                    Label(pane.title, systemImage: pane.symbol)
-                        .tag(pane)
+                ForEach(MainPaneGroup.allCases) { group in
+                    Section(group.title) {
+                        ForEach(group.panes) { pane in
+                            Label(pane.title, systemImage: pane.symbol)
+                                .tag(pane)
+                                .help(pane.summary)
+                        }
+                    }
                 }
             }
             .listStyle(.sidebar)
-            .navigationSplitViewColumnWidth(min: 170, ideal: 190, max: 240)
+            .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 260)
+            // A pane added without being filed in a group would simply vanish
+            // from the sidebar, and nothing else would complain. Fail loudly
+            // in Debug instead.
+            .onAppear {
+                assert(Set(MainPaneGroup.allPanes) == Set(MainPane.allCases)
+                       && MainPaneGroup.allPanes.count == MainPane.allCases.count,
+                       "every MainPane must appear in exactly one sidebar group")
+            }
         } detail: {
             paneView(selectedPane ?? lastPane)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -120,6 +207,8 @@ struct MainWindowView: View {
         case .general: GeneralPane()
         case .prompter: PrompterPane()
         case .gestures: GesturesPane()
+        case .meeting: MeetingPane()
+        case .assistant: AssistantPane()
         case .diagnostics: DiagnosticsPane()
         case .about: AboutPane()
         }
@@ -278,8 +367,13 @@ private struct GeneralPane: View {
 private struct AboutPane: View {
     var body: some View {
         VStack(spacing: Metrics.itemGap) {
-            MenuBarIcon(state: .live)
-                .font(.largeTitle)
+            // The app icon, not the menu bar glyph: this pane is about the
+            // application, and the glyph is a status indicator whose whole
+            // job is to mean something other than "PRISM" most of the time.
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .frame(width: 64, height: 64)
+                .accessibilityHidden(true)
             Text("PRISM")
                 .font(.headline)
             Text("Version \(versionString)")

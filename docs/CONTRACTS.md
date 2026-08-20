@@ -59,7 +59,23 @@ in the repo — read them before writing code:
 
 Language: Swift 5.9, macOS 13.0 deployment target. No Swift 6 concurrency
 annotations (`@MainActor` on UI-facing classes is fine; no `Sendable`
-churn). No third-party dependencies. No network access anywhere.
+churn).
+
+**One third-party dependency**: `argmaxinc/argmax-oss-swift` (MIT), product
+`WhisperKit`, pinned to an exact version rather than a range — its manifest
+declares `.macOS(.v13)` while its README says macOS 14, and a minor release
+that quietly raised the floor would orphan every Ventura user of the camera
+extension. It may be imported only from `PRISM/AI/Engines/`, which
+`project.yml` excludes from `PRISMTests`; everything above that directory
+talks to `SpeechRecognizing`, and `AppState` reaches the real engine through
+`SpeechEngineRegistry` so the test bundle compiles with nothing resolved.
+
+**No network access PRISM did not ask you about** (§7). No analytics, no
+telemetry, no crash reporting, no update check — unchanged. Two
+user-initiated exceptions (§5.32, §5.33) are confined to
+`PRISM/AI/LLM/LLMTransport.swift`, which CI verifies is the only file in the
+tree naming a networking API. A stock build, with no AI provider configured,
+opens no sockets at all.
 
 ---
 
@@ -1120,6 +1136,23 @@ public final class AudioCapture {
     public func readMicTap(from cursor: UInt64,
                            into buffer: UnsafeMutablePointer<Float>,
                            maxFrames: Int) -> (cursor: UInt64, frames: Int)
+    /// §5.32 transcription tap. A SECOND, independent passive copy, taken
+    /// at the opposite end of the chain from the mic-check tap above:
+    /// after 48 kHz conversion but BEFORE §5.17 cleanup and §5.13 effects,
+    /// because a transcript must not change when somebody picks a voice
+    /// effect. Its ring is deeper (1<<19, ~10.9 s) because the reader
+    /// hitches on model loads and main-thread stalls.
+    ///
+    /// Separate from the mic-check tap rather than shared: arming is a
+    /// plain Bool, not a refcount, and MicCheck disarms unconditionally.
+    ///
+    /// A returned cursor greater than `cursor + frames` means the ring
+    /// lapped; the caller must record a gap, never stitch across it.
+    public func setASRTapArmed(_ armed: Bool)
+    public var asrTapCursor: UInt64 { get }
+    public func readASRTap(from cursor: UInt64,
+                           into buffer: UnsafeMutablePointer<Float>,
+                           maxFrames: Int) -> (cursor: UInt64, frames: Int)
     public init()
     public func start(deviceUID: String?)          // nil = default input
     public func stop()
@@ -1176,6 +1209,174 @@ public final class VoiceChanger {
 switch must not change what you sound like). Pure, testable pieces:
 `detectFrequency` (normalised autocorrelation over a caller-supplied
 scratch), `chromaticTarget`, and the static `program(for:amount:)` table.
+
+### MeetingSession (`PRISM/AI/Meeting/MeetingSession.swift`)
+
+The §5.32 live transcript. Every dependency is a closure or a protocol, so
+the whole state machine is drivable headless — no microphone, no permission,
+no model, no meeting. That is the point of the shape, not a side effect:
+a mute mid-sentence, a lapped ring and a stop during an in-flight decode are
+all things worth a test and none of them are worth reproducing by hand.
+
+```swift
+public enum MeetingPhase: Equatable {
+    case idle, preparing(Double), listening, stopping, failed(String)
+    public var isRunning: Bool
+    public var isListening: Bool
+}
+public enum NotesPhase: Equatable { case none, writing, ready, failed(String) }
+
+@MainActor
+public final class MeetingSession: ObservableObject {
+    @Published public private(set) var phase: MeetingPhase
+    @Published public private(set) var lines: [TranscriptLine]
+    @Published public private(set) var hypothesis: String     // still settling
+    @Published public private(set) var notesPhase: NotesPhase
+    @Published public private(set) var record: MeetingRecord?
+    @Published public private(set) var farEndHeard: Bool      // audible, not merely started
+    @Published public private(set) var notice: String?
+    @Published public var userNotes: String
+
+    /// Installed by AppState after construction — an owner cannot form a
+    /// closure over itself before it exists. While true the ASR tap
+    /// receives nothing at all, and the session records a gap.
+    public var micIsOffAir: () -> Bool
+
+    public init(engineFactory: @escaping (SpeechModel) -> SpeechRecognizing,
+                armMicTap: @escaping (Bool) -> Void,
+                micTapCursor: @escaping () -> UInt64,
+                readMicTap: @escaping (UInt64, UnsafeMutablePointer<Float>, Int)
+                                        -> (cursor: UInt64, frames: Int),
+                farEnd: (any SystemAudioCapturing)?,
+                store: TranscriptStore? = nil,
+                micIsOffAir: @escaping () -> Bool = { false },
+                now: @escaping () -> Date = Date.init)
+
+    public func apply(_ settings: MeetingSettings)
+    public func start()
+    public func stop()
+    public func transcriptTail(turns: Int) -> String
+    public var labelledTranscript: String { get }
+    public var elapsed: TimeInterval { get }
+    public var wordCount: Int { get }
+    public func dismissNotice()
+    public func applyNotes(markdown: String, title: String?, items: [MeetingActionItem])
+    public func setNotesPhase(_ phase: NotesPhase)
+}
+```
+
+Drain is one 10 Hz main-thread timer added in `.common` mode — the default
+mode stops firing while a menu is open, and a transcript with holes in it at
+exactly the moments somebody opened the popover is worse than no transcript.
+Decodes never overlap.
+
+### AssistantSession (`PRISM/AI/Meeting/AssistantSession.swift`)
+
+```swift
+@MainActor
+public final class AssistantSession: ObservableObject {
+    @Published public private(set) var answer: String
+    @Published public private(set) var isStreaming: Bool
+    /// Set by the detector; lights a control. NEVER causes a request.
+    @Published public private(set) var detectedQuestion: String?
+    @Published public private(set) var lastError: String?
+    @Published public private(set) var lastAsked: String?
+
+    public func apply(_ settings: AssistantSettings)
+    public func observeTranscript(_ tail: String)
+    public func clearDetectedQuestion()
+    /// `text == nil` answers the detected question. The two paths build
+    /// deliberately different prompts — see §5.33.
+    public func ask(_ text: String?, provider: LLMProvider,
+                    transcriptTail: @autoclosure () -> String)
+    public func cancel()
+    public func clear()
+}
+```
+
+Carries a stall watchdog rearmed on every token. A provider that stops
+mid-stream without closing otherwise leaves `isStreaming` true forever and
+wedges every later question until the app is relaunched.
+
+### SpeechRecognizing (`PRISM/AI/Speech/SpeechRecognizing.swift`)
+
+The seam that keeps the one third-party dependency inside one directory.
+
+```swift
+public protocol SpeechRecognizing: AnyObject {
+    var supportsWordTimestamps: Bool { get async }
+    func load(progress: @escaping (SpeechModelState) -> Void) async throws
+    func unload() async
+    func transcribe(_ request: SpeechRequest,
+                    channel: ChannelProfile) async throws -> SpeechHypothesis
+}
+
+/// `PRISM/AI/Engines/` is excluded from PRISMTests, and AppState is in both
+/// targets — so AppState must not name `WhisperKitEngine`. The app installs
+/// the real factory at launch; a test gets `UnavailableSpeechEngine`, which
+/// fails honestly rather than returning nothing and making a broken
+/// pipeline look like a quiet room.
+public enum SpeechEngineRegistry {
+    public static var factory: ((SpeechModel) -> SpeechRecognizing)?
+    public static func make(_ model: SpeechModel) -> SpeechRecognizing
+}
+```
+
+### LLMProvider and LLMTransport (`PRISM/AI/LLM/`)
+
+```swift
+public protocol LLMProvider: AnyObject {
+    var id: String { get }
+    var displayName: String { get }
+    /// Decides map-reduce vs one pass in `TranscriptChunker`.
+    var contextBudget: Int { get }
+    func isAvailable() async -> Bool
+    func stream(_ request: LLMRequest) -> AsyncThrowingStream<LLMEvent, Error>
+}
+public typealias LLMEvent = LLMStreamEvent   // defined by SSEParser
+```
+
+Three conformers: `AnthropicProvider`, `OllamaProvider`,
+`OpenAICompatibleProvider`. They build request bodies and decode frames via
+`SSEParser`, which opens no sockets and is therefore testable from string
+fixtures.
+
+`LLMTransport` is **the only file in the repository that opens a network
+connection** (§7). CI allowlists exactly that path, asserts it names no
+endpoint outside `api.anthropic.com` and localhost, and greps the whole tree
+for telemetry-shaped symbols. It also enforces the host allowlist at runtime,
+because CI can check literals but not a URL assembled from a settings field.
+
+### TranscriptStore (`PRISM/AI/Transcript/TranscriptStore.swift`)
+
+```swift
+@MainActor
+public final class TranscriptStore {
+    /// Injected in tests so the suite never writes to the real
+    /// Application Support folder (LUTStore's idiom).
+    public static var directoryOverride: URL?
+    public static var directory: URL { get }
+    @discardableResult public func save(_ record: MeetingRecord) throws -> URL
+    @discardableResult public func saveNotes(_ markdown: String,
+                                             for record: MeetingRecord) throws -> URL
+    public func load(id: String) -> MeetingRecord?
+    public func all() -> [MeetingRecord]
+    public func delete(id: String) throws
+    public func deleteAll() throws
+    public func bytesOnDisk() -> Int64
+}
+```
+
+Transcripts and notes only. There is no method here that writes audio, and
+no caller that could ask for one.
+
+### Keychain (`PRISM/System/Keychain.swift`)
+
+The one secret PRISM holds (§5.33). `kSecUseDataProtectionKeychain: true` on
+every query is load-bearing: without it the item lands in the legacy login
+keychain and the user is prompted on every launch. Read once at launch and
+cached in memory — all four `SecItem` calls block the calling thread, and a
+keychain read per request would sit on the path of a live answer.
 
 ### MicCheck (`PRISM/Capture/MicCheck.swift`)
 
@@ -2056,6 +2257,47 @@ public final class AppState: ObservableObject {
     public func setPrompterOpacity(_ opacity: Double)
     public func setPrompterMirrored(_ mirrored: Bool)
     public func setPrompterAnchor(_ anchor: PrompterAnchor)
+    // Meetings (§5.32). AppState supplies the taps and the demand signal;
+    // MeetingSession owns the rest. Nothing here reaches a stage.
+    public let meeting: MeetingSession
+    /// ⌃⌥⌘M. Starts transcribing, or stops and files the transcript.
+    /// Pressing it with transcription never switched on switches it on
+    /// (§8.7) rather than doing nothing and explaining why.
+    public func toggleMeeting()
+    public func startMeeting()
+    public func stopMeeting()
+    public func setMeetingTranscribes(_ on: Bool)
+    public func setMeetingModel(_ shortName: String)
+    public func setMeetingLanguage(_ language: String)
+    public func setMeetingFarEnd(_ source: FarEndSource)
+    public func setMeetingFarEndApp(_ bundleID: String?)
+    public func setMeetingFarEndLabel(_ label: String)
+    public func setMeetingSilenceRMS(_ value: Double)
+    public func setMeetingSavesTranscript(_ saves: Bool)
+    public func setMeetingTemplate(_ name: String)
+    /// The one place §5.32 reaches the network, and only on a press.
+    public func writeMeetingNotes()
+    public func cancelMeetingNotes()
+    // Assistant (§5.33)
+    public let assistant: AssistantSession
+    /// Installed by the app delegate, which owns the panel — AppState may
+    /// not reference the UI layer (PRISMTests excludes UI/**).
+    public var assistantPanelHandler: ((Bool) -> Void)?
+    /// True when a key is in the Keychain. The key itself never reaches a
+    /// view, and is never written to StudioSettings.
+    @Published public private(set) var hasAnthropicKey: Bool
+    public func setAssistantEnabled(_ enabled: Bool)
+    /// ⌃⌥⌘A. Opens the panel if closed, otherwise asks. Never dismisses.
+    public func askAssistant(_ text: String? = nil)
+    public func setAssistantProvider(_ kind: LLMProviderKind)
+    public func setAssistantModel(_ model: String)
+    public func setAssistantBaseURL(_ url: String)
+    public func setAssistantOpacity(_ value: Double)
+    public func setAssistantAnchor(_ anchor: AssistantAnchor)
+    public func setAssistantContextTurns(_ turns: Int)
+    public func setAssistantHighlightsQuestions(_ on: Bool)
+    public func setAssistantAboutMe(_ text: String)
+    @discardableResult public func setAnthropicKey(_ key: String) -> Bool
     // Control surface (§5.19, §5.20)
     @Published public var hotkeyBindings: HotkeyBindings
     @Published public var externalControlEnabled: Bool      // default off
@@ -2097,7 +2339,8 @@ intent announced.
   modifiers (`prismCard()`), animation constants gated on reduce-motion.
 - `PopoverView.swift` — full layout §8.3; `@EnvironmentObject var state:
   AppState`. Drag-and-drop of `.cube` onto the popover calls
-  `state.importLUT`. Bottom bar: gear opens Settings window, ✕ quits. The
+  `state.importLUT`. Bottom bar: gear opens the main PRISM window (there is
+  no separate Settings window — see PRISMApp below), ✕ quits. The
   notice row sits under the warning row and carries `Show` when the event
   produced a file — a saved file the user cannot find was not saved.
 - `CaptureSection.swift` / `MainWindow/CapturePane.swift` — §5.15/§5.16
@@ -2116,13 +2359,10 @@ intent announced.
   always-on meter view both the popover and the main window's Voice pane
   render, so the two can never disagree about how loud you are),
   `OnboardingView.swift` (three-step state machine
-  §9 + persistent setup banner), `SettingsView.swift` (deeper controls:
-  pan, crop aspect, orientation, per-adjustment sliders, published format
-  set editor, shortcut recorder + external control switch, login item
-  toggle, LUT management).
+  §9 + persistent setup banner).
 - `HotkeyRecorder.swift` — `HotkeyRecorderField` (§5.19; records a real key-down;
-  ⎋ cancels, ⌫ clears) and `ShortcutsList`, shared by the main window's
-  Shortcuts pane and the Settings General tab so the two cannot disagree.
+  ⎋ cancels, ⌫ clears) and `ShortcutsList`, used by the main window's
+  Shortcuts pane — one list, so nothing can disagree about what is bound.
 - `MainWindow/ShortcutsPane.swift`, `MainWindow/DiagnosticsPane.swift` —
   §5.19/§5.20 and §5.21 respectively.
 - `PrompterSection.swift` / `MainWindow/PrompterPane.swift` — §5.27. The
@@ -2139,17 +2379,20 @@ intent announced.
   calls `setPrompterEnabled(false)`, so the panel and the switch cannot
   disagree.
 - `MenuBarIcon.swift` — maps `MenuBarState` → glyph. Uses asset PDFs
-  `PrismOutline` / `PrismFilled` (template) with overlay badges; falls back
-  to SF Symbols if assets missing.
+  `PrismGlyph` / `PrismGlyphFilled` (template) with overlay badges; falls
+  back to SF Symbols if assets missing.
 
 ### PRISMApp (`PRISM/PRISMApp.swift`) — integration phase
 
 `@main struct PRISMApp: App` — `MenuBarExtra` (`.window` style) hosting
-`PopoverView`, `Settings` scene hosting `SettingsView`, app delegate
-adaptor for lifecycle (start AppState, register login item, hotkeys). The
+`PopoverView`, plus an app delegate adaptor for lifecycle (start AppState,
+register login item, hotkeys). There is deliberately **no** `Settings`
+scene: it held a smaller, drifting copy of the framing, adjust, format, LUT
+and shortcut controls, so the main window is the single settings surface and
+`CommandGroup(replacing: .appSettings)` points ⌘, at it. The
 delegate also owns the two AppKit windows AppState can only reach through a
 closure: `MainWindowController` (`openMainWindowHandler`) and
-`PrompterPanelController` (`prompterPanelHandler`, §5.27).
+`PrompterPanelController` (`prompterPanelHandler`, §5.27) and `AssistantPanelController` (`assistantPanelHandler`, §5.33). It also installs the real speech engine into `SpeechEngineRegistry` at launch — the app target is the only one that may name `WhisperKitEngine`.
 
 ---
 

@@ -1,9 +1,9 @@
 // HotkeyRecorder.swift
 // PRISM
 //
-// The shortcut recorder (§5.19) and the shortcut list built from it, shared
-// by the main window's Shortcuts pane and the Settings General tab so the
-// two surfaces cannot disagree about what is bound.
+// The shortcut recorder (§5.19) and the shortcut list built from it, used
+// by the main window's Shortcuts pane — one list, so nothing can disagree
+// about what is bound.
 //
 // A recorder rather than a menu of chords: the combos worth binding outnumber
 // any list worth reading, and pressing the key is how everyone expects to

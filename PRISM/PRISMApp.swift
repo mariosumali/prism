@@ -1,11 +1,16 @@
 // PRISMApp.swift
 // PRISM
 //
-// App entry. MenuBarExtra (.window style) hosts the popover; the Settings
-// scene hosts quick preferences (§8.3); the main PRISM window (an AppKit
-// window owned by the delegate via MainWindowController, so nothing shows
-// at login-item launch) is the full control surface, including the Menu Bar
-// pane that customizes the popover itself.
+// App entry. MenuBarExtra (.window style) hosts the popover; the main PRISM
+// window (an AppKit window owned by the delegate via MainWindowController,
+// so nothing shows at login-item launch) is the full control surface,
+// including the Menu Bar pane that customizes the popover itself.
+//
+// There is deliberately no SwiftUI `Settings` scene. It used to hold a
+// second, smaller copy of the framing, adjust, format, LUT and shortcut
+// controls, which meant two windows editing the same state with two sets of
+// wording — and the smaller copy was always the one that fell behind. The
+// main window is the single settings surface, and ⌘, opens it.
 //
 // PRISM appears in both the Dock and the menu bar. That overrides SPEC §1,
 // which specifies LSUIElement = true (menu bar only) — see PRISM/Info.plist.
@@ -36,10 +41,14 @@ struct PRISMApp: App {
             MenuBarIcon(state: state.menuBarState)
         }
         .menuBarExtraStyle(.window)
-
-        Settings {
-            SettingsView()
-                .environmentObject(state)
+        // Removing the Settings scene also removes the app menu's
+        // "Settings…" item, and ⌘, is muscle memory. Put it back pointing
+        // at the window that now owns every setting.
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings…") { state.showMainWindow() }
+                    .keyboardShortcut(",", modifiers: .command)
+            }
         }
     }
 }
@@ -51,10 +60,20 @@ final class PRISMAppDelegate: NSObject, NSApplicationDelegate {
     /// §5.27 — created the first time the prompter is asked for and kept
     /// afterwards, so the panel remembers where the user dragged it.
     @MainActor private var prompterPanelController: PrompterPanelController?
+    /// §5.33 — same arrangement as the prompter's panel, and for the same
+    /// reason: it remembers where it was dragged to.
+    @MainActor private var assistantPanelController: AssistantPanelController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Task { @MainActor in
             guard let state = PRISMAppDelegate.pendingState else { return }
+            // §5.32. The real speech engine is installed here, from the app
+            // target only — `PRISM/AI/Engines/` is excluded from the test
+            // bundle, which is what keeps the suite ad-hoc signed and free
+            // of the WhisperKit package. AppState never names it.
+            SpeechEngineRegistry.factory = { model in
+                WhisperKitEngine(model: model)
+            }
             // AppState cannot depend on the UI layer (PRISMTests excludes
             // UI/**), so the window controller is reached through this hook.
             state.openMainWindowHandler = { [weak self, weak state] in
@@ -76,6 +95,18 @@ final class PRISMAppDelegate: NSObject, NSApplicationDelegate {
                 }
                 self.prompterPanelController?.show()
             }
+            state.assistantPanelHandler = { [weak self, weak state] visible in
+                guard let self else { return }
+                guard visible else {
+                    self.assistantPanelController?.hide()
+                    return
+                }
+                guard let state else { return }
+                if self.assistantPanelController == nil {
+                    self.assistantPanelController = AssistantPanelController(state: state)
+                }
+                self.assistantPanelController?.show()
+            }
             state.start()
         }
     }
@@ -85,9 +116,10 @@ final class PRISMAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Clicking the Dock icon opens (or raises) the main PRISM window —
-    /// unconditionally, because gating on hasVisibleWindows would let a
-    /// visible Settings window swallow the click. The popover belongs to the
-    /// menu bar item and cannot be summoned programmatically.
+    /// unconditionally, because gating on hasVisibleWindows would let any
+    /// other visible window (the prompter panel, say) swallow the click. The
+    /// popover belongs to the menu bar item and cannot be summoned
+    /// programmatically.
     func applicationShouldHandleReopen(_ sender: NSApplication,
                                        hasVisibleWindows flag: Bool) -> Bool {
         Task { @MainActor in

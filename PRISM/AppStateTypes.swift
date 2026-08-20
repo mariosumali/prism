@@ -150,7 +150,6 @@ public struct WarningMessage: Equatable, Identifiable {
         /// is the one state in PRISM that can leave an app without a camera,
         /// so the way out belongs in the row that reports it.
         case clearBlocks
-        case openSettings
         /// Stills have nowhere writable to go.
         case chooseCaptureFolder
         /// Screen capture needs its own grant, and the picker is useless
@@ -375,6 +374,7 @@ public struct StageStatus: Equatable {
 /// Popover disclosure groups remember their state (§8.3).
 public enum PopoverSection: String, CaseIterable {
     case framing, effects, format, scene, moments, voice, capture, prompter
+    case meeting
 }
 
 /// What is behind you, as one choice (§5.4, §5.7).
@@ -429,6 +429,7 @@ public enum PopoverModule: String, Codable, CaseIterable, Identifiable {
     case scene         // background mode + eye contact
     case voice         // §5.13 microphone voice effects
     case prompter      // the script, and the controls that scroll it
+    case meeting       // §5.32 the live transcript, and the assistant's key
     case framing
     case effects
     case format
@@ -449,6 +450,7 @@ public enum PopoverModule: String, Codable, CaseIterable, Identifiable {
         case .scene: return "Scene"
         case .voice: return "Voice"
         case .prompter: return "Prompter"
+        case .meeting: return "Meeting"
         case .framing: return "Framing"
         case .effects: return "Effects"
         case .format: return "Format"
@@ -469,6 +471,7 @@ public enum PopoverModule: String, Codable, CaseIterable, Identifiable {
         case .scene: return "theatermasks"
         case .voice: return "waveform.and.mic"
         case .prompter: return "doc.plaintext"
+        case .meeting: return "text.bubble"
         case .framing: return "crop.rotate"
         case .effects: return "wand.and.stars"
         case .format: return "rectangle.on.rectangle"

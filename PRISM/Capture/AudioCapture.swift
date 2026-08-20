@@ -213,6 +213,56 @@ public final class AudioCapture {
         micTap.read(from: cursor, into: buffer, maxFrames: maxFrames)
     }
 
+    // MARK: Transcription tap (§5.32)
+    //
+    // A second passive copy of the microphone, for the speech recogniser.
+    // Separate from the mic-check tap above for two independent reasons.
+    //
+    // It is taken at a different point in the chain. The mic check is tapped
+    // *after* the voice changer, because its whole job is to play back what
+    // the call receives. That is exactly the wrong signal for a recogniser:
+    // Chipmunk, Robot, Autotune and Telephone make speech unintelligible,
+    // and a transcript must not change because someone picked a voice
+    // effect. It is also taken before §5.17 cleanup, so a noise gate cannot
+    // clip a word onset and Studio's EQ cannot colour what the model hears.
+    // Whisper is robust to room noise; it is not robust to a ring modulator.
+    //
+    // And arming is a plain Bool, not a refcount. MicCheck.cancel() and
+    // finishRecording() call armTap(false) unconditionally, so sharing one
+    // ring would let a mic check ending disarm a transcript mid-sentence.
+    //
+    // Deeper than the mic-check ring — 1<<19 frames is 10.9 s at 48 kHz,
+    // 2 MB — because the reader hitches on model loads, disk and main-thread
+    // stalls in a way a 10 Hz playback poll never does. A lapped cursor is
+    // skipped forward silently, so the reader compares the returned cursor
+    // against the one it passed and records a gap rather than inventing
+    // continuity.
+
+    let asrTap = MicTapRing(capacityFrames: 1 << 19)
+    /// Same single-writer/lock-on-set-only discipline as isMuted.
+    private var _asrTapArmed = false
+
+    /// Arms the transcription tap. Main thread; the RT callback observes the
+    /// flag raw, at worst one IO slice late.
+    public func setASRTapArmed(_ armed: Bool) {
+        os_unfair_lock_lock(flagLock)
+        _asrTapArmed = armed
+        os_unfair_lock_unlock(flagLock)
+    }
+
+    /// Where a transcript should start reading from: the write head as of
+    /// now, so a meeting contains only speech captured after it started.
+    public var asrTapCursor: UInt64 { asrTap.head }
+
+    /// Drains tap frames written since `cursor`. Main thread. A returned
+    /// cursor greater than `cursor + frames` means the ring lapped and audio
+    /// was lost — the caller must treat that as a gap, not stitch across it.
+    public func readASRTap(from cursor: UInt64,
+                           into buffer: UnsafeMutablePointer<Float>,
+                           maxFrames: Int) -> (cursor: UInt64, frames: Int) {
+        asrTap.read(from: cursor, into: buffer, maxFrames: maxFrames)
+    }
+
     // MARK: Input level (§5.17)
     //
     // A continuous "is the microphone hearing me" reading, published from
@@ -564,6 +614,7 @@ public final class AudioCapture {
         voicePathInterrupted = false
         // The tap's lap-skip margin must dominate the largest single write.
         micTap.setMaxWriteFrames(convertCapacityFrames)
+        asrTap.setMaxWriteFrames(convertCapacityFrames)
 
         // Deliberate delay line (§5.12). Preallocated with the rest of the RT
         // buffers even when lag is never used: 10 s of 48 kHz stereo float is
@@ -679,6 +730,25 @@ public final class AudioCapture {
         }
 
         guard frames > 0 else { return noErr }
+
+        // §5.32: the transcription tap, taken here — converted to 48 kHz but
+        // ahead of cleanup and ahead of the voice changer. See the tap's
+        // declaration for why this is the opposite end of the chain from the
+        // mic check, and why that is deliberate rather than an oversight.
+        //
+        // Note where this sits relative to the two early returns above:
+        // while muted or while clip audio owns the ring, the callback has
+        // already returned and this tap receives *nothing* — not silence,
+        // nothing. That is the §5.32 privacy guarantee, and it is
+        // architecture rather than policy: there is no code path from a
+        // muted microphone to a transcript. Off costs one comparison.
+        if _asrTapArmed {
+            if clientChannels == 1 {
+                asrTap.writeMono(samples, frameCount: frames)
+            } else {
+                asrTap.writeStereoMixdown(samples, frameCount: frames)
+            }
+        }
 
         // §5.13/§5.17: both microphone chains process the 48 kHz signal in
         // place, before mono duplication and before the delay line, so

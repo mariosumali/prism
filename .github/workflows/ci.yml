@@ -53,27 +53,74 @@ jobs:
         run: |
           if [ -x Tools/driver_smoke/run.sh ]; then Tools/driver_smoke/run.sh; fi
 
-      - name: Verify no networking APIs in source
-        # §7 again, from the other end: the otool check below only fires if a
-        # framework actually links, which every Foundation-provided path
-        # (URLSession lives in Foundation, getaddrinfo in libSystem) walks
-        # straight past. Catch the call site instead.
+      - name: Verify no networking APIs outside the LLM transport
+        # §7, amended for §5.32/§5.33. PRISM still makes no request of its
+        # own: no analytics, no telemetry, no crash reporting, no update
+        # check. What changed is that a user may now point PRISM at an AI
+        # provider, and a request to a provider the user chose, made when
+        # the user presses a key, is a request the user asked for.
         #
-        # Every directory that ends up inside a shipped binary is scanned, not
-        # just the three top-level app targets. PRISMShared is compiled into
-        # the app, the audio plug-in and the tests (project.yml), it is C on
-        # the RT audio path, and a BSD socket there linked nothing but
-        # libSystem — so it walked past both tripwires. A check with a hole in
-        # it is worse than no check, because it is quoted as evidence.
+        # The guarantee is kept by construction rather than by intent: every
+        # byte PRISM sends leaves through ONE file. This step is the same
+        # grep as before with exactly one path allowlisted, so a networking
+        # call added anywhere else still fails the build — including in
+        # PRISMShared, which is compiled into the app, the plug-in and the
+        # tests, and which is C on the RT audio path.
         run: |
-          if grep -rnE 'URLSession|NSURLConnection|NWConnection|NWBrowser|NWListener|NWPathMonitor|NWEndpoint|import Network|CFNetwork|CFStream|NSStream|NSTask|Process\(\)|dnssd|getaddrinfo|sys/socket\.h|socket\(|sendto\(|recvfrom\(|contentsOf: *URL' \
-               PRISM PRISMShared PRISMKernels PRISMCameraExtension PRISMAudioPlugIn; then
-            echo "::error::Networking API referenced in source"; exit 1
+          HITS=$(grep -rnE 'URLSession|NSURLConnection|NWConnection|NWBrowser|NWListener|NWPathMonitor|NWEndpoint|import Network|CFNetwork|CFStream|NSStream|NSTask|Process\(\)|dnssd|getaddrinfo|sys/socket\.h|socket\(|sendto\(|recvfrom\(|contentsOf: *URL' \
+                   PRISM PRISMShared PRISMKernels PRISMCameraExtension PRISMAudioPlugIn \
+                 | grep -v '^PRISM/AI/LLM/LLMTransport\.swift:' || true)
+          if [ -n "$HITS" ]; then
+            echo "$HITS"
+            echo "::error::Networking API outside PRISM/AI/LLM/LLMTransport.swift"; exit 1
+          fi
+
+      - name: Verify the LLM transport reaches nothing it was not asked to
+        # The allowlisted file is ~150 lines and is meant to be read in full
+        # before being trusted. These two checks are what make that reading
+        # worth something: it may name only the two hosts PRISM knows about
+        # (a user-supplied endpoint is a runtime value the user typed, and
+        # is gated separately inside the file), and nothing anywhere in the
+        # tree may be telemetry-shaped.
+        #
+        # The second grep is NEW. The amendment narrowed the guarantee in
+        # one file and strengthened it everywhere else.
+        run: |
+          BAD=$(grep -nE "https?://" PRISM/AI/LLM/LLMTransport.swift \
+                | grep -vE 'api\.anthropic\.com|127\.0\.0\.1|localhost' || true)
+          if [ -n "$BAD" ]; then
+            echo "$BAD"; echo "::error::Unexpected endpoint literal in the LLM transport"; exit 1
+          fi
+          # Code only. Comment lines are stripped first, because this
+          # codebase argues with itself in comments and several of them
+          # discuss telemetry precisely in order to say PRISM has none — a
+          # check that fired on its own rationale would be deleted within a
+          # week, and a deleted check guards nothing.
+          TELEM=$(grep -rniE --include='*.swift' --include='*.c' --include='*.h' \
+                    --include='*.cpp' --include='*.metal' \
+                    'analytics|telemetry|crashlytics|sentry|checkForUpdate|phoneHome' \
+                    PRISM PRISMShared PRISMKernels PRISMCameraExtension PRISMAudioPlugIn \
+                  | grep -vE '^[^:]+:[0-9]+: *(//|/\*|\*)' || true)
+          if [ -n "$TELEM" ]; then
+            echo "$TELEM"; echo "::error::Telemetry-shaped symbol in source"; exit 1
           fi
 
       - name: Verify no network symbols in app
-        # §7: PRISM makes no network connections. Cheap tripwire: the app
-        # binary must not link networking frameworks.
+        # §7's original tripwire, kept EXACTLY as it was.
+        #
+        # It was expected to need narrowing once §5.32/§5.33 landed — the
+        # speech model is downloaded from Hugging Face and provider requests
+        # go out over HTTPS, so CFNetwork looked certain to link. Measured
+        # rather than assumed, and it does not: the app binary links neither
+        # CFNetwork nor Network.framework, because URLSession is reached
+        # through Foundation and the package pulls in nothing else.
+        #
+        # So this check is unchanged. A guard weakened on the strength of a
+        # prediction that turned out to be wrong is a guard given away for
+        # nothing, and if a future change does make CFNetwork link, this
+        # failing is the correct outcome — it means something started
+        # reaching the network by a route the source allowlist above cannot
+        # see, which is precisely what this exists to catch.
         run: |
           BIN=$(find ~/Library/Developer/Xcode/DerivedData -path '*Debug/PRISM.app/Contents/MacOS/PRISM' | head -1)
           if [ -n "$BIN" ]; then

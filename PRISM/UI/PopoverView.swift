@@ -186,6 +186,8 @@ struct PopoverView: View {
             CaptureSection()
         case .prompter:
             PrompterSection()
+        case .meeting:
+            MeetingSection()
         case .presets:
             PresetBar()
         case .scene:
@@ -311,9 +313,6 @@ struct PopoverView: View {
                     .controlSize(.small)
             case .clearBlocks:
                 Button("Unblock all") { state.clearAllBlocks() }
-                    .controlSize(.small)
-            case .openSettings:
-                Button("Open Settings") { openSettingsWindow() }
                     .controlSize(.small)
             // Settled in the main window — the capture folder is too large
             // a question to answer from a dropdown, so the button opens the
@@ -542,18 +541,20 @@ struct PopoverView: View {
 
     // MARK: - Bottom bar
 
+    /// One button, not two: the gear used to open a separate Settings window
+    /// that held a smaller copy of the same controls. Everything lives in the
+    /// PRISM window now, so there is one place to send anyone.
     private var bottomBar: some View {
         HStack {
             Button {
                 state.showMainWindow()
             } label: {
-                Image(systemName: "macwindow")
+                Image(systemName: "gearshape")
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
             .accessibilityLabel("Open PRISM window")
-            .help("Open the PRISM window")
-            settingsButton
+            .help("Open the PRISM window — every setting is in there")
             Spacer()
             Button {
                 state.quit()
@@ -565,35 +566,6 @@ struct PopoverView: View {
             .accessibilityLabel("Quit PRISM")
             .help("Quit PRISM")
         }
-    }
-
-    @ViewBuilder
-    private var settingsButton: some View {
-        if #available(macOS 14.0, *) {
-            SettingsLink {
-                Image(systemName: "gearshape")
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .accessibilityLabel("Settings")
-        } else {
-            Button {
-                openSettingsWindow()
-            } label: {
-                Image(systemName: "gearshape")
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .accessibilityLabel("Settings")
-        }
-    }
-
-    private func openSettingsWindow() {
-        // macOS 13 selector; older name kept as a fallback.
-        if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
-            NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
-        }
-        NSApp.activate(ignoringOtherApps: true)
     }
 
     /// Screen Recording is its own grant, and unlike camera and microphone

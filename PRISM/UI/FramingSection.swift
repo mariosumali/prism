@@ -4,7 +4,7 @@
 // Collapsible Framing section (§8.3): zoom and rotate sliders with numeric
 // fields, the "Flip output" mirror toggle with its §5.4 caption, and the
 // auto-frame toggle with its cost caption when blur is off. Also defines
-// PrismSliderRow, reused by the Settings tabs.
+// PrismSliderRow, the labelled slider every pane in the main window uses.
 //
 // Licensed under the Apache License, Version 2.0.
 

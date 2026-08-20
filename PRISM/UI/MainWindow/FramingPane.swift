@@ -6,7 +6,7 @@
 // aspect, auto-framing, and a reset — all above a live preview. Edits here
 // stage into the draft (previewed privately, applied from the Apply bar);
 // writes keep the geometry stage's enabled flag in sync with identity,
-// same as the popover and Settings.
+// same as the popover's framing section.
 //
 // Licensed under the Apache License, Version 2.0.
 

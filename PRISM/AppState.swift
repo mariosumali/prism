@@ -175,6 +175,16 @@ public final class AppState: ObservableObject {
             // switches ARE the demand gate for a Vision request, so they have
             // to reach the recogniser now rather than on some later frame
             // that happens to notice.
+            // §5.32/§5.33: both sessions hold a snapshot rather than
+            // reading `studio` per tick, so a settings change has to be
+            // pushed to them the way the voice chains are.
+            if studio.meeting != oldValue.meeting {
+                meeting.apply(studio.meeting)
+                reconcileTranscription()
+            }
+            if studio.assistant != oldValue.assistant {
+                assistant.apply(studio.assistant)
+            }
             if studio.gestures != oldValue.gestures {
                 updateGestureWatching()
             }
@@ -373,6 +383,12 @@ public final class AppState: ObservableObject {
     public let micCheck: MicCheck
     /// §5.21 — this session's history, in memory only.
     public let sessionLog = SessionLog()
+    /// §5.32 — the live transcript. Owns its own capture wiring and state
+    /// machine; AppState supplies the taps and the demand signal and stays
+    /// out of the rest.
+    public let meeting: MeetingSession
+    /// §5.33 — the in-meeting assistant.
+    public let assistant = AssistantSession()
 
     // MARK: - Components
 
@@ -512,6 +528,24 @@ public final class AppState: ObservableObject {
 
     public init() {
         micCheck = MicCheck(capture: audioCapture)
+        // §5.32. Every dependency arrives as a closure so the session can be
+        // driven headless in a test — no microphone, no permission, no
+        // model. `micIsOffAir` is the same signal the status line uses:
+        // while it is true the transcription tap receives nothing at all,
+        // and the session marks a gap rather than stitching across it.
+        let systemAudio = SystemAudioCapture()
+        self.systemAudioCapture = systemAudio
+        let capture = audioCapture
+        meeting = MeetingSession(
+            engineFactory: { model in
+                SpeechEngineRegistry.make(model)
+            },
+            armMicTap: { [capture] in capture.setASRTapArmed($0) },
+            micTapCursor: { [capture] in capture.asrTapCursor },
+            readMicTap: { [capture] cursor, buffer, maxFrames in
+                capture.readASRTap(from: cursor, into: buffer, maxFrames: maxFrames)
+            },
+            farEnd: systemAudio)
         // Metal is required for everything downstream; a Mac without Metal
         // cannot run the pipeline at all, so surface that as the error state.
         do {
@@ -540,6 +574,7 @@ public final class AppState: ObservableObject {
         pipeline?.clipStage.player = clipPlayer
 
         loadPersistedState()
+        wireMeeting()
         wireFramePath()
         wireLatencyMonitor()
         wireClipPlayer()
@@ -933,6 +968,8 @@ public final class AppState: ObservableObject {
         case .snapshot: takeSnapshot()
         case .screenSource: toggleScreenSource()
         case .prompter: togglePrompter()
+        case .meeting: toggleMeeting()
+        case .ask: askAssistant()
         }
     }
 
@@ -959,6 +996,38 @@ public final class AppState: ObservableObject {
         hotkeys.setPresetBindings(list.compactMap { preset in
             preset.hotkey.map { (preset.id, $0) }
         })
+    }
+
+    /// §5.32/§5.33. Installs the signals the two sessions cannot form for
+    /// themselves, and mirrors their published state back into the demand
+    /// gate.
+    private func wireMeeting() {
+        meeting.micIsOffAir = { [weak self] in self?.micIsOffAir ?? false }
+        meeting.apply(studio.meeting)
+        assistant.apply(studio.assistant)
+
+        // The key is read once, here, rather than per request.
+        cachedAnthropicKey = Keychain.get(account: Keychain.Account.anthropic) ?? ""
+        hasAnthropicKey = !cachedAnthropicKey.isEmpty
+
+        // A meeting that stops for any reason — the user, a failure, or a
+        // model that would not load — has to drop audio demand with it, or
+        // the microphone stays live for a transcript nobody is taking.
+        meeting.$phase
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.reconcileTranscription() }
+            .store(in: &cancellables)
+
+        // The detector runs on settled far-end text and lights a control.
+        // It never causes a request — see §5.33 and QuestionDetector.
+        meeting.$lines
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self, self.studio.assistant.isActive else { return }
+                self.assistant.observeTranscript(
+                    self.meeting.transcriptTail(turns: 6))
+            }
+            .store(in: &cancellables)
     }
 
     private func wireSetupObservers() {
@@ -1328,8 +1397,29 @@ public final class AppState: ObservableObject {
     /// virtual mic went silent exactly when someone listened to it). It
     /// widens audio demand only: an audio-only client must not turn the
     /// camera on.
+    /// §5.32: a meeting being transcribed is microphone demand too. The
+    /// popover can be closed, no app can be reading the virtual mic, and
+    /// PRISM still has to be hearing the room — otherwise the transcript
+    /// stops the moment the user looks away from it.
+    ///
+    /// Flipped only from `meeting.phase`, and every flip reconciles, in the
+    /// same shape as `virtualMicInUse`.
+    private var transcriptionActive = false
+
+    /// §5.33. Read once at launch and held in memory: every `SecItem` call
+    /// blocks the calling thread, and doing that per request would put a
+    /// synchronous keychain read on the path of a live answer.
+    private var cachedAnthropicKey = ""
+    /// Published so the pane can show "saved" without the key itself ever
+    /// reaching a view.
+    @Published public private(set) var hasAnthropicKey = false
+    /// §5.32 far-end capture. Held here so its lifetime matches the app's;
+    /// `MeetingSession` starts and stops it.
+    private let systemAudioCapture: SystemAudioCapture
+    private let noteWriter = MeetingNoteWriter()
+
     private var audioCaptureDemand: Bool {
-        captureDemand || virtualMicInUse
+        captureDemand || virtualMicInUse || transcriptionActive
     }
 
     /// Shared didSet body for `popoverOpen` and `mainWindowOpen`: the preview
@@ -2014,7 +2104,9 @@ public final class AppState: ObservableObject {
     /// configured delay and then resumes that far behind live — a stall, not
     /// a rewind, which is what adding latency actually looks like.
     public func engageLag() {
-        guard let pipeline, !isLagging else { return }
+        // The pipeline is a precondition, not a participant: the transport is
+        // claimed through claimReplayTransport below.
+        guard pipeline != nil, !isLagging else { return }
         guard studio.replay.isArmed else {
             warning = WarningMessage(
                 text: "Turn on the rolling buffer to use the lag switch",
@@ -2743,6 +2835,292 @@ public final class AppState: ObservableObject {
     private func revertToCamera(logging message: String) {
         sessionLog.record(.device, message)
         selectVideoSource(.camera)
+    }
+
+    // MARK: - Intents: meetings (§5.32)
+
+    /// ⌃⌥⌘M. Starts transcribing this call, or stops and files the
+    /// transcript.
+    public func toggleMeeting() {
+        if meeting.phase.isRunning {
+            stopMeeting()
+        } else {
+            startMeeting()
+        }
+    }
+
+    public func startMeeting() {
+        guard !meeting.phase.isRunning else { return }
+        // The switch and the action ask one question between them (§8.7):
+        // pressing the chord on a machine where transcription has never
+        // been turned on turns it on, rather than doing nothing and
+        // explaining why.
+        if !studio.meeting.transcribes {
+            studio.meeting.transcribes = true
+            meeting.apply(studio.meeting)
+        }
+        guard permissions.microphone == .granted else {
+            warning = WarningMessage(
+                text: "PRISM needs microphone access to transcribe this call.")
+            return
+        }
+        meeting.start()
+        reconcileTranscription()
+        sessionLog.record(.device, "Started transcribing (\(farEndLogPhrase))")
+    }
+
+    public func stopMeeting() {
+        guard meeting.phase.isRunning else { return }
+        let minutes = Int(meeting.elapsed / 60)
+        meeting.stop()
+        reconcileTranscription()
+        sessionLog.record(.device, "Stopped transcribing after \(minutes) min")
+    }
+
+    /// The §5.21 redaction rule at its sharpest. A log row may say PRISM was
+    /// transcribing and which application it was listening to — both things
+    /// the pickers already show. It may never say a word of what was heard.
+    private var farEndLogPhrase: String {
+        switch studio.meeting.farEnd {
+        case .off: return "you only"
+        case .everything: return "you and this Mac's audio"
+        case .chosenApp:
+            let name = studio.meeting.farEndBundleID ?? "an app"
+            return "you and \(name)"
+        }
+    }
+
+    public func setMeetingTranscribes(_ on: Bool) {
+        guard on != studio.meeting.transcribes else { return }
+        studio.meeting.transcribes = on
+        if !on, meeting.phase.isRunning { stopMeeting() }
+    }
+
+    public func setMeetingModel(_ shortName: String) {
+        guard shortName != studio.meeting.model else { return }
+        studio.meeting.model = shortName
+    }
+
+    public func setMeetingLanguage(_ language: String) {
+        studio.meeting.language = language
+    }
+
+    public func setMeetingFarEnd(_ source: FarEndSource) {
+        guard source != studio.meeting.farEnd else { return }
+        studio.meeting.farEnd = source
+        if source != .off, permissions.screenRecording != .granted {
+            // Asked for rather than demanded: mic-only transcription is a
+            // complete feature, and the pane explains that Screen Recording
+            // is macOS's name for the permission covering another
+            // application's *sound*. PRISM captures no pixels for this.
+            Task { [weak self] in
+                _ = await self?.permissions.requestScreenRecording()
+            }
+        }
+    }
+
+    public func setMeetingFarEndApp(_ bundleID: String?) {
+        studio.meeting.farEndBundleID = bundleID
+    }
+
+    public func setMeetingFarEndLabel(_ label: String) {
+        studio.meeting.farEndLabel = label
+    }
+
+    public func setMeetingSilenceRMS(_ value: Double) {
+        studio.meeting.silenceRMS = value
+    }
+
+    public func setMeetingSavesTranscript(_ saves: Bool) {
+        studio.meeting.savesTranscript = saves
+    }
+
+    public func setMeetingTemplate(_ name: String) {
+        studio.meeting.templateName = name
+    }
+
+    /// Arms or disarms the tap and the drain, exactly as
+    /// `reconcileInputLevel` does for the meter. Gated on the session
+    /// actually listening, so an armed tap and a running drain can only
+    /// exist while there is a meeting to feed.
+    private func reconcileTranscription() {
+        let active = meeting.phase.isRunning
+        guard active != transcriptionActive else { return }
+        transcriptionActive = active
+        reconcileCaptures()
+    }
+
+    // MARK: - Intents: assistant (§5.33)
+
+    /// §5.33 — puts the answer panel on screen, or takes it away. The same
+    /// shape as the prompter's handler, and for the same reason: AppState
+    /// may not reference the UI layer, so the app delegate installs this.
+    public var assistantPanelHandler: ((Bool) -> Void)?
+
+    public func setAssistantEnabled(_ enabled: Bool) {
+        guard enabled != studio.assistant.isEnabled else { return }
+        studio.assistant.isEnabled = enabled
+        if !enabled { assistant.cancel() }
+        assistantPanelHandler?(enabled)
+    }
+
+    /// ⌃⌥⌘A. Opens the panel if it is closed; otherwise asks — the detected
+    /// question if there is one, and a "what should I know" summary if not.
+    ///
+    /// It never dismisses. See `ShortcutAction.ask`.
+    public func askAssistant(_ text: String? = nil) {
+        guard studio.assistant.provider != .none else {
+            warning = WarningMessage(
+                text: "Choose an AI provider in the Assistant pane first.")
+            return
+        }
+        if !studio.assistant.isEnabled {
+            setAssistantEnabled(true)
+        }
+        guard let provider = makeProvider() else {
+            warning = WarningMessage(
+                text: LLMError.missingKey.errorDescription ?? "That provider isn't set up yet.")
+            return
+        }
+        assistant.ask(text, provider: provider,
+                      transcriptTail: meeting.transcriptTail(
+                        turns: studio.assistant.clampedContextTurns))
+    }
+
+    public func setAssistantProvider(_ kind: LLMProviderKind) {
+        guard kind != studio.assistant.provider else { return }
+        studio.assistant.provider = kind
+        if kind == .none { assistant.cancel() }
+    }
+
+    public func setAssistantModel(_ model: String) {
+        switch studio.assistant.provider {
+        case .anthropic: studio.assistant.anthropicModel = model
+        case .ollama: studio.assistant.ollamaModel = model
+        case .openAICompatible: studio.assistant.compatibleModel = model
+        case .none: break
+        }
+    }
+
+    public func setAssistantBaseURL(_ url: String) {
+        studio.assistant.compatibleBaseURL = url
+    }
+
+    public func setAssistantOpacity(_ value: Double) {
+        studio.assistant.opacity = value
+    }
+
+    public func setAssistantAnchor(_ anchor: AssistantAnchor) {
+        studio.assistant.anchor = anchor
+    }
+
+    public func setAssistantContextTurns(_ turns: Int) {
+        studio.assistant.contextTurns = turns
+    }
+
+    public func setAssistantHighlightsQuestions(_ on: Bool) {
+        studio.assistant.highlightsQuestions = on
+    }
+
+    public func setAssistantAboutMe(_ text: String) {
+        studio.assistant.aboutMe = text
+    }
+
+    /// Stores the key in the Keychain and caches it in memory.
+    ///
+    /// Cached because every `SecItem` call blocks the calling thread, and a
+    /// keychain read per request would put that on the path of a live
+    /// answer. Never written to `StudioSettings` — that is JSON in a plist
+    /// any process running as this user can read.
+    @discardableResult
+    public func setAnthropicKey(_ key: String) -> Bool {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            _ = Keychain.remove(account: Keychain.Account.anthropic)
+            cachedAnthropicKey = ""
+            hasAnthropicKey = false
+            return true
+        }
+        switch Keychain.set(trimmed, account: Keychain.Account.anthropic) {
+        case .success:
+            cachedAnthropicKey = trimmed
+            hasAnthropicKey = true
+            return true
+        case .failure(let error):
+            warning = WarningMessage(text: error.errorDescription
+                                     ?? "PRISM couldn't save that key.")
+            return false
+        }
+    }
+
+    /// Builds the provider the settings currently describe, or nil when it
+    /// is not usable yet.
+    func makeProvider() -> LLMProvider? {
+        switch studio.assistant.provider {
+        case .none:
+            return nil
+        case .anthropic:
+            guard !cachedAnthropicKey.isEmpty else { return nil }
+            return AnthropicProvider(model: studio.assistant.anthropicModel,
+                                     apiKey: cachedAnthropicKey)
+        case .ollama:
+            guard !studio.assistant.ollamaModel.isEmpty else { return nil }
+            return OllamaProvider(model: studio.assistant.ollamaModel)
+        case .openAICompatible:
+            guard studio.assistant.providerIsConfigured else { return nil }
+            return OpenAICompatibleProvider(
+                baseURL: studio.assistant.compatibleBaseURL,
+                model: studio.assistant.compatibleModel)
+        }
+    }
+
+    // MARK: - Intents: meeting notes (§5.32)
+
+    /// Writes notes from the transcript. The one place §5.32 reaches the
+    /// network, and only because the user pressed a button that says so.
+    public func writeMeetingNotes() {
+        guard let record = meeting.record, !record.words.isEmpty else {
+            warning = WarningMessage(text: "There's no transcript to write notes from yet.")
+            return
+        }
+        guard let provider = makeProvider() else {
+            warning = WarningMessage(
+                text: "Choose an AI provider in the Assistant pane first.")
+            return
+        }
+        meeting.setNotesPhase(.writing)
+        let started = Date()
+        noteWriter.write(
+            record: record,
+            transcript: meeting.labelledTranscript,
+            template: NoteTemplate.named(studio.meeting.templateName),
+            provider: provider,
+            language: studio.meeting.language,
+            onProgress: { _ in },
+            completion: { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success(let notes):
+                    self.meeting.applyNotes(markdown: notes.markdown,
+                                            title: notes.title,
+                                            items: notes.actionItems)
+                    let seconds = Int(Date().timeIntervalSince(started))
+                    // Names the model and the time. Never a word of what it
+                    // wrote — §5.21's rule does not bend for the feature
+                    // that produces the most sensitive text in the app.
+                    self.sessionLog.record(
+                        .degradation,
+                        "Wrote meeting notes with \(provider.displayName) in \(seconds)s")
+                case .failure(let error):
+                    self.meeting.setNotesPhase(.failed(error.localizedDescription))
+                    self.sessionLog.record(.degradation, "Meeting notes failed")
+                }
+            })
+    }
+
+    public func cancelMeetingNotes() {
+        noteWriter.cancel()
+        meeting.setNotesPhase(.none)
     }
 
     // MARK: - Intents: prompter (§5.27)
@@ -3986,6 +4364,12 @@ public final class AppState: ObservableObject {
 
     public func quit() {
         micCheck.cancel()
+        // §5.32: stop rather than abandon. A meeting torn down by the
+        // process exiting is a transcript that was never written, and the
+        // user pressed Quit rather than asking to lose it.
+        if meeting.phase.isRunning { stopMeeting() }
+        assistant.cancel()
+        noteWriter.cancel()
         levelTimer?.invalidate()
         levelTimer = nil
         audioCapture.stop()

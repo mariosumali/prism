@@ -331,11 +331,14 @@ public struct StudioSettings: Codable, Equatable {
     public var presence = PresenceSettings()
     public var prompter = PrompterSettings()
     public var gestures = GestureSettings()
+    public var meeting = MeetingSettings()
+    public var assistant = AssistantSettings()
     public init() {}
 
     public enum CodingKeys: String, CodingKey {
         case replay, away, panic, lag, voice, connection
         case capture, apps, cleanup, micWatch, presence, prompter, gestures
+        case meeting, assistant
     }
 
     /// Same forward-compatibility contract as PipelineConfiguration: a field
@@ -360,6 +363,8 @@ public struct StudioSettings: Codable, Equatable {
         presence = decode(.presence, PresenceSettings())
         prompter = decode(.prompter, PrompterSettings())
         gestures = decode(.gestures, GestureSettings())
+        meeting = decode(.meeting, MeetingSettings())
+        assistant = decode(.assistant, AssistantSettings())
     }
 
     /// The rolling buffer runs when replay is armed, or when the away loop

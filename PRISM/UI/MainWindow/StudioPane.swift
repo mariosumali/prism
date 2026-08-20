@@ -110,7 +110,7 @@ struct StudioPane: View {
                     .controlSize(.small)
             // The capture folder lives in this window, so from here the
             // warning row has nowhere to send anyone.
-            case .chooseCaptureFolder, .openSettings, .none:
+            case .chooseCaptureFolder, .none:
                 EmptyView()
             }
         }

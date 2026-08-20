@@ -449,7 +449,7 @@ public final class ReplayBuffer {
     }
 
     private func ensureSession(width: Int, height: Int) -> Bool {
-        if let session, sessionWidth == width, sessionHeight == height {
+        if session != nil, sessionWidth == width, sessionHeight == height {
             return true
         }
         if let session {

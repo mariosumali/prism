@@ -26,8 +26,11 @@
 	<string>13.0</string>
 	<!-- SPEC §1 specifies LSUIElement = true (menu bar only, no Dock icon).
 	     Overridden deliberately: PRISM shows in the Dock *and* the menu bar.
-	     Clicking the Dock icon opens Settings (see PRISMAppDelegate), since a
-	     menu bar agent has no main window to raise. -->
+	     Clicking the Dock icon opens the main PRISM window — the app's one
+	     settings surface — via applicationShouldHandleReopen in
+	     PRISMAppDelegate. The popover belongs to the menu bar item and
+	     cannot be summoned programmatically, so the Dock needs somewhere
+	     of its own to go. -->
 	<key>LSUIElement</key>
 	<false/>
 	<key>LSApplicationCategoryType</key>
