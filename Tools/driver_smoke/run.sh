@@ -5,9 +5,16 @@
 # executes it. Exits nonzero if compilation fails or any assertion FAILs.
 set -euo pipefail
 
-ROOT="/Users/mariosumali/Documents/GitHub/prism"
-SRC="$ROOT/Tools/driver_smoke"
-BIN="/tmp/prism_driver_smoke"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$DIR/../.." && pwd)"
+SRC="$DIR"
+BIN="${TMPDIR:-/tmp}/prism_driver_smoke"
+
+if pgrep -x PRISM >/dev/null 2>&1; then
+  echo "driver_smoke: quit PRISM before running this test." >&2
+  echo "              The smoke test owns and resets the production audio ring." >&2
+  exit 2
+fi
 
 OBJDIR="$(mktemp -d "${TMPDIR:-/tmp}/prism_driver_smoke_obj.XXXXXX")"
 trap 'rm -rf "$OBJDIR"' EXIT

@@ -38,6 +38,7 @@
 
 #include <fcntl.h>
 #include <math.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,6 +59,20 @@ static float            gPeak;
 static double           gSumSq;
 static unsigned long long gFrames;
 static unsigned long long gCallbacks;
+
+// A damaged or stale HAL plug-in can accept configuration and then never
+// finish starting its IO thread. A diagnostic must diagnose that state, not
+// become one more process waiting on it forever. Keep the handler strictly
+// async-signal-safe: write a fixed message and leave immediately.
+static void startTimedOut(int signalNumber) {
+    (void)signalNumber;
+    static const char message[] =
+        "FAIL: AudioOutputUnitStart did not return within 10 seconds.\n"
+        "      Core Audio is wedged. Restart it with `sudo killall coreaudiod`;\n"
+        "      if only PRISM still fails, run ./rebuild.sh --driver-only.\n";
+    (void)write(STDERR_FILENO, message, sizeof(message) - 1);
+    _exit(2);
+}
 
 static OSStatus inputProc(void *ref, AudioUnitRenderActionFlags *flags,
                           const AudioTimeStamp *ts, UInt32 bus,
@@ -138,6 +153,10 @@ static PRISMRingBuffer *mapRing(void) {
 }
 
 int main(int argc, char **argv) {
+    // The probe is commonly run from another script or CI, where stdout is
+    // block-buffered. Keep progress visible if a CoreAudio call stalls.
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     int seconds = 5;
     int control = 0;
     for (int i = 1; i < argc; i++) {
@@ -216,8 +235,16 @@ int main(int argc, char **argv) {
                                    kAudioOutputUnitProperty_SetInputCallback,
                                    kAudioUnitScope_Global, 0, &cb,
                                    sizeof(cb))) != noErr
-        || (st = AudioUnitInitialize(gUnit)) != noErr
-        || (st = AudioOutputUnitStart(gUnit)) != noErr) {
+        || (st = AudioUnitInitialize(gUnit)) != noErr) {
+        printf("FAIL: could not start capture (status %d).\n", (int)st);
+        return 1;
+    }
+
+    signal(SIGALRM, startTimedOut);
+    alarm(10);
+    st = AudioOutputUnitStart(gUnit);
+    alarm(0);
+    if (st != noErr) {
         printf("FAIL: could not start capture (status %d).\n", (int)st);
         return 1;
     }

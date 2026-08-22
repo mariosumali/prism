@@ -55,12 +55,21 @@ IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
 [ -n "$IDENTITY" ] || IDENTITY="-"
 echo "==> building PRISMAudioPlugIn (signing as: $IDENTITY)"
 
+LOG="${TMPDIR:-/tmp}/prism-audio-build.log"
+status=0
 xcodebuild -project PRISM.xcodeproj -target PRISMAudioPlugIn \
     -configuration Release build \
     CODE_SIGN_IDENTITY="$IDENTITY" \
     CODE_SIGN_STYLE=Manual \
     PROVISIONING_PROFILE_SPECIFIER="" \
-    | grep -E "error:|\*\* BUILD" || true
+    >"$LOG" 2>&1 || status=$?
+
+if [ "$status" -ne 0 ]; then
+    echo "==> BUILD FAILED — the installed driver was not touched" >&2
+    grep -E "error:|\*\* BUILD FAILED" "$LOG" | head -40 >&2 || true
+    echo "    full log: $LOG" >&2
+    exit "$status"
+fi
 
 BUILT="build/Release/PRISM.driver"
 [ -d "$BUILT" ] || { echo "install_audio.sh: $BUILT was not produced" >&2; exit 1; }

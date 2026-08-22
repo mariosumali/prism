@@ -74,17 +74,48 @@ else
 fi
 
 echo "==> building"
-xcodebuild -project PRISM.xcodeproj -target PRISM -configuration Debug build \
+LOG="${TMPDIR:-/tmp}/prism-local-build.log"
+LOCAL_DERIVED_DATA="$PWD/build/LocalDerivedData"
+status=0
+xcodebuild -project PRISM.xcodeproj -scheme PRISM -configuration Debug build \
+    -derivedDataPath "$LOCAL_DERIVED_DATA" \
     CODE_SIGN_IDENTITY="$IDENTITY" \
     CODE_SIGN_STYLE=Manual \
     CODE_SIGN_ENTITLEMENTS="PRISM/PRISM-Local.entitlements" \
     PROVISIONING_PROFILE_SPECIFIER="" \
-    | grep -E "error:|warning: .*(deprecat|unused)|\*\* BUILD" || true
+    >"$LOG" 2>&1 || status=$?
 
-APP="build/Debug/PRISM.app"
-[ -d "$APP" ] || { echo "run_local.sh: $APP was not produced" >&2; exit 1; }
+if [ "$status" -ne 0 ]; then
+    echo "==> BUILD FAILED — existing build was not launched" >&2
+    grep -E "error:|\*\* BUILD FAILED" "$LOG" | head -40 >&2 || true
+    echo "    full log: $LOG" >&2
+    exit "$status"
+fi
+
+grep -E "warning: .*(deprecat|unused)" "$LOG" || true
+
+APP="$LOCAL_DERIVED_DATA/Build/Products/Debug/PRISM.app"
+[ -x "$APP/Contents/MacOS/PRISM" ] || {
+    echo "run_local.sh: $APP was not produced completely" >&2
+    exit 1
+}
+if ! codesign --verify --deep --strict "$APP" >/dev/null 2>&1; then
+    echo "run_local.sh: $APP failed signature verification" >&2
+    exit 1
+fi
+
+# A build product is not another installed copy of PRISM. Xcode can register
+# it while building even when --build-only is used, so remove that transient
+# Launch Services record before returning (and again after `open` below).
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+unregister_build_copy() {
+    if [ -x "$LSREGISTER" ]; then
+        "$LSREGISTER" -u "$APP" >/dev/null 2>&1 || true
+    fi
+}
 
 if [ "$BUILD_ONLY" -eq 1 ]; then
+    unregister_build_copy
     echo "==> built $APP (not launched)"
     exit 0
 fi
@@ -99,3 +130,5 @@ fi
 echo "==> launching — look for the prism glyph in the menu bar"
 echo "    (first launch prompts for camera and microphone access)"
 open "$APP"
+sleep 1
+unregister_build_copy

@@ -257,8 +257,10 @@ func findPrismSink() -> (device: CMIODeviceID, sink: CMIOStreamID)? {
     guard !streams.isEmpty else { return nil }
 
     let directions = streams.map { cmioUInt32(of: $0, selector: Int(kCMIOStreamPropertyDirection)) }
-    // Sink = the stream the host writes into (direction 1); source = 0.
-    if let idx = directions.firstIndex(where: { $0 == 1 }) {
+    // CoreMediaIO names these from the hardware's perspective: the
+    // client-facing capture/source stream is input (1), while the stream the
+    // app writes into is output (0). CMIOSink uses this same convention.
+    if let idx = directions.firstIndex(where: { $0 == 0 }) {
         return (device, streams[idx])
     }
     if streams.count >= 2 {
@@ -388,7 +390,12 @@ func runCameraLoop(seconds: Double, width: Int, height: Int, fps: Int) -> Stats?
 
     // 3. Copy the sink's buffer queue and start the stream (CMIOSink's path).
     var queueRef: Unmanaged<CMSimpleQueue>?
-    var status = CMIOStreamCopyBufferQueue(sinkStreamID, nil, nil, &queueRef)
+    // The producer callback is required even though the harness does not need
+    // its notification payload. Passing nil can return noErr with no queue,
+    // which looks like an impossible framework failure and masks a healthy
+    // extension.
+    var status = CMIOStreamCopyBufferQueue(sinkStreamID, { _, _, _ in }, nil,
+                                           &queueRef)
     guard status == 0, let sinkQueue = queueRef?.takeRetainedValue() else {
         print("   SKIPPED: CMIOStreamCopyBufferQueue failed (\(status)).")
         return nil
@@ -401,10 +408,14 @@ func runCameraLoop(seconds: Double, width: Int, height: Int, fps: Int) -> Stats?
     defer { CMIODeviceStopStream(deviceID, sinkStreamID) }
 
     // 4. Capture session on the PRISM Camera AVCaptureDevice.
-    // (.externalUnknown is deprecated in macOS 14 in favor of .external,
-    // but PRISM targets macOS 13.0 — the warning is expected.)
+    let externalDeviceType: AVCaptureDevice.DeviceType
+    if #available(macOS 14.0, *) {
+        externalDeviceType = .external
+    } else {
+        externalDeviceType = .externalUnknown
+    }
     let discovery = AVCaptureDevice.DiscoverySession(
-        deviceTypes: [.externalUnknown, .builtInWideAngleCamera],
+        deviceTypes: [externalDeviceType, .builtInWideAngleCamera],
         mediaType: .video, position: .unspecified)
     guard let camera = discovery.devices.first(where: {
         $0.uniqueID == prismCameraDeviceUID || $0.localizedName == "PRISM Camera"

@@ -22,7 +22,7 @@
 	     an old contract fails in ways that look like app bugs ('who?' on new
 	     properties). -->
 	<key>CFBundleVersion</key>
-	<string>2</string>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<!-- Required for the com.apple.system_extension.cmio category: without

@@ -28,6 +28,9 @@ cd "$(dirname "$0")"
 DRIVER="/Library/Audio/Plug-Ins/HAL/PRISM.driver"
 INSTALLED="/Applications/PRISM.app"
 PREVIOUS="/Applications/PRISM.app.previous"
+PREVIOUS_INFO="$PREVIOUS/Contents/Info.plist"
+PREVIOUS_INFO_DISABLED="$PREVIOUS/Contents/Info.plist.rollback"
+ROLLBACK_SWAP="/Applications/PRISM.rollback-swap"
 DO_APP=1
 DO_DRIVER=0
 ASK_DRIVER=1
@@ -48,10 +51,11 @@ done
 # Is the installed driver older than any driver source file? The driver reads
 # the shared ring layout too, so PRISMShared counts as driver source.
 driver_is_stale() {
-    [ -d "$DRIVER" ] || return 0
+    driver_bin="$DRIVER/Contents/MacOS/PRISM"
+    [ -f "$driver_bin" ] || return 0
     newest=$(find PRISMAudioPlugIn PRISMShared -type f \
                   \( -name '*.cpp' -o -name '*.c' -o -name '*.h' \) \
-                  -newer "$DRIVER" -print -quit 2>/dev/null)
+                  -newer "$driver_bin" -print -quit 2>/dev/null)
     [ -n "$newest" ]
 }
 
@@ -75,16 +79,40 @@ if [ "$DO_ROLLBACK" -eq 1 ]; then
     fi
     pkill -x PRISM 2>/dev/null || true
     sleep 1
-    # Swap, so a rollback is itself reversible by running --rollback again.
+    # Swap, so a rollback is itself reversible. Update the live bundle in
+    # place to preserve the status-item identity remembered by Control Center.
     if [ -d "$INSTALLED" ]; then
-        mv "$INSTALLED" "$PREVIOUS.swap"
-        mv "$PREVIOUS" "$INSTALLED"
-        mv "$PREVIOUS.swap" "$PREVIOUS"
+        if [ -f "$PREVIOUS_INFO_DISABLED" ]; then
+            mv "$PREVIOUS_INFO_DISABLED" "$PREVIOUS_INFO"
+        fi
+        rm -rf "$ROLLBACK_SWAP"
+        ditto "$INSTALLED" "$ROLLBACK_SWAP"
+        rsync -a --delete --inplace "$PREVIOUS/" "$INSTALLED/"
+        rm -rf "$PREVIOUS"
+        mv "$ROLLBACK_SWAP" "$PREVIOUS"
+        mv "$PREVIOUS_INFO" "$PREVIOUS_INFO_DISABLED"
     else
+        if [ -f "$PREVIOUS_INFO_DISABLED" ]; then
+            mv "$PREVIOUS_INFO_DISABLED" "$PREVIOUS_INFO"
+        fi
         mv "$PREVIOUS" "$INSTALLED"
     fi
     echo "==> rolled back to the previously installed build"
+    LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+    if [ -x "$LSREGISTER" ]; then
+        "$LSREGISTER" -f "$INSTALLED" >/dev/null 2>&1 || true
+        "$LSREGISTER" -u "$PREVIOUS" >/dev/null 2>&1 || true
+        "$LSREGISTER" -u /Applications/PRISM.app.backup >/dev/null 2>&1 || true
+    fi
     open "$INSTALLED"
+    if [ -x "$LSREGISTER" ]; then
+        sleep 1
+        "$LSREGISTER" -u "$PREVIOUS" >/dev/null 2>&1 || true
+        "$LSREGISTER" -u /Applications/PRISM.app.backup >/dev/null 2>&1 || true
+        sleep 2
+        "$LSREGISTER" -u "$PREVIOUS" >/dev/null 2>&1 || true
+        "$LSREGISTER" -u /Applications/PRISM.app.backup >/dev/null 2>&1 || true
+    fi
     exit 0
 fi
 
@@ -150,9 +178,8 @@ if [ "$DO_APP" -eq 1 ]; then
     sleep 2
     if pgrep -x PRISM >/dev/null 2>&1; then
         echo
-        echo "    PRISM is running. If the menu bar item is missing, open it"
-        echo "    from the Dock — and see the menu-bar note in docs/ before"
-        echo "    changing any icon code, which has been the wrong fix before."
+        echo "    PRISM is running — look for the prism glyph in the menu bar."
+        echo "    The Dock icon opens the full control window."
     else
         echo
         echo "    ⚠  PRISM is not running after launch — check Console.app." >&2
