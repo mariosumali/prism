@@ -240,6 +240,12 @@ public final class VideoPipeline {
     private var outputPool: CVPixelBufferPool?
     private var workingWidth = 0
     private var workingHeight = 0
+    /// Last configuration actually applied to FrameRing. Keeping this on the
+    /// frame queue avoids taking FrameRing's lock just to rediscover that the
+    /// source dimensions and resource plan are unchanged on every frame.
+    private var frameRingWidth = 1920
+    private var frameRingHeight = 1080
+    private var frameRingDepth = 0
     private var intermediateA: MTLTexture?
     private var intermediateB: MTLTexture?
     private var outputScratch: MTLTexture?     // outputFit target while crossfading
@@ -420,6 +426,7 @@ public final class VideoPipeline {
         frameRing = try FrameRing(metal: metal, width: initialFormat.width,
                                   height: initialFormat.height,
                                   depth: initialPlan.freezeDepth)
+        frameRingDepth = initialPlan.freezeDepth
         stillRing = try StillRing(metal: metal)
         sharpnessPipeline = try metal.computePipeline(function: "prism_sharpness")
         crossfadePipeline = try metal.computePipeline(function: "prism_crossfade")
@@ -581,10 +588,13 @@ public final class VideoPipeline {
                 let clipSubstituting = clipStage.isEnabled
                     && (clipStage.player?.hasFrame ?? false)
                 if !clipSubstituting {
-                    let pick = frameRing.sharpestFrame(nowTime: now, windowMs: 300)
-                        ?? frameRing.sharpestFrame(nowTime: now, windowMs: .infinity)
-                    if let pick, let copy = snapshotTexture(of: pick) {
-                        freezeStage.freeze(texture: copy)
+                    let pick = frameRing.sharpestTexture(nowTime: now, windowMs: 300)
+                        ?? frameRing.sharpestTexture(nowTime: now, windowMs: .infinity)
+                    if let pick {
+                        // FreezeStage makes the one owned copy required here.
+                        // Copying first in VideoPipeline made a second full
+                        // resolution allocation and blit on every freeze.
+                        freezeStage.freeze(texture: pick)
                     } else {
                         // Nothing to hold (capture stopped / ring empty).
                         // Defer: the first live frame becomes the freeze
@@ -613,7 +623,7 @@ public final class VideoPipeline {
     /// exists to close. A refused start releases it again.
     ///
     /// The picture is the same pick freeze makes (§5.2): the sharpest frame
-    /// of the preceding 300 ms, copied out of the ring so the pool cannot
+    /// of the preceding 300 ms, copied out of the ring so the next write cannot
     /// overwrite it. With an empty ring there is nothing to hold and the
     /// stage falls back to what it did before — but then no camera has
     /// delivered, so there is no live picture to leak either.
@@ -623,8 +633,8 @@ public final class VideoPipeline {
         let now = lastFrameTime
         stateLock.unlock()
         frameQueue.sync {
-            let pick = frameRing.sharpestFrame(nowTime: now, windowMs: 300)
-                ?? frameRing.sharpestFrame(nowTime: now, windowMs: .infinity)
+            let pick = frameRing.sharpestTexture(nowTime: now, windowMs: 300)
+                ?? frameRing.sharpestTexture(nowTime: now, windowMs: .infinity)
             replayStage.bridgeFrame = pick.flatMap { snapshotTexture(of: $0) }
         }
         guard start(replayPlayer) else {
@@ -922,8 +932,8 @@ public final class VideoPipeline {
         // command buffer is committed, so a freeze pick can never snapshot a
         // slot whose copy has not yet been submitted to the queue.
         var ringSlot = -1
-        if let cameraBuffer, ringStrideCounter % UInt64(ringStride) == 0 {
-            ringSlot = frameRing.record(cameraBuffer, at: time, encoder: commandBuffer)
+        if cameraBuffer != nil, ringStrideCounter % UInt64(ringStride) == 0 {
+            ringSlot = frameRing.record(source, at: time, encoder: commandBuffer)
             if ringSlot >= 0 {
                 encodeSharpness(into: commandBuffer, source: source, slot: ringSlot,
                                 result: frameRing.sharpnessBuffer)
@@ -953,6 +963,8 @@ public final class VideoPipeline {
         // the completed handler because a stage's pass count is a property of
         // the frame, and by then the next one may have changed it.
         var encodedWeights: [Double] = []
+        encoded.reserveCapacity(userStages.count + 1)
+        encodedWeights.reserveCapacity(userStages.count + 1)
         var current = source
         var useA = true
         var segmentationDone = false
@@ -1217,9 +1229,15 @@ public final class VideoPipeline {
             workingHeight = height
         }
         // §5.2/§7: how far back the ring reaches is the governor's call and
-        // moves with the format; reconfigure early-returns when nothing
-        // changed, so this costs a comparison per frame.
-        try frameRing.reconfigure(width: width, height: height, depth: depth)
+        // moves with the format. The frame queue owns this snapshot, so the
+        // common path avoids entering FrameRing's lock altogether.
+        if width != frameRingWidth || height != frameRingHeight
+            || depth != frameRingDepth {
+            try frameRing.reconfigure(width: width, height: height, depth: depth)
+            frameRingWidth = width
+            frameRingHeight = height
+            frameRingDepth = depth
+        }
     }
 
     private func ensureOutputScratch() throws -> MTLTexture {
@@ -1279,9 +1297,8 @@ public final class VideoPipeline {
     /// corrupt a held freeze frame. This is an event-path command buffer (the
     /// one-command-buffer rule applies to the per-frame path); queue ordering
     /// guarantees the copy lands before any later ring overwrite.
-    private func snapshotTexture(of pixelBuffer: CVPixelBuffer) -> MTLTexture? {
-        guard let source = try? metal.makeTexture(from: pixelBuffer),
-              let copy = try? metal.makeIntermediate(width: source.width, height: source.height),
+    private func snapshotTexture(of source: MTLTexture) -> MTLTexture? {
+        guard let copy = try? metal.makeIntermediate(width: source.width, height: source.height),
               let commandBuffer = metal.commandQueue.makeCommandBuffer(),
               let blit = commandBuffer.makeBlitCommandEncoder() else {
             return nil
@@ -1314,7 +1331,7 @@ public final class VideoPipeline {
         guard !encoded.isEmpty, weights.count == encoded.count else { return [:] }
         let sum = weights.reduce(0, +)
         guard sum > 0 else { return [:] }
-        var result: [StageID: Double] = [:]
+        var result = [StageID: Double](minimumCapacity: encoded.count)
         for (id, weight) in zip(encoded, weights) {
             result[id] = totalGpuMs * weight / sum
         }

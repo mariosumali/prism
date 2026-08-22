@@ -9,7 +9,7 @@
 
 import Foundation
 
-public enum StillFormat: String, Codable, CaseIterable {
+public enum StillFormat: String, Codable, CaseIterable, Sendable {
     /// Lossless, and readable by everything. The default because a still
     /// pulled off a call is usually pasted straight into a message.
     case png

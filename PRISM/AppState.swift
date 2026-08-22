@@ -17,6 +17,13 @@ import QuartzCore
 import SwiftUI
 import UserNotifications
 
+/// A finished still buffer crossing to the file-writing queue. CoreVideo's
+/// overlay lacks Sendable conformance, but this buffer is immutable after the
+/// pipeline hands it out and the exporter is its only consumer.
+private struct SendableStillBuffer: @unchecked Sendable {
+    let value: CVPixelBuffer
+}
+
 /// Cross-thread mailbox for the latest preview texture. onOutput fires on
 /// Metal's completion thread; the preview reads from the UI. A lock-guarded
 /// box avoids a per-frame main-actor hop and lets teardown drop the
@@ -31,11 +38,19 @@ final class PreviewTextureBox {
     private let lock = NSLock()
     private var texture: MTLTexture?
     private var enabled = true
+    private var observers: [UUID: () -> Void] = [:]
 
     func store(_ t: MTLTexture?) {
         lock.lock()
         texture = enabled ? t : nil
+        // Dictionary assignment is copy-on-write, so this snapshots the
+        // observer set without allocating an Array on every video frame.
+        let callbacks = enabled && t != nil ? observers : [:]
         lock.unlock()
+        // Never invoke foreign code under the mailbox lock. A preview draw
+        // can immediately call take(), and doing that while locked would
+        // turn a frame notification into a deadlock.
+        for callback in callbacks.values { callback() }
     }
 
     func setEnabled(_ on: Bool) {
@@ -52,6 +67,41 @@ final class PreviewTextureBox {
         defer { lock.unlock() }
         return texture
     }
+
+    func addObserver(_ observer: @escaping () -> Void) -> UUID {
+        let id = UUID()
+        lock.lock()
+        observers[id] = observer
+        lock.unlock()
+        return id
+    }
+
+    func removeObserver(_ id: UUID) {
+        lock.lock()
+        observers[id] = nil
+        lock.unlock()
+    }
+}
+
+/// Lifetime token for PreviewView's frame-driven invalidation. It observes
+/// both live and draft mailboxes because a pane can switch between them while
+/// it remains on screen; the renderer itself decides which texture to draw.
+final class PreviewFrameObservation {
+    private let cancelClosure: () -> Void
+    private let lock = NSLock()
+    private var cancelled = false
+
+    init(cancel: @escaping () -> Void) { cancelClosure = cancel }
+
+    func cancel() {
+        lock.lock()
+        guard !cancelled else { lock.unlock(); return }
+        cancelled = true
+        lock.unlock()
+        cancelClosure()
+    }
+
+    deinit { cancel() }
 }
 
 /// Which capture is driving the chain, readable from the capture queues.
@@ -372,6 +422,18 @@ public final class AppState: ObservableObject {
 
     public var previewTextureProvider: (() -> MTLTexture?) = { nil }
     public var draftPreviewTextureProvider: (() -> MTLTexture?) = { nil }
+
+    /// Drives MTKView from actual pipeline output instead of a free-running
+    /// display link. Internal UI plumbing: no published state and therefore
+    /// no SwiftUI invalidation per frame.
+    func observePreviewFrames(_ observer: @escaping () -> Void) -> PreviewFrameObservation {
+        let liveID = previewBox.addObserver(observer)
+        let draftID = draftPreviewBox.addObserver(observer)
+        return PreviewFrameObservation { [previewBox, draftPreviewBox] in
+            previewBox.removeObserver(liveID)
+            draftPreviewBox.removeObserver(draftID)
+        }
+    }
 
     // MARK: - Sub-objects the UI observes directly
 
@@ -800,13 +862,24 @@ public final class AppState: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] report in
                 guard let self else { return }
+                guard report != self.latency else { return }
                 self.latency = report
                 self.sessionLog.observe(report)
+                var nextStatus = self.stageStatus
+                var statusChanged = false
                 for id in StageID.allCases {
-                    var status = self.stageStatus[id] ?? StageStatus()
-                    status.measuredMs = report.stages[id] ?? 0
-                    self.stageStatus[id] = status
+                    var status = nextStatus[id] ?? StageStatus()
+                    let measured = report.stages[id] ?? 0
+                    if status.measuredMs != measured {
+                        status.measuredMs = measured
+                        nextStatus[id] = status
+                        statusChanged = true
+                    }
                 }
+                // One dictionary publication per report, not one publication
+                // per registered stage. At 4 Hz the old loop could invalidate
+                // the complete SwiftUI tree dozens of times a second.
+                if statusChanged { self.stageStatus = nextStatus }
             }
             .store(in: &cancellables)
     }
@@ -1080,8 +1153,9 @@ public final class AppState: ObservableObject {
         // 1Hz: sink handoff, audio latency, plug-in presence, deferred
         // format publication, sink drop accounting, placeholder ticking.
         let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.pollTick() }
+            MainActor.assumeIsolated { self?.pollTick() }
         }
+        timer.tolerance = 0.1
         RunLoop.main.add(timer, forMode: .common)
         pollTimer = timer
 
@@ -1090,16 +1164,14 @@ public final class AppState: ObservableObject {
     }
 
     private func pollTick() {
-        if let handoff = cmioSink.readHandoffMs() {
+        if let handoff = cmioSink.handoffMs {
             monitor.recordHandoffMs(handoff)
         }
         monitor.setAudioAddedMs(audioCapture.addedLatencyMs)
 
         let dropped = cmioSink.droppedFrames
         if dropped > lastSinkDroppedFrames {
-            for _ in 0..<(dropped - lastSinkDroppedFrames) {
-                monitor.noteDroppedFrame()
-            }
+            monitor.noteDroppedFrames(dropped - lastSinkDroppedFrames)
             lastSinkDroppedFrames = dropped
         }
 
@@ -1246,8 +1318,9 @@ public final class AppState: ObservableObject {
         }
         lastInputLevelSequence = audioCapture.inputLevelReading.sequence
         let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.inputLevelTick() }
+            MainActor.assumeIsolated { self?.inputLevelTick() }
         }
+        timer.tolerance = 0.015
         RunLoop.main.add(timer, forMode: .common)
         levelTimer = timer
     }
@@ -1307,8 +1380,9 @@ public final class AppState: ObservableObject {
         replayTimer = nil
         guard replayMode != .idle else { return }
         let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.refreshReplayState() }
+            MainActor.assumeIsolated { self?.refreshReplayState() }
         }
+        timer.tolerance = 0.025
         RunLoop.main.add(timer, forMode: .common)
         replayTimer = timer
     }
@@ -1319,13 +1393,12 @@ public final class AppState: ObservableObject {
         noCameraTimer?.invalidate()
         let interval = 1.0 / Double(formatManager.activeFormat.frameRate)
         let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            self.lastFrameLock.lock()
-            let sinceCamera = Date().timeIntervalSince(self.lastCameraFrameAt)
-            self.lastFrameLock.unlock()
-            guard sinceCamera > interval * 2.5 else { return }
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated {
                 guard let self else { return }
+                self.lastFrameLock.lock()
+                let sinceCamera = Date().timeIntervalSince(self.lastCameraFrameAt)
+                self.lastFrameLock.unlock()
+                guard sinceCamera > interval * 2.5 else { return }
                 // Anything substituting for the camera has to keep producing
                 // frames when the camera itself is not delivering — an away
                 // loop must survive the camera dropping out, since that is
@@ -1344,24 +1417,26 @@ public final class AppState: ObservableObject {
     private func restartAutoFrameTimerIfNeeded() {
         autoFrameTimer?.invalidate()
         autoFrameTimer = nil
-        guard config.geometry.autoFrame, let pipeline else {
+        guard config.geometry.autoFrame, pipeline != nil else {
             autoFramer.reset()
             self.pipeline?.geometryStage.autoFrameOffset = (1, 0, 0)
             self.draftRendererBox.get()?.setAutoFrameOffset((1, 0, 0))
             return
         }
-        let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self, weak pipeline] _ in
-            guard let self, let pipeline else { return }
-            let box = pipeline.blurStage.latestSubjectBox
-            let offset = self.autoFramer.update(subjectBox: box, dt: 1.0 / 30.0)
-            pipeline.geometryStage.autoFrameOffset = offset
-            // The draft previews the same auto-framing motion (it runs no
-            // segmentation of its own — see DraftRenderer).
-            self.draftRendererBox.get()?.setAutoFrameOffset(offset)
+        let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, let pipeline = self.pipeline else { return }
+                let box = pipeline.blurStage.latestSubjectBox
+                let offset = self.autoFramer.update(subjectBox: box, dt: 1.0 / 30.0)
+                pipeline.geometryStage.autoFrameOffset = offset
+                // The draft previews the same auto-framing motion (it runs no
+                // segmentation of its own — see DraftRenderer).
+                self.draftRendererBox.get()?.setAutoFrameOffset(offset)
+            }
         }
+        timer.tolerance = 0.005
         RunLoop.main.add(timer, forMode: .common)
         autoFrameTimer = timer
-        _ = pipeline // silence unused in release
     }
 
     // MARK: - Capture control
@@ -2531,10 +2606,11 @@ public final class AppState: ObservableObject {
         // The frame is a pool buffer; holding it here keeps its IOSurface out
         // of the free list until the encoder has copied the pixels out, which
         // is the whole reason it is passed rather than the texture.
+        let sendableFrame = SendableStillBuffer(value: frame)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result: CaptureResult
             do {
-                try StillExporter.write(frame, format: format, to: url)
+                try StillExporter.write(sendableFrame.value, format: format, to: url)
                 result = .saved(url)
             } catch {
                 result = .failed((error as? CaptureError)?.errorDescription
@@ -2914,7 +2990,7 @@ public final class AppState: ObservableObject {
             // is macOS's name for the permission covering another
             // application's *sound*. PRISM captures no pixels for this.
             Task { [weak self] in
-                _ = await self?.permissions.requestScreenRecording()
+                _ = self?.permissions.requestScreenRecording()
             }
         }
     }

@@ -49,9 +49,18 @@ struct PreviewView: NSViewRepresentable {
         view.delegate = context.coordinator
         view.colorPixelFormat = .bgra8Unorm
         view.framebufferOnly = true
-        view.enableSetNeedsDisplay = false
+        // Draw only when PreviewTextureBox receives a finished pipeline
+        // frame. A free-running MTKView display link wakes the main thread and
+        // acquires a drawable even when the camera is stalled or the pipeline
+        // has deliberately dropped a frame.
+        view.enableSetNeedsDisplay = true
         view.isPaused = true
         view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        context.coordinator.attach(view)
+        context.coordinator.frameObservation = state.observePreviewFrames {
+            [weak renderer = context.coordinator] in
+            renderer?.requestDraw()
+        }
         return view
     }
 
@@ -59,34 +68,96 @@ struct PreviewView: NSViewRepresentable {
         let renderer = context.coordinator
         view.preferredFramesPerSecond = max(state.config.format.frameRate, 1)
         if surfaceVisible {
-            renderer.textureProvider = (usesDraft && state.draftConfig != nil)
+            renderer.setTextureProvider((usesDraft && state.draftConfig != nil)
                 ? state.draftPreviewTextureProvider
-                : state.previewTextureProvider
-            view.isPaused = false
+                : state.previewTextureProvider)
+            renderer.requestDraw()
         } else {
             // §8.3 — zero GPU cost while closed: pause, drop every reference.
-            renderer.textureProvider = nil
-            view.isPaused = true
+            renderer.setTextureProvider(nil)
             view.releaseDrawables()
         }
+    }
+
+    static func dismantleNSView(_ view: MTKView, coordinator: Renderer) {
+        coordinator.frameObservation?.cancel()
+        coordinator.frameObservation = nil
+        coordinator.setTextureProvider(nil)
+        view.delegate = nil
+        view.releaseDrawables()
     }
 
     // MARK: - Renderer
 
     final class Renderer: NSObject, MTKViewDelegate {
+        private static let sharedDevice = MTLCreateSystemDefaultDevice()
+        private static let sharedCommandQueue = sharedDevice?.makeCommandQueue()
+        private static let sharedPipelineState = makePipeline(device: sharedDevice)
+
         let device: MTLDevice?
         private let commandQueue: MTLCommandQueue?
-        private var pipelineState: MTLRenderPipelineState?
+        private let pipelineState: MTLRenderPipelineState?
+        private weak var view: MTKView?
+        private let drawLock = NSLock()
+        private var drawPending = false
+        private var acceptsDrawRequests = false
+
+        var frameObservation: PreviewFrameObservation?
 
         /// Set while the popover is open; nil tears the preview path down.
-        var textureProvider: (() -> MTLTexture?)?
+        private var textureProvider: (() -> MTLTexture?)?
 
         override init() {
-            let device = MTLCreateSystemDefaultDevice()
-            self.device = device
-            self.commandQueue = device?.makeCommandQueue()
+            // Both preview surfaces use the same immutable pipeline and
+            // thread-safe command queue. Compiling an identical runtime Metal
+            // library per view wasted startup time and retained duplicate GPU
+            // driver state after the main window was closed.
+            self.device = Self.sharedDevice
+            self.commandQueue = Self.sharedCommandQueue
+            self.pipelineState = Self.sharedPipelineState
             super.init()
-            buildPipeline()
+        }
+
+        func attach(_ view: MTKView) {
+            self.view = view
+        }
+
+        /// Called on the main thread by SwiftUI. The completion queue only
+        /// reads the locked boolean; the closure itself stays main-thread
+        /// confined alongside `draw(in:)`.
+        func setTextureProvider(_ provider: (() -> MTLTexture?)?) {
+            textureProvider = provider
+            drawLock.lock()
+            acceptsDrawRequests = provider != nil
+            if provider == nil { drawPending = false }
+            drawLock.unlock()
+        }
+
+        /// May be called from Metal's completion queue. Coalescing here is
+        /// important: live and draft output can finish close together, and
+        /// AppKit needs one main-thread invalidation, not a queue of stale
+        /// draws that keeps running after the newest texture has arrived.
+        func requestDraw() {
+            drawLock.lock()
+            guard acceptsDrawRequests, !drawPending else {
+                drawLock.unlock()
+                return
+            }
+            drawPending = true
+            drawLock.unlock()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.drawLock.lock()
+                self.drawPending = false
+                let shouldDraw = self.acceptsDrawRequests
+                self.drawLock.unlock()
+                guard shouldDraw, let view = self.view else { return }
+                // Let AppKit align drawing with its display cycle. Calling
+                // MTKView.draw() here can block the main thread in
+                // CAMetalLayer.nextDrawable when the camera finishes between
+                // display refreshes, making controls feel sticky.
+                view.needsDisplay = true
+            }
         }
 
         private static let shaderSource = """
@@ -118,17 +189,20 @@ struct PreviewView: NSViewRepresentable {
         }
         """
 
-        private func buildPipeline() {
-            guard let device else { return }
+        private static func makePipeline(device: MTLDevice?) -> MTLRenderPipelineState? {
+            guard let device else { return nil }
             do {
                 let library = try device.makeLibrary(source: Self.shaderSource, options: nil)
+                guard let vertex = library.makeFunction(name: "prism_preview_vertex"),
+                      let fragment = library.makeFunction(name: "prism_preview_fragment")
+                else { return nil }
                 let descriptor = MTLRenderPipelineDescriptor()
-                descriptor.vertexFunction = library.makeFunction(name: "prism_preview_vertex")
-                descriptor.fragmentFunction = library.makeFunction(name: "prism_preview_fragment")
+                descriptor.vertexFunction = vertex
+                descriptor.fragmentFunction = fragment
                 descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
-                pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
+                return try device.makeRenderPipelineState(descriptor: descriptor)
             } catch {
-                pipelineState = nil
+                return nil
             }
         }
 

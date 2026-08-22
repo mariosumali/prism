@@ -40,6 +40,15 @@ public final class CMIOSink {
     /// Frames dropped because the sink queue was full (§3.2: drop + count).
     public private(set) var droppedFrames: Int = 0
 
+    /// Latest value collected by the sink's existing 1 Hz property poll.
+    /// AppState reads this cache rather than issuing a duplicate CoreMediaIO
+    /// round trip on its own 1 Hz timer.
+    public var handoffMs: Double? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return lastHandoffMs
+    }
+
     /// True while the published §5.18 policy could refuse someone. Gates the
     /// 1 Hz 'blkd' read: an extension holding no policy always answers "[]",
     /// and paying a round trip per second for that answer is waste on the
@@ -352,7 +361,8 @@ public final class CMIOSink {
     private func startRetryTimer() {
         guard retryTimer == nil else { return }
         let timer = DispatchSource.makeTimerSource(queue: controlQueue)
-        timer.schedule(deadline: .now(), repeating: Self.retryInterval)
+        timer.schedule(deadline: .now(), repeating: Self.retryInterval,
+                       leeway: .milliseconds(100))
         timer.setEventHandler { [weak self] in self?.attemptConnect() }
         timer.resume()
         retryTimer = timer
@@ -366,7 +376,9 @@ public final class CMIOSink {
     private func startPollTimer() {
         guard pollTimer == nil else { return }
         let timer = DispatchSource.makeTimerSource(queue: controlQueue)
-        timer.schedule(deadline: .now() + Self.pollInterval, repeating: Self.pollInterval)
+        timer.schedule(deadline: .now() + Self.pollInterval,
+                       repeating: Self.pollInterval,
+                       leeway: .milliseconds(100))
         timer.setEventHandler { [weak self] in self?.pollProperties() }
         timer.resume()
         pollTimer = timer
@@ -444,6 +456,7 @@ public final class CMIOSink {
         formatDescription = nil
         formatWidth = 0
         formatHeight = 0
+        lastHandoffMs = nil
         isConnected = false
         stateLock.unlock()
 

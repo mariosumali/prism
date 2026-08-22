@@ -199,7 +199,7 @@ final class LagSwitchTests: XCTestCase {
     /// ring: the stall's silence first, then the frames the window names.
     private func emit(_ line: AudioDelayLine, value: Float,
                       frames: Int = 64, delayFrames: Int = 480) -> [Float] {
-        var slice = [Float](repeating: value, count: frames * 2)
+        let slice = [Float](repeating: value, count: frames * 2)
         let window = slice.withUnsafeBufferPointer {
             line.push($0.baseAddress!, frameCount: frames, delayFrames: delayFrames)
         }

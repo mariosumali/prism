@@ -147,11 +147,11 @@ public final class SystemAudioCapture: NSObject, SystemAudioCapturing,
     public func start(bundleID: String?) async {
         await stop()
 
-        stateLock.lock()
-        generation &+= 1
-        let gen = generation
-        _hasHeardAnything = false
-        stateLock.unlock()
+        let gen = stateLock.withLock {
+            generation &+= 1
+            _hasHeardAnything = false
+            return generation
+        }
 
         guard CGPreflightScreenCaptureAccess() else {
             onFailure?("PRISM needs Screen Recording permission to hear the other side of "
@@ -238,19 +238,20 @@ public final class SystemAudioCapture: NSObject, SystemAudioCapturing,
             try? await stream.stopCapture()
             return
         }
-        stateLock.lock()
-        self.stream = stream
-        _isRunning = true
-        stateLock.unlock()
+        stateLock.withLock {
+            self.stream = stream
+            _isRunning = true
+        }
     }
 
     public func stop() async {
-        stateLock.lock()
-        generation &+= 1
-        let current = stream
-        stream = nil
-        _isRunning = false
-        stateLock.unlock()
+        let current = stateLock.withLock {
+            generation &+= 1
+            let current = stream
+            stream = nil
+            _isRunning = false
+            return current
+        }
         guard let current else { return }
         try? await current.stopCapture()
     }

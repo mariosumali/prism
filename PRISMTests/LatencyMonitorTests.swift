@@ -433,7 +433,7 @@ final class LatencyMonitorTests: XCTestCase {
             monitor.record(makeTimings(gpuMs: 999, dropped: true))
         }
         monitor.noteDroppedFrame()
-        monitor.noteDroppedFrame()
+        monitor.noteDroppedFrames(1)
         monitor.recordHandoffMs(1.5)
         monitor.setAudioAddedMs(2.25)
 

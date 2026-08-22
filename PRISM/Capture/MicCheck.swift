@@ -323,8 +323,9 @@ public final class MicCheck: ObservableObject {
         recordingStartedAt = now()
         phase = .recording
         let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.pollOnce() }
+            MainActor.assumeIsolated { self?.pollOnce() }
         }
+        timer.tolerance = 0.015
         RunLoop.main.add(timer, forMode: .common)
         pollTimer = timer
     }

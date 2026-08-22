@@ -40,7 +40,7 @@ public final class ReplayBuffer {
 
     /// One buffered frame: the compressed sample plus what the away loop
     /// needs to reason about it.
-    public struct RecordedFrame {
+    public struct RecordedFrame: @unchecked Sendable {
         public let sample: CMSampleBuffer
         /// Host-clock seconds; monotonic, the timeline both features run on.
         public let seconds: Double
@@ -56,10 +56,41 @@ public final class ReplayBuffer {
     /// session is keyed on.
     public struct PendingRecord {
         let buffer: CVPixelBuffer
+        fileprivate let surface: RecordSurface
         let seconds: Double
         let thumbnailSlot: Int
         let width: Int
         let height: Int
+    }
+
+    /// One reusable encoder input. A CVPixelBufferPool minimum is not a
+    /// maximum: asking it for a new buffer every frame allocates new object
+    /// and Metal wrappers and may outgrow the memory plan under encoder load.
+    fileprivate final class RecordSurface: @unchecked Sendable {
+        let buffer: CVPixelBuffer
+        let texture: MTLTexture
+
+        private let lock = NSLock()
+        private var inUse = false
+
+        init(buffer: CVPixelBuffer, texture: MTLTexture) {
+            self.buffer = buffer
+            self.texture = texture
+        }
+
+        func claim() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !inUse else { return false }
+            inUse = true
+            return true
+        }
+
+        func release() {
+            lock.lock()
+            inUse = false
+            lock.unlock()
+        }
     }
 
     public static let thumbnailWidth = 32
@@ -113,6 +144,7 @@ public final class ReplayBuffer {
 
     // Frame-queue-confined
     private var pool: CVPixelBufferPool?
+    private var recordSurfaces: [RecordSurface] = []
     private var recordWidth = 0
     private var recordHeight = 0
     private var thumbnailCursor = 0
@@ -137,6 +169,8 @@ public final class ReplayBuffer {
 
     deinit {
         if let session {
+            VTCompressionSessionCompleteFrames(session,
+                                               untilPresentationTimeStamp: .invalid)
             VTCompressionSessionInvalidate(session)
         }
     }
@@ -173,6 +207,8 @@ public final class ReplayBuffer {
 
         encodeQueue.async { [weak self] in
             guard let self, let session = self.session else { return }
+            VTCompressionSessionCompleteFrames(session,
+                                               untilPresentationTimeStamp: .invalid)
             VTCompressionSessionInvalidate(session)
             self.session = nil
             self.sessionWidth = 0
@@ -191,15 +227,15 @@ public final class ReplayBuffer {
         guard isArmed else { return nil }
         let target = recordSize(width: source.width, height: source.height)
         guard ensureResources(width: target.width, height: target.height) else { return nil }
-        guard let pool, let thumbnailBuffer else { return nil }
+        guard pool != nil, let thumbnailBuffer,
+              let surface = recordSurfaces.first(where: { $0.claim() }) else { return nil }
+        let buffer = surface.buffer
+        let destination = surface.texture
 
-        var created: CVPixelBuffer?
-        guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool,
-                                                 &created) == kCVReturnSuccess,
-              let buffer = created,
-              let destination = try? metal.makeTexture(from: buffer) else { return nil }
-
-        guard let copyEncoder = commandBuffer.makeComputeCommandEncoder() else { return nil }
+        guard let copyEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            surface.release()
+            return nil
+        }
         copyEncoder.label = "ReplayBuffer.downscale"
         copyEncoder.setComputePipelineState(copyPipeline)
         copyEncoder.setTexture(source, index: 0)
@@ -228,7 +264,7 @@ public final class ReplayBuffer {
             thumbEncoder.endEncoding()
         }
 
-        return PendingRecord(buffer: buffer, seconds: hostSeconds,
+        return PendingRecord(buffer: buffer, surface: surface, seconds: hostSeconds,
                              thumbnailSlot: slot,
                              width: target.width, height: target.height)
     }
@@ -236,7 +272,10 @@ public final class ReplayBuffer {
     /// Called from the frame's completed handler: the GPU is done with the
     /// buffer and its thumbnail, so both are safe to publish.
     public func commit(_ record: PendingRecord) {
-        guard isArmed else { return }
+        guard isArmed else {
+            record.surface.release()
+            return
+        }
         encodeQueue.async { [weak self] in
             self?.encode(record, width: record.width, height: record.height)
         }
@@ -397,7 +436,21 @@ public final class ReplayBuffer {
                                           bufferAttrs as CFDictionary,
                                           &created) == kCVReturnSuccess,
                   let newPool = created else { return false }
+            var newSurfaces: [RecordSurface] = []
+            newSurfaces.reserveCapacity(Self.recordPoolDepth)
+            for _ in 0..<Self.recordPoolDepth {
+                var createdBuffer: CVPixelBuffer?
+                guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault,
+                                                         newPool,
+                                                         &createdBuffer) == kCVReturnSuccess,
+                      let buffer = createdBuffer,
+                      let texture = try? metal.makeTexture(from: buffer) else {
+                    return false
+                }
+                newSurfaces.append(RecordSurface(buffer: buffer, texture: texture))
+            }
             pool = newPool
+            recordSurfaces = newSurfaces
             recordWidth = width
             recordHeight = height
             // Dimensions changed: previously buffered frames no longer share
@@ -426,13 +479,18 @@ public final class ReplayBuffer {
     // MARK: - Encoding (encodeQueue)
 
     private func encode(_ record: PendingRecord, width: Int, height: Int) {
-        guard ensureSession(width: width, height: height), let session else { return }
+        guard ensureSession(width: width, height: height), let session else {
+            record.surface.release()
+            return
+        }
         let presentation = CMTime(seconds: record.seconds, preferredTimescale: 90_000)
         // The thumbnail slot has to survive into the output callback, and the
         // callback's per-frame refcon is the only channel VideoToolbox gives
         // us for it. Boxed, passed retained, consumed on the far side.
         let context = Unmanaged.passRetained(
-            FrameContext(seconds: record.seconds, thumbnailSlot: record.thumbnailSlot)
+            FrameContext(seconds: record.seconds,
+                         thumbnailSlot: record.thumbnailSlot,
+                         surface: record.surface)
         ).toOpaque()
 
         let status = VTCompressionSessionEncodeFrame(
@@ -445,6 +503,7 @@ public final class ReplayBuffer {
             infoFlagsOut: nil)
         if status != noErr {
             Unmanaged<FrameContext>.fromOpaque(context).release()
+            record.surface.release()
         }
     }
 
@@ -453,6 +512,10 @@ public final class ReplayBuffer {
             return true
         }
         if let session {
+            // Completion returns every reusable input lease through the
+            // callback before the old encoder is retired.
+            VTCompressionSessionCompleteFrames(session,
+                                               untilPresentationTimeStamp: .invalid)
             VTCompressionSessionInvalidate(session)
             self.session = nil
         }
@@ -560,9 +623,13 @@ public final class ReplayBuffer {
 private final class FrameContext {
     let seconds: Double
     let thumbnailSlot: Int
-    init(seconds: Double, thumbnailSlot: Int) {
+    let surface: ReplayBuffer.RecordSurface
+
+    init(seconds: Double, thumbnailSlot: Int,
+         surface: ReplayBuffer.RecordSurface) {
         self.seconds = seconds
         self.thumbnailSlot = thumbnailSlot
+        self.surface = surface
     }
 }
 
@@ -570,6 +637,7 @@ private let replayCompressionCallback: VTCompressionOutputCallback = {
     outputRefcon, sourceFrameRefcon, status, _, sampleBuffer in
     guard let sourceFrameRefcon else { return }
     let context = Unmanaged<FrameContext>.fromOpaque(sourceFrameRefcon).takeRetainedValue()
+    defer { context.surface.release() }
     guard status == noErr,
           let outputRefcon,
           let sampleBuffer,

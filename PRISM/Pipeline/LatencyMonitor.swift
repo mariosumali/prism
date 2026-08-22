@@ -131,7 +131,8 @@ public final class LatencyMonitor: ObservableObject {
 
     public init() {
         publishTimer = DispatchSource.makeTimerSource(queue: .main)
-        publishTimer.schedule(deadline: .now() + 0.25, repeating: 0.25)
+        publishTimer.schedule(deadline: .now() + 0.25, repeating: 0.25,
+                              leeway: .milliseconds(25))
         publishTimer.setEventHandler { [weak self] in
             self?.publishNow()
         }
@@ -231,8 +232,17 @@ public final class LatencyMonitor: ObservableObject {
     }
 
     public func noteDroppedFrame() {
+        noteDroppedFrames(1)
+    }
+
+    /// Records a batch in one lock acquisition. The sink counter is sampled
+    /// once a second, so an overloaded client can report hundreds at once;
+    /// taking the monitor lock once per dropped frame makes overload itself
+    /// create more overload.
+    public func noteDroppedFrames(_ count: Int) {
+        guard count > 0 else { return }
         lock.lock()
-        droppedFrames += 1
+        droppedFrames += count
         lock.unlock()
     }
 
@@ -320,6 +330,12 @@ public final class LatencyMonitor: ObservableObject {
             syncSkewMs: totalAdded - audioAddedMs,
             deliberateDelayMs: deliberateDelayMs)
         lock.unlock()
-        report = next
+        // The timer intentionally keeps running so a newly active pipeline
+        // is visible within 250 ms, but an idle app's report is identical.
+        // Publishing that identical value still invalidates every SwiftUI
+        // surface observing AppState and was PRISM's largest idle main-thread
+        // wakeup. Equality here removes the redraw without changing cadence
+        // while measurements are moving.
+        if next != report { report = next }
     }
 }
