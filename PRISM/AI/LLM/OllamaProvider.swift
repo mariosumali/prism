@@ -117,6 +117,11 @@ final class OllamaProvider: LLMProvider {
             "options": [
                 // See the header. Without this the model truncates silently.
                 "num_ctx": contextBudget,
+                // LLMRequest's ceiling applies locally too. Ollama's
+                // default is unlimited generation, which can turn a brief
+                // insight request into minutes of unnecessary inference if
+                // a model fails to emit its own stop sequence.
+                "num_predict": request.maxTokens,
             ],
             // Keep the weights resident between the notes call and the
             // questions that follow it. Reloading several gigabytes per

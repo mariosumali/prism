@@ -27,7 +27,7 @@ import Foundation
 
 // MARK: - Record
 
-public struct MeetingRecord: Codable, Identifiable, Equatable {
+public struct MeetingRecord: Codable, Identifiable, Equatable, Sendable {
     public var id: String
     public var title: String
     public var startedAt: Date
@@ -98,7 +98,7 @@ public struct MeetingRecord: Codable, Identifiable, Equatable {
 
 // MARK: - Action items
 
-public struct MeetingActionItem: Codable, Identifiable, Equatable {
+public struct MeetingActionItem: Codable, Identifiable, Equatable, Sendable {
     public var id: String
     public var task: String
     public var owner: String
@@ -144,6 +144,14 @@ public struct MeetingActionItem: Codable, Identifiable, Equatable {
 @MainActor
 public final class TranscriptStore {
 
+    /// Every transcript operation is ordered through one queue. Live
+    /// checkpoints use it asynchronously so JSON encoding and disk I/O never
+    /// interrupt the transcript UI; the final save uses the same queue
+    /// synchronously, which guarantees an older checkpoint can never land
+    /// after the finished record and overwrite it.
+    private static let ioQueue = DispatchQueue(
+        label: "horse.prism.transcripts", qos: .utility)
+
     /// Injectable so the suite never writes into a developer's real
     /// Application Support folder. Same idiom as LUTStore's directory
     /// override.
@@ -179,14 +187,30 @@ public final class TranscriptStore {
     @discardableResult
     public func save(_ record: MeetingRecord) throws -> URL {
         let folder = folder(for: record.id)
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        encoder.dateEncodingStrategy = .iso8601
-        let data = try encoder.encode(record)
         let url = transcriptURL(for: record.id)
-        try data.write(to: url, options: .atomic)
-        return url
+        return try Self.ioQueue.sync {
+            try Self.write(record, folder: folder, url: url)
+        }
+    }
+
+    /// Coalesced live checkpoints take this path. The completion always
+    /// returns on the main actor, where MeetingSession owns its status.
+    public func saveInBackground(
+        _ record: MeetingRecord,
+        additionalWords: [TranscriptWord] = [],
+        completion: @escaping (Result<URL, Error>) -> Void
+    ) {
+        let folder = folder(for: record.id)
+        let url = transcriptURL(for: record.id)
+        Self.ioQueue.async {
+            var snapshot = record
+            if !additionalWords.isEmpty {
+                snapshot.words = TranscriptRenderer.mergingChronological(
+                    snapshot.words, with: additionalWords)
+            }
+            let result = Result { try Self.write(snapshot, folder: folder, url: url) }
+            DispatchQueue.main.async { completion(result) }
+        }
     }
 
     /// Writes the notes as markdown beside the transcript, so the useful
@@ -196,35 +220,46 @@ public final class TranscriptStore {
     @discardableResult
     public func saveNotes(_ markdown: String, for record: MeetingRecord) throws -> URL {
         let folder = folder(for: record.id)
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let url = notesURL(for: record.id)
-        try markdown.write(to: url, atomically: true, encoding: .utf8)
-        return url
+        return try Self.ioQueue.sync {
+            try FileManager.default.createDirectory(at: folder,
+                                                    withIntermediateDirectories: true)
+            try markdown.write(to: url, atomically: true, encoding: .utf8)
+            return url
+        }
     }
 
     // MARK: Reading
 
     public func load(id: String) -> MeetingRecord? {
-        guard let data = try? Data(contentsOf: transcriptURL(for: id)) else { return nil }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return try? decoder.decode(MeetingRecord.self, from: data)
+        let url = transcriptURL(for: id)
+        return Self.ioQueue.sync { Self.decode(url) }
     }
 
     /// Every meeting on disk, newest first.
     public func all() -> [MeetingRecord] {
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: Self.directory, includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]) else { return [] }
-        return entries
-            .compactMap { load(id: $0.lastPathComponent) }
-            .sorted { $0.startedAt > $1.startedAt }
+        let directory = Self.directory
+        return Self.ioQueue.sync { Self.scan(directory) }
+    }
+
+    /// Loads the library without parsing every meeting on the main thread.
+    /// Old installs do not have a separate metadata index, so discovery still
+    /// has to decode each record once; doing it here keeps opening the Meeting
+    /// pane responsive even after years of saved calls.
+    public func allInBackground(completion: @escaping ([MeetingRecord]) -> Void) {
+        let directory = Self.directory
+        Self.ioQueue.async {
+            let records = Self.scan(directory)
+            DispatchQueue.main.async { completion(records) }
+        }
     }
 
     public func delete(id: String) throws {
         let folder = folder(for: id)
-        guard FileManager.default.fileExists(atPath: folder.path) else { return }
-        try FileManager.default.removeItem(at: folder)
+        try Self.ioQueue.sync {
+            guard FileManager.default.fileExists(atPath: folder.path) else { return }
+            try FileManager.default.removeItem(at: folder)
+        }
     }
 
     /// Everything, when the user asks for everything gone. A transcript is
@@ -233,18 +268,55 @@ public final class TranscriptStore {
     /// the user is told to go and find.
     public func deleteAll() throws {
         let root = Self.directory
-        guard FileManager.default.fileExists(atPath: root.path) else { return }
-        try FileManager.default.removeItem(at: root)
+        try Self.ioQueue.sync {
+            guard FileManager.default.fileExists(atPath: root.path) else { return }
+            try FileManager.default.removeItem(at: root)
+        }
     }
 
     public func bytesOnDisk() -> Int64 {
-        guard let enumerator = FileManager.default.enumerator(
-            at: Self.directory, includingPropertiesForKeys: [.fileSizeKey],
-            options: [.skipsHiddenFiles]) else { return 0 }
-        var total: Int64 = 0
-        for case let url as URL in enumerator {
-            total += Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        let directory = Self.directory
+        return Self.ioQueue.sync {
+            guard let enumerator = FileManager.default.enumerator(
+                at: directory, includingPropertiesForKeys: [.fileSizeKey],
+                options: [.skipsHiddenFiles]) else { return 0 }
+            var total: Int64 = 0
+            for case let url as URL in enumerator {
+                total += Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+            }
+            return total
         }
-        return total
+    }
+
+    // MARK: Queue-only helpers
+
+    private nonisolated static func write(_ record: MeetingRecord,
+                                           folder: URL, url: URL) throws -> URL {
+        try FileManager.default.createDirectory(at: folder,
+                                                withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        // Compact JSON is materially faster to encode and write for a long
+        // meeting. The user-facing copy/export paths render readable text;
+        // this file is the durable source of truth.
+        encoder.outputFormatting = [.sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(record).write(to: url, options: .atomic)
+        return url
+    }
+
+    private nonisolated static func decode(_ url: URL) -> MeetingRecord? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(MeetingRecord.self, from: data)
+    }
+
+    private nonisolated static func scan(_ directory: URL) -> [MeetingRecord] {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]) else { return [] }
+        return entries
+            .compactMap { decode($0.appendingPathComponent("transcript.json")) }
+            .sorted { $0.startedAt > $1.startedAt }
     }
 }

@@ -304,7 +304,8 @@ final class MeetingSessionTests: XCTestCase {
                              tap: FakeTapSource,
                              farEnd: FakeFarEnd? = nil,
                              offAir: OffAirSwitch? = nil,
-                             clock: TestClock? = nil) -> MeetingSession {
+                             clock: TestClock? = nil,
+                             checkpointDelay: TimeInterval = 3) -> MeetingSession {
         MeetingSession(
             engineFactory: { _ in engine },
             armMicTap: { tap.arm($0) },
@@ -313,7 +314,8 @@ final class MeetingSessionTests: XCTestCase {
             farEnd: farEnd,
             store: nil,
             micIsOffAir: { offAir?.read() ?? false },
-            now: { clock?.now() ?? Date() })
+            now: { clock?.now() ?? Date() },
+            checkpointDelay: checkpointDelay)
     }
 
     /// Turns the main run loop for a moment. The drain timer is a real
@@ -591,6 +593,126 @@ final class MeetingSessionTests: XCTestCase {
         XCTAssertEqual(reloaded?.words.count, 3)
         XCTAssertTrue(store.transcriptURL(for: id).path.hasPrefix(directory.path),
                       "the suite must never write into the real Application Support")
+    }
+
+    func testAStartedMeetingCheckpointsBeforeStop() {
+        let engine = FakeSpeechEngine()
+        engine.script(words: scriptedWords(), text: "Ship the driver")
+        let tap = FakeTapSource()
+        let session = makeSession(engine: engine, tap: tap, checkpointDelay: 0)
+
+        startListening(session, settings: makeSettings(saves: true))
+        tap.feed(0.4, frames: Self.oneSecond * 10)
+        waitUntil("a durable live checkpoint") { session.lastSavedAt != nil }
+
+        guard let id = session.record?.id else { return XCTFail("no live record") }
+        let checkpoint = TranscriptStore().load(id: id)
+        XCTAssertNotNil(checkpoint, "a crash before Stop must not erase the meeting")
+        XCTAssertGreaterThanOrEqual(checkpoint?.words.count ?? 0, 2)
+        XCTAssertNil(checkpoint?.endedAt, "a checkpoint is still visibly in progress")
+        session.stop()
+    }
+
+    func testTheFirstVisibleHypothesisIsIncludedInARecoveryCheckpoint() {
+        let engine = FakeSpeechEngine()
+        engine.script(words: scriptedWords(), text: "Ship the driver")
+        let tap = FakeTapSource()
+        let session = makeSession(engine: engine, tap: tap, checkpointDelay: 0)
+
+        startListening(session, settings: makeSettings(saves: true))
+        tap.feed(0.4, frames: Self.oneSecond * 3)
+        waitUntil("the first provisional hypothesis") { !session.hypothesis.isEmpty }
+        waitUntil("a provisional recovery checkpoint") { session.lastSavedAt != nil }
+
+        guard let id = session.record?.id else { return XCTFail("no live record") }
+        let checkpoint = TranscriptStore().load(id: id)
+        XCTAssertEqual(checkpoint?.words.map(\.trimmed), ["Ship", "the", "driver"])
+        XCTAssertTrue(checkpoint?.words.allSatisfy { $0.state == .pending } == true)
+        session.stop()
+    }
+
+    func testTurningSavingOffRemovesALiveCheckpoint() {
+        let engine = FakeSpeechEngine()
+        engine.script(words: scriptedWords(), text: "Ship the driver")
+        let tap = FakeTapSource()
+        let session = makeSession(engine: engine, tap: tap, checkpointDelay: 0)
+
+        startListening(session, settings: makeSettings(saves: true))
+        tap.feed(0.4, frames: Self.oneSecond * 10)
+        waitUntil("a live checkpoint") { session.lastSavedAt != nil }
+        guard let id = session.record?.id else { return XCTFail("no live record") }
+
+        session.apply(makeSettings(saves: false))
+        XCTAssertNil(TranscriptStore().load(id: id),
+                     "off must remove a checkpoint already written this meeting")
+        XCTAssertNil(session.lastSavedAt)
+        session.stop()
+    }
+
+    func testTheNotesSnapshotIncludesTextTypedDuringTheLiveMeeting() {
+        let session = makeSession(engine: FakeSpeechEngine(), tap: FakeTapSource())
+        startListening(session, settings: makeSettings(saves: false))
+
+        session.userNotes = "Decision: ship on Friday."
+
+        XCTAssertEqual(session.recordForNotes()?.userNotes,
+                       "Decision: ship on Friday.")
+        session.stop()
+    }
+
+    func testEditingNotesOnAnOpenedMeetingPersistsThem() throws {
+        let stored = MeetingRecord(
+            title: "Saved",
+            startedAt: Date(timeIntervalSince1970: 1_000),
+            endedAt: Date(timeIntervalSince1970: 1_060),
+            words: [TranscriptWord(text: "Hello", startMs: 0, endMs: 500,
+                                   channel: .directMic)])
+        try TranscriptStore().save(stored)
+        let session = makeSession(engine: FakeSpeechEngine(), tap: FakeTapSource(),
+                                  checkpointDelay: 0)
+        session.viewSavedMeeting(stored)
+
+        session.userNotes = "Follow up tomorrow."
+        waitUntil("the opened record update") {
+            TranscriptStore().load(id: stored.id)?.userNotes == "Follow up tomorrow."
+        }
+
+        XCTAssertNotNil(session.lastSavedAt)
+    }
+
+    func testOpeningARecoveredCheckpointUsesCapturedAudioForItsDuration() {
+        let started = Date(timeIntervalSince1970: 1_000)
+        let recovered = MeetingRecord(
+            title: "Recovered",
+            startedAt: started,
+            words: [TranscriptWord(text: "Hello", startMs: 2_000, endMs: 3_000,
+                                   channel: .directMic)])
+        let session = makeSession(engine: FakeSpeechEngine(), tap: FakeTapSource())
+
+        session.viewSavedMeeting(recovered)
+
+        XCTAssertEqual(session.record?.endedAt,
+                       started.addingTimeInterval(3))
+        XCTAssertEqual(session.elapsed, 3, accuracy: 0.001)
+    }
+
+    func testStoppingKeepsTheVisibleOnePassTail() {
+        let engine = FakeSpeechEngine()
+        engine.script(words: scriptedWords(), text: "Ship the driver")
+        let tap = FakeTapSource()
+        let session = makeSession(engine: engine, tap: tap)
+
+        startListening(session, settings: makeSettings(saves: false))
+        tap.feed(0.4, frames: Self.oneSecond * 3)
+        waitUntil("the first provisional hypothesis") { !session.hypothesis.isEmpty }
+        XCTAssertEqual(session.wordCount, 0,
+                       "one decode is visible but not agreement-confirmed")
+
+        session.stop()
+
+        XCTAssertEqual(session.record?.words.map(\.trimmed),
+                       ["Ship", "the", "driver"],
+                       "Stop must not cut off words that were already on screen")
     }
 
     func testStoppingWritesNothingWhenSavingIsOff() {

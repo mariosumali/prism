@@ -45,7 +45,7 @@ public final class MeetingNoteWriter {
     /// rather than tolerated. No length or range constraints: those are not
     /// supported and including them fails the request rather than being
     /// ignored.
-    static var notesSchema: JSONValue {
+    nonisolated static var notesSchema: JSONValue {
         .schema(type: "object",
                 properties: [
                     "title": .schema(type: "string",
@@ -72,26 +72,42 @@ public final class MeetingNoteWriter {
     // MARK: - Writing
 
     public func write(record: MeetingRecord,
-                      transcript: String,
                       template: NoteTemplate,
                       provider: LLMProvider,
                       language: String,
                       onProgress: @escaping (String) -> Void,
                       completion: @escaping (Swift.Result<Result, Error>) -> Void) {
         cancel()
-        task = Task { [weak self] in
-            guard let self else { return }
+        task = Task {
             do {
                 let body: String
-                if TranscriptChunker.fitsInOnePass(transcript,
-                                                   contextBudget: provider.contextBudget) {
-                    body = transcript
+                // Counting and splitting a multi-hour transcript is CPU and
+                // allocation heavy. MeetingNoteWriter is main-actor-owned for
+                // its lifecycle, so explicitly move that preparation away
+                // from the UI before the first provider request begins.
+                let contextBudget = provider.contextBudget
+                let prepared = await Task.detached(priority: .utility) {
+                    // Render from the immutable record off the main actor as
+                    // well. A multi-hour meeting used to build this entire
+                    // string synchronously when the button was pressed,
+                    // before chunking had even moved to the background.
+                    let transcript = TranscriptRenderer.labelled(
+                        record.words,
+                        youLabel: TranscriptRenderer.defaultYouLabel,
+                        farEndLabel: record.farEndLabel,
+                        includeTimestamps: true)
+                    let chunks = TranscriptChunker.chunks(
+                        transcript, tokenBudget: contextBudget)
+                    return (transcript: transcript, chunks: chunks)
+                }.value
+                if prepared.chunks.count <= 1 {
+                    body = prepared.transcript
                 } else {
-                    onProgress("Summarising a long meeting in sections…")
-                    body = try await self.mapReduce(transcript, provider: provider)
+                    body = try await Self.mapReduce(prepared.chunks, provider: provider,
+                                                    onProgress: onProgress)
                 }
                 onProgress("Writing the notes…")
-                let result = try await self.singlePass(record: record,
+                let result = try await Self.singlePass(record: record,
                                                        transcript: body,
                                                        template: template,
                                                        provider: provider,
@@ -110,11 +126,11 @@ public final class MeetingNoteWriter {
 
     // MARK: - One pass
 
-    private func singlePass(record: MeetingRecord,
-                            transcript: String,
-                            template: NoteTemplate,
-                            provider: LLMProvider,
-                            language: String) async throws -> Result {
+    private nonisolated static func singlePass(record: MeetingRecord,
+                                                transcript: String,
+                                                template: NoteTemplate,
+                                                provider: LLMProvider,
+                                                language: String) async throws -> Result {
         let stamp = DateFormatter()
         stamp.locale = Locale(identifier: "en_US_POSIX")
         stamp.dateFormat = "HH:mm"
@@ -140,26 +156,28 @@ public final class MeetingNoteWriter {
                 transcript: transcript,
                 markdownStructure: template.markdownStructure()))],
             maxTokens: 16_000,
-            jsonSchema: Self.notesSchema,
+            jsonSchema: notesSchema,
             // Notes are extraction, not reasoning. Low effort is both
             // cheaper and, on a task where the answer is already in the
             // input, no worse.
             effort: "low")
 
         let raw = try await collect(request, provider: provider)
-        return try Self.decode(raw)
+        return try decode(raw)
     }
 
     // MARK: - Map / reduce
 
-    private func mapReduce(_ transcript: String, provider: LLMProvider) async throws -> String {
-        let chunks = TranscriptChunker.chunks(transcript,
-                                              tokenBudget: provider.contextBudget)
-        guard !chunks.isEmpty else { return transcript }
-
+    private nonisolated static func mapReduce(
+        _ chunks: [String],
+        provider: LLMProvider,
+        onProgress: @escaping (String) -> Void
+    ) async throws -> String {
         var summaries: [String] = []
-        for chunk in chunks {
+        summaries.reserveCapacity(chunks.count)
+        for (index, chunk) in chunks.enumerated() {
             if Task.isCancelled { throw LLMError.cancelled }
+            onProgress("Summarising section \(index + 1) of \(chunks.count)…")
             let request = LLMRequest(
                 systemFrozen: Prompts.mapSystem,
                 messages: [.user(Prompts.mapUser(chunk: chunk))],
@@ -190,18 +208,22 @@ public final class MeetingNoteWriter {
     /// `jsonDelta` and prose as `textDelta`; both are concatenated, because
     /// which one a given provider uses for a schema-constrained reply is
     /// not consistent between them.
-    private func collect(_ request: LLMRequest, provider: LLMProvider) async throws -> String {
-        var output = ""
+    private nonisolated static func collect(
+        _ request: LLMRequest,
+        provider: LLMProvider
+    ) async throws -> String {
+        var fragments: [String] = []
+        fragments.reserveCapacity(256)
         for try await event in provider.stream(request) {
             if Task.isCancelled { throw LLMError.cancelled }
             switch event {
-            case .textDelta(let text): output += text
-            case .jsonDelta(let json): output += json
+            case .textDelta(let text): fragments.append(text)
+            case .jsonDelta(let json): fragments.append(json)
             case .apiError(_, let message): throw LLMError.transport(message)
             case .stop: break
             }
         }
-        return output
+        return fragments.joined()
     }
 
     // MARK: - Decoding
@@ -212,7 +234,7 @@ public final class MeetingNoteWriter {
     /// providers differ on whether a schema-constrained response comes back
     /// bare, and a set of meeting notes should not be lost to three
     /// backticks.
-    static func decode(_ raw: String) throws -> Result {
+    nonisolated static func decode(_ raw: String) throws -> Result {
         let trimmed = unwrapFence(raw.trimmingCharacters(in: .whitespacesAndNewlines))
         guard let data = trimmed.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -239,7 +261,7 @@ public final class MeetingNoteWriter {
                       actionItems: items.filter { !$0.task.isEmpty })
     }
 
-    static func unwrapFence(_ text: String) -> String {
+    nonisolated static func unwrapFence(_ text: String) -> String {
         guard text.hasPrefix("```") else { return text }
         var lines = text.components(separatedBy: .newlines)
         lines.removeFirst()

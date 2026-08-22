@@ -42,7 +42,7 @@ import Foundation
 /// for recorders that only have one stream; PRISM always has two or one,
 /// never a mixed one, because the mic tap and the far-end tap are separate
 /// rings by construction.
-public enum ChannelProfile: Int, Codable, CaseIterable, Equatable {
+public enum ChannelProfile: Int, Codable, CaseIterable, Equatable, Sendable {
     /// This Mac's microphone: the user.
     case directMic = 0
     /// Everyone else, captured from the meeting app's own output.
@@ -58,7 +58,7 @@ public enum ChannelProfile: Int, Codable, CaseIterable, Equatable {
 // MARK: - Word state
 
 /// Whether anything may still revise this word.
-public enum WordState: String, Codable, Equatable {
+public enum WordState: String, Codable, Equatable, Sendable {
     /// Nothing else is coming. Safe to persist and to quote.
     case final
     /// Confirmed by the recogniser, but a slower correction source is still
@@ -75,7 +75,7 @@ public enum WordState: String, Codable, Equatable {
 /// of the audio chunk that produced them — a chunk-relative time is a bug
 /// waiting for the first buffer trim, and every consumer would have to know
 /// the offset to do anything useful.
-public struct TranscriptWord: Codable, Equatable, Identifiable {
+public struct TranscriptWord: Codable, Equatable, Identifiable, Sendable {
     /// Stable for the life of the word, across corrections. Not derived
     /// from the text or the index: both change.
     public var id: String

@@ -75,9 +75,17 @@ public enum ShortcutAction: String, Codable, CaseIterable, Identifiable {
     /// never "make it disappear", because dismissing something you cannot
     /// see you dismissed is unrecoverable.
     case ask                    // ⌃⌥⌘A
+    /// §5.34: live insights on or off. A toggle, unlike `ask`, because the
+    /// thing it controls is a mode rather than an act — and a mode that
+    /// sends the transcript on its own needs a key that turns it off as
+    /// readily as it turned it on. Turning it on also starts listening and
+    /// shows the panel (§8.7): the chord means "start showing me things",
+    /// and a chord that did nothing until two other switches were found is
+    /// a chord nobody would press twice.
+    case insights               // ⌃⌥⌘I
 
     /// ANSI key codes: F = 3, M = 46, R = 15, A = 0, P = 35, E = 14,
-    /// L = 37, B = 11, V = 9, S = 1, D = 2, T = 17.
+    /// L = 37, B = 11, V = 9, S = 1, D = 2, T = 17, I = 34.
     public var defaultCombo: HotkeyCombo {
         switch self {
         case .freeze:
@@ -112,6 +120,8 @@ public enum ShortcutAction: String, Codable, CaseIterable, Identifiable {
             return HotkeyCombo(keyCode: 46, option: true, command: true, control: true)
         case .ask:
             return HotkeyCombo(keyCode: 0, option: true, command: true, control: true)
+        case .insights:
+            return HotkeyCombo(keyCode: 34, option: true, command: true, control: true)
         }
     }
 
@@ -133,6 +143,7 @@ public enum ShortcutAction: String, Codable, CaseIterable, Identifiable {
         case .prompter: return "Prompter"
         case .meeting: return "Transcribe this call"
         case .ask: return "Ask the assistant"
+        case .insights: return "Live insights"
         }
     }
 

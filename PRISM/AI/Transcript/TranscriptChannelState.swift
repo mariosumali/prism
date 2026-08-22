@@ -218,6 +218,30 @@ public struct TranscriptChannelState {
         return TranscriptDelta(newWords: [anchor])
     }
 
+    /// Words the user can already see but the ordinary consumer has not yet
+    /// received. A live checkpoint includes these as pending so a crash does
+    /// not erase the last visible phrase (or the stitcher's held final word).
+    /// They remain ephemeral in the running session and can still be revised;
+    /// only the recovery file receives this snapshot.
+    var checkpointTail: [TranscriptWord] {
+        var tail: [TranscriptWord] = []
+        tail.reserveCapacity(partialWords.count + 1)
+        if var anchor, !anchorEmitted {
+            anchor.state = .pending
+            tail.append(anchor)
+        }
+        tail.append(contentsOf: partialWords.map { word in
+            var pending = word
+            pending.state = .pending
+            return pending
+        })
+        return tail
+    }
+
+    var hasCheckpointTail: Bool {
+        (anchor != nil && !anchorEmitted) || !partialWords.isEmpty
+    }
+
     public mutating func reset() {
         watermark = 0
         partialWatermark = 0

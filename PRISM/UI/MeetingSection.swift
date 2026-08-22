@@ -137,12 +137,30 @@ private struct MeetingSectionBody: View {
             .controlSize(.small)
             .help("Transcribe this call on this Mac\(state.shortcutSuffix(.meeting))")
             Spacer(minLength: 0)
+            // §5.34. A toggle rather than a button, because it is a mode;
+            // on the popover because the popover is the surface that gets
+            // opened mid-sentence, and "stop sending" is a mid-sentence
+            // request.
+            Toggle(isOn: insightsBinding) {
+                Image(systemName: "bolt.fill")
+            }
+            .toggleStyle(.button)
+            .controlSize(.small)
+            .disabled(state.studio.assistant.provider == .none)
+            .help("Live insights\(state.shortcutSuffix(.insights))")
+            .accessibilityLabel("Live insights")
             Button("Ask…") { state.askAssistant() }
                 .controlSize(.small)
                 .disabled(!state.studio.assistant.isActive)
                 .help("Open the assistant\(state.shortcutSuffix(.ask))")
                 .accessibilityLabel("Ask the assistant")
         }
+    }
+
+    private var insightsBinding: Binding<Bool> {
+        Binding(
+            get: { state.studio.assistant.liveInsights },
+            set: { state.setLiveInsights($0) })
     }
 
     /// Elapsed time, plus the far end when there is one. Both are read at a
@@ -245,6 +263,13 @@ private struct MeetingSectionBody: View {
             return "Transcribing on this Mac. Nothing is sent anywhere."
         }
         let destination = "Notes and answers go to \(provider.displayName)."
+        // §5.34 makes "until you ask" false, so the line says which mode
+        // it is describing.
+        if state.studio.assistant.liveInsights {
+            return provider.leavesThisMac
+                ? "\(destination) Live insights is on, so the last few lines go there on their own while you listen with the panel up."
+                : "\(destination) Live insights is on. Nothing leaves this Mac."
+        }
         return provider.leavesThisMac
             ? "\(destination) The transcript stays on this Mac until you ask for notes."
             : "\(destination) Nothing leaves this Mac."

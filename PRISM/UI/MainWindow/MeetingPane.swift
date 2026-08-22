@@ -14,11 +14,10 @@
 // written for the lawyers, not for the user.
 //
 // The transcript is drawn here rather than in a document window of its own.
-// A second window is the shape you reach for when a feature has a library,
-// and this one does not: there is exactly one meeting at a time, you are in
-// it, and what you want mid-call is to glance at the last few lines and type
-// a note. Past meetings are files in Application Support, which is a browser
-// macOS already ships.
+// The pane keeps the current meeting at hand while also exposing a compact
+// library of saved meetings, search, speaker filters, and export controls.
+// The underlying JSON files remain ordinary Application Support files that
+// can be revealed in Finder whenever direct access is useful.
 //
 // Notes are the network boundary and they are drawn as one. Everything above
 // the Notes section happens on this Mac with no connection at all; pressing
@@ -30,9 +29,11 @@
 //
 // Licensed under the Apache License, Version 2.0.
 
+import AppKit
 import Combine
 import Foundation
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct MeetingPane: View {
     @EnvironmentObject var state: AppState
@@ -61,6 +62,19 @@ private struct MeetingPaneBody: View {
     @State private var elapsed: TimeInterval = 0
     @State private var modelBytes: Int64 = 0
     @State private var removalError: String?
+    @State private var transcriptSearch = ""
+    @State private var transcriptScope = TranscriptScope.everyone
+    @State private var followsTranscript = true
+    @State private var copiedTranscript = false
+    @State private var transcriptActionError: String?
+    @State private var savedMeetings: [MeetingRecord] = []
+    @State private var isLoadingMeetings = false
+
+    private enum TranscriptScope: String, CaseIterable {
+        case everyone = "All"
+        case you = "You"
+        case others = "Others"
+    }
 
     /// `@State` rather than a stored `let`: this view is rebuilt every time
     /// AppState publishes, and a publisher rebuilt with it would tear the
@@ -75,6 +89,7 @@ private struct MeetingPaneBody: View {
     var body: some View {
         Form {
             listeningSection
+            savedMeetingsSection
             modelSection
             farEndSection
             transcriptSection
@@ -86,14 +101,96 @@ private struct MeetingPaneBody: View {
         .onAppear {
             modelBytes = SpeechModelCatalog.bytesOnDisk()
             elapsed = session.phase.isRunning ? session.elapsed : 0
+            refreshSavedMeetings()
         }
         .onChange(of: session.phase) { _ in
             modelBytes = SpeechModelCatalog.bytesOnDisk()
             elapsed = session.phase.isRunning ? session.elapsed : 0
+            if !session.phase.isRunning { refreshSavedMeetings() }
+        }
+        .onChange(of: session.notesPhase) { phase in
+            if phase == .ready, !session.phase.isRunning { refreshSavedMeetings() }
         }
         .onReceive(ticker) { _ in
             let current = session.phase.isRunning ? session.elapsed : 0
             if Int(current) != Int(elapsed) { elapsed = current }
+        }
+    }
+
+    // MARK: - Saved meetings
+
+    private var savedMeetingsSection: some View {
+        Section("Saved meetings") {
+            HStack(spacing: Metrics.itemGap) {
+                if isLoadingMeetings {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Loading…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if savedMeetings.isEmpty {
+                    Text("No saved meetings yet.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Menu {
+                        ForEach(savedMeetings) { meeting in
+                            Button {
+                                session.viewSavedMeeting(meeting)
+                            } label: {
+                                Text(savedMeetingLabel(meeting))
+                            }
+                        }
+                    } label: {
+                        Label("Open a transcript", systemImage: "clock.arrow.circlepath")
+                    }
+                    .disabled(session.phase.isRunning)
+                }
+                Spacer(minLength: 0)
+                Button {
+                    refreshSavedMeetings()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .disabled(isLoadingMeetings)
+                .help("Refresh saved meetings")
+                .accessibilityLabel("Refresh saved meetings")
+                Button("Show folder") { revealMeetingsFolder() }
+                    .controlSize(.small)
+                    .help("Open PRISM's Meetings folder in Finder")
+            }
+
+            if let record = session.record {
+                HStack(alignment: .firstTextBaseline, spacing: Metrics.itemGap) {
+                    Text(record.title)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                    Text(record.startedAt.formatted(date: .abbreviated, time: .shortened))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                    Text(MeetingNoteWriter.durationText(record.duration))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Viewing \(record.title)")
+            }
+        }
+    }
+
+    private func savedMeetingLabel(_ record: MeetingRecord) -> String {
+        let recovery = record.endedAt == nil ? "Recovered · " : ""
+        return "\(recovery)\(record.title) — \(record.startedAt.formatted(date: .abbreviated, time: .shortened))"
+    }
+
+    private func refreshSavedMeetings() {
+        guard !isLoadingMeetings else { return }
+        isLoadingMeetings = true
+        TranscriptStore().allInBackground { records in
+            savedMeetings = records
+            isLoadingMeetings = false
         }
     }
 
@@ -314,12 +411,47 @@ private struct MeetingPaneBody: View {
 
     private var transcriptSection: some View {
         Section("The transcript") {
+            transcriptTools
             transcriptScroller
             HStack(spacing: Metrics.itemGap) {
-                Text("\(session.wordCount) words")
+                Text(transcriptCountText)
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 0)
+                if let saved = saveStatusText {
+                    Label(saved, systemImage: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("Transcript \(saved)")
+                } else if session.phase.isRunning, settings.savesTranscript,
+                          session.wordCount > 0 {
+                    Label("Saving…", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            HStack(spacing: Metrics.itemGap) {
+                Button(copiedTranscript ? "Copied" : "Copy transcript") {
+                    copyTranscript()
+                }
+                .disabled(session.lines.isEmpty)
+                Button("Export…") { exportMeeting() }
+                    .disabled(session.lines.isEmpty || session.record == nil)
+                if let id = session.record?.id,
+                   FileManager.default.fileExists(
+                    atPath: TranscriptStore().transcriptURL(for: id).path) {
+                    Button("Show file") { revealTranscript(id: id) }
+                }
+                Spacer(minLength: 0)
+            }
+            .controlSize(.small)
+
+            if let transcriptActionError {
+                Text(transcriptActionError)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             TextEditor(text: $session.userNotes)
@@ -333,23 +465,86 @@ private struct MeetingPaneBody: View {
         }
     }
 
+    private var transcriptTools: some View {
+        HStack(spacing: Metrics.itemGap) {
+            TextField("Search transcript", text: $transcriptSearch)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("Search transcript")
+            Picker("Speaker", selection: $transcriptScope) {
+                ForEach(TranscriptScope.allCases, id: \.self) { scope in
+                    Text(scope.rawValue).tag(scope)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 92)
+            Toggle(isOn: $followsTranscript) {
+                Label("Follow", systemImage: "arrow.down.to.line")
+            }
+            .toggleStyle(.button)
+            .controlSize(.small)
+            .help("Keep the newest words in view")
+            .accessibilityLabel("Follow the latest transcript")
+        }
+    }
+
+    private var visibleTranscriptLines: [TranscriptLine] {
+        let query = transcriptSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+        return session.lines.filter { line in
+            let speakerMatches: Bool
+            switch transcriptScope {
+            case .everyone: speakerMatches = true
+            case .you: speakerMatches = line.channel == .directMic
+            case .others: speakerMatches = line.channel == .farEnd
+            }
+            guard speakerMatches else { return false }
+            guard !query.isEmpty else { return true }
+            return line.text.localizedCaseInsensitiveContains(query)
+                || line.label.localizedCaseInsensitiveContains(query)
+                || line.timestamp.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    private var transcriptCountText: String {
+        let shown = visibleTranscriptLines.count
+        if transcriptSearch.isEmpty, transcriptScope == .everyone {
+            return "\(session.wordCount) words · \(session.lines.count) turns"
+        }
+        return "\(shown) of \(session.lines.count) turns"
+    }
+
+    private var saveStatusText: String? {
+        guard settings.savesTranscript, let savedAt = session.lastSavedAt else { return nil }
+        let seconds = max(0, Int(Date().timeIntervalSince(savedAt)))
+        if !session.phase.isRunning { return "saved" }
+        if seconds < 5 { return "saved just now" }
+        if seconds < 60 { return "saved \(seconds)s ago" }
+        return "saved \(seconds / 60)m ago"
+    }
+
     /// Oldest at the top, newest at the bottom, and it follows the
     /// conversation. A live transcript you have to scroll while talking is a
     /// transcript nobody reads.
     private var transcriptScroller: some View {
         ScrollViewReader { proxy in
             ScrollView(.vertical) {
-                VStack(alignment: .leading, spacing: Metrics.metaGap) {
+                LazyVStack(alignment: .leading, spacing: Metrics.metaGap) {
                     if session.lines.isEmpty, session.hypothesis.isEmpty {
                         Text(emptyTranscriptState)
                             .font(.callout)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    ForEach(session.lines) { line in
+                    if !session.lines.isEmpty, visibleTranscriptLines.isEmpty {
+                        Text("No transcript lines match this search and speaker filter.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    ForEach(visibleTranscriptLines) { line in
                         transcriptRow(line)
                     }
-                    if !session.hypothesis.isEmpty {
+                    if !session.hypothesis.isEmpty,
+                       transcriptSearch.isEmpty, transcriptScope == .everyone {
                         // Never withheld: holding the unsettled tail back is
                         // how a live transcript ends up a sentence behind the
                         // conversation it is transcribing.
@@ -367,29 +562,34 @@ private struct MeetingPaneBody: View {
             }
             .frame(minHeight: 140, maxHeight: 280)
             .onChange(of: session.lines.count) { _ in
-                proxy.scrollTo("bottom", anchor: .bottom)
+                scrollToTranscriptEnd(proxy)
             }
             .onChange(of: session.hypothesis) { _ in
-                proxy.scrollTo("bottom", anchor: .bottom)
+                scrollToTranscriptEnd(proxy)
             }
         }
     }
 
     private func transcriptRow(_ line: TranscriptLine) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: Metrics.itemGap) {
+        HStack(alignment: .top, spacing: Metrics.itemGap) {
             Text(line.timestamp)
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.tertiary)
                 .frame(width: 40, alignment: .leading)
-            // A line still settling is drawn dimmer, never withheld.
-            Text("\(line.label): \(line.text)")
-                .font(.callout)
-                .foregroundStyle(line.isSettled
-                                 ? AnyShapeStyle(.primary)
-                                 : AnyShapeStyle(.secondary))
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(line.label)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(line.channel == .directMic ? Color.accentColor : Color.orange)
+                // A line still settling is drawn dimmer, never withheld.
+                Text(line.text)
+                    .font(.callout)
+                    .foregroundStyle(line.isSettled
+                                     ? AnyShapeStyle(.primary)
+                                     : AnyShapeStyle(.secondary))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(line.label) at \(line.timestamp): \(line.text)")
@@ -398,6 +598,15 @@ private struct MeetingPaneBody: View {
     private var emptyTranscriptState: String {
         if session.phase.isRunning { return "Listening. Words appear as they settle." }
         return "Nothing has been transcribed. Start listening and this fills in as people talk."
+    }
+
+    private func scrollToTranscriptEnd(_ proxy: ScrollViewProxy) {
+        guard followsTranscript, transcriptSearch.isEmpty,
+              transcriptScope == .everyone else { return }
+        // No animation: streamed revisions already move frequently, and an
+        // animated scroll per revision keeps the main thread continuously
+        // compositing during a long answer.
+        proxy.scrollTo("bottom", anchor: .bottom)
     }
 
     // MARK: - 5. Notes
@@ -418,7 +627,7 @@ private struct MeetingPaneBody: View {
                 if session.notesPhase == .writing {
                     ProgressView()
                         .controlSize(.small)
-                    Text("Writing…")
+                    Text(session.notesProgress ?? "Writing…")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Button("Cancel") { state.cancelMeetingNotes() }
@@ -528,9 +737,9 @@ private struct MeetingPaneBody: View {
 
     private var keepingSection: some View {
         Section("Keeping it") {
-            Toggle("Save the transcript when the meeting ends", isOn: savesBinding)
-                .help("Write the words to a file in Application Support")
-            Text("PRISM never writes the audio, under any setting. The transcript is a file in your Application Support folder, and it is not sent anywhere unless you ask for notes. Turn this off and the words are gone when the meeting stops.")
+            Toggle("Keep a crash-safe transcript", isOn: savesBinding)
+                .help("Checkpoint the words to a file in Application Support while listening")
+            Text("PRISM never writes the audio, under any setting. While this is on, it checkpoints the transcript in your Application Support folder so an app or system crash cannot erase the meeting. It is not sent anywhere unless you ask for notes. Turning this off during a meeting removes its checkpoint; the words are gone when the meeting stops.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -557,6 +766,66 @@ private struct MeetingPaneBody: View {
     }
 
     // MARK: - Actions
+
+    private func copyTranscript() {
+        let text = TranscriptRenderer.render(
+            visibleTranscriptLines, includeTimestamps: true)
+        guard !text.isEmpty else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        copiedTranscript = true
+        transcriptActionError = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            copiedTranscript = false
+        }
+    }
+
+    private func exportMeeting() {
+        guard let record = session.recordForNotes() else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.plainText]
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = safeFilename(record.title) + ".md"
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            let markdown = MeetingExport.markdown(
+                record: record,
+                transcript: TranscriptRenderer.render(
+                    session.lines, includeTimestamps: true))
+            do {
+                try markdown.write(to: url, atomically: true, encoding: .utf8)
+                transcriptActionError = nil
+            } catch {
+                transcriptActionError = "PRISM couldn't export this meeting — \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func safeFilename(_ title: String) -> String {
+        let forbidden = CharacterSet(charactersIn: "/:")
+        let parts = title.components(separatedBy: forbidden)
+        let cleaned = parts.joined(separator: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? "Meeting" : cleaned
+    }
+
+    private func revealTranscript(id: String) {
+        let url = TranscriptStore().transcriptURL(for: id)
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    private func revealMeetingsFolder() {
+        let directory = TranscriptStore.directory
+        do {
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true)
+            NSWorkspace.shared.open(directory)
+            transcriptActionError = nil
+        } catch {
+            transcriptActionError = "PRISM couldn't open the Meetings folder — \(error.localizedDescription)"
+        }
+    }
 
     private func removeModels() {
         do {

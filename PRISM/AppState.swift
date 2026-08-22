@@ -234,6 +234,7 @@ public final class AppState: ObservableObject {
             }
             if studio.assistant != oldValue.assistant {
                 assistant.apply(studio.assistant)
+                insights.apply(studio.assistant)
             }
             if studio.gestures != oldValue.gestures {
                 updateGestureWatching()
@@ -449,8 +450,17 @@ public final class AppState: ObservableObject {
     /// machine; AppState supplies the taps and the demand signal and stays
     /// out of the rest.
     public let meeting: MeetingSession
+    /// Installed by the app delegate. Detection can request consent or clear
+    /// a stale request, but it cannot start Meeting mode by itself.
+    public var meetingJoinPromptHandler: ((MeetingJoinCandidate) -> Void)?
+    public var meetingJoinEndedHandler: (([String]) -> Void)?
+    public var clearMeetingJoinPromptsHandler: (() -> Void)?
     /// §5.33 — the in-meeting assistant.
     public let assistant = AssistantSession()
+    /// §5.34 — live insights. Its own object for the assistant's reason, and
+    /// armed only through `wireMeeting`: it needs the panel, a provider and
+    /// a listening meeting, and any one of them going away disarms it.
+    public let insights = InsightSession()
 
     // MARK: - Components
 
@@ -469,6 +479,7 @@ public final class AppState: ObservableObject {
     private let formatManager = FormatManager()
     private let hotkeys = Hotkeys()
     private let autoFramer = AutoFramer()
+    private var meetingJoinDetector = MeetingJoinDetector()
 
     private let previewBox = PreviewTextureBox()
     /// Draft preview path: the renderer lives only while the main window is
@@ -943,6 +954,7 @@ public final class AppState: ObservableObject {
             guard let self, self.virtualMicInUse != inUse else { return }
             self.virtualMicInUse = inUse
             self.reconcileCaptures()
+            self.reconcileMeetingJoinDetection()
         }
         deviceMonitor.onWake = { [weak self] in
             guard let self else { return }
@@ -997,12 +1009,50 @@ public final class AppState: ObservableObject {
             self.updateMenuBarState()
             self.reconcileCaptures()       // a first client starts capture
             self.reconcileAppRules()       // §5.18: who is watching decides the look
+            self.reconcileMeetingJoinDetection()
         }
         cmioSink.onBlockedClientsChanged = { [weak self] blocked in
             guard let self else { return }
             self.blockedClients = blocked
             self.updateBlockedWarning()
         }
+    }
+
+    /// A supported app beginning to read PRISM Camera is an exact call edge.
+    /// PRISM Microphone supplies the camera-off fallback; Core Audio cannot
+    /// name its client, so that path is used only when the frontmost app is a
+    /// supported meeting app, or exactly one supported app is running.
+    private func reconcileMeetingJoinDetection() {
+        let detection = meetingJoinDetector.update(
+            cameraClients: clients,
+            microphoneClient: runningMeetingClientForMicrophone(),
+            at: Date()
+        )
+        if !detection.endedSigningIDs.isEmpty {
+            meetingJoinEndedHandler?(detection.endedSigningIDs)
+        }
+        guard !meeting.phase.isRunning, let prompt = detection.prompt else { return }
+        meetingJoinPromptHandler?(prompt)
+    }
+
+    private func runningMeetingClientForMicrophone() -> CameraClient? {
+        guard virtualMicInUse else { return nil }
+        let workspace = NSWorkspace.shared
+        let running = workspace.runningApplications
+
+        if let signingID = workspace.frontmostApplication?.bundleIdentifier,
+           MeetingClientCatalog.candidate(signingID: signingID) != nil {
+            return CameraClient(signingID: signingID)
+        }
+
+        var candidates: [String: CameraClient] = [:]
+        for app in running where !app.isTerminated {
+            guard let signingID = app.bundleIdentifier,
+                  let candidate = MeetingClientCatalog.candidate(signingID: signingID)
+            else { continue }
+            candidates[candidate.id] = CameraClient(signingID: signingID)
+        }
+        return candidates.count == 1 ? candidates.values.first : nil
     }
 
     private func wireHotkeys() {
@@ -1043,6 +1093,7 @@ public final class AppState: ObservableObject {
         case .prompter: togglePrompter()
         case .meeting: toggleMeeting()
         case .ask: askAssistant()
+        case .insights: toggleLiveInsights()
         }
     }
 
@@ -1078,6 +1129,10 @@ public final class AppState: ObservableObject {
         meeting.micIsOffAir = { [weak self] in self?.micIsOffAir ?? false }
         meeting.apply(studio.meeting)
         assistant.apply(studio.assistant)
+        insights.apply(studio.assistant)
+        // §5.34 builds its requests from the same provider the assistant
+        // uses, reached through the factory so the key never leaves here.
+        insights.providerFactory = { [weak self] in self?.makeProvider() }
 
         // The key is read once, here, rather than per request.
         cachedAnthropicKey = Keychain.get(account: Keychain.Account.anthropic) ?? ""
@@ -1086,19 +1141,37 @@ public final class AppState: ObservableObject {
         // A meeting that stops for any reason — the user, a failure, or a
         // model that would not load — has to drop audio demand with it, or
         // the microphone stays live for a transcript nobody is taking.
+        // §5.34 follows the same signal: no listening, no insights, and a
+        // meeting that ends takes its cards with it.
         meeting.$phase
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.reconcileTranscription() }
+            .sink { [weak self] phase in
+                self?.reconcileTranscription()
+                self?.insights.setListening(phase.isListening)
+                if phase.isRunning {
+                    self?.clearMeetingJoinPromptsHandler?()
+                }
+            }
             .store(in: &cancellables)
 
         // The detector runs on settled far-end text and lights a control.
-        // It never causes a request — see §5.33 and QuestionDetector.
+        // It never causes a request by itself — see §5.33 and
+        // QuestionDetector. §5.34 is the opt-in exception: it is fed every
+        // change too, and decides for itself, against its own switches and
+        // its own cooldowns, whether now is a moment to ask.
         meeting.$lines
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                guard let self, self.studio.assistant.isActive else { return }
+            .sink { [weak self] lines in
+                guard let self else { return }
+                self.insights.observe(lines: lines)
+                guard self.studio.assistant.isActive else { return }
+                // Only the newest settled turn can be a question that is
+                // still waiting for an answer. Passing the rolling history
+                // repeatedly resurfaced old questions and rendered six
+                // transcript lines on every publication for no benefit.
+                let newest = lines.last(where: \.isSettled)
                 self.assistant.observeTranscript(
-                    self.meeting.transcriptTail(turns: 6))
+                    newest?.channel == .farEnd ? newest?.text ?? "" : "")
             }
             .store(in: &cancellables)
     }
@@ -1492,6 +1565,11 @@ public final class AppState: ObservableObject {
     /// `MeetingSession` starts and stops it.
     private let systemAudioCapture: SystemAudioCapture
     private let noteWriter = MeetingNoteWriter()
+    /// One ephemeral URLSession shared by Ask, notes, and live insights.
+    /// Providers are cheap request configuration; constructing a fresh
+    /// transport for each one threw away connection reuse and kept multiple
+    /// networking session objects resident for identical privacy settings.
+    private let llmTransport = LLMTransport()
 
     private var audioCaptureDemand: Bool {
         captureDemand || virtualMicInUse || transcriptionActive
@@ -2945,12 +3023,30 @@ public final class AppState: ObservableObject {
         sessionLog.record(.device, "Started transcribing (\(farEndLogPhrase))")
     }
 
+    /// The notification action arrives here. Keeping it separate from
+    /// detection is the consent boundary: observing a client can only post a
+    /// question, while this explicit user action may start the existing mode.
+    public func startMeeting(fromPromptFor signingID: String) {
+        guard MeetingClientCatalog.candidate(signingID: signingID) != nil else { return }
+        clearMeetingJoinPromptsHandler?()
+        if studio.meeting.farEnd == .chosenApp {
+            studio.meeting.farEndBundleID = signingID
+        }
+        startMeeting()
+    }
+
     public func stopMeeting() {
         guard meeting.phase.isRunning else { return }
         let minutes = Int(meeting.elapsed / 60)
+        // Read before `stop()`: the phase change resets the counters.
+        let insightSummary = insights.meetingSummary
         meeting.stop()
         reconcileTranscription()
         sessionLog.record(.device, "Stopped transcribing after \(minutes) min")
+        // §5.34, counts only. Never a word of what a card said.
+        if let insightSummary {
+            sessionLog.record(.device, insightSummary)
+        }
     }
 
     /// The §5.21 redaction rule at its sharpest. A log row may say PRISM was
@@ -3102,6 +3198,72 @@ public final class AppState: ObservableObject {
         studio.assistant.aboutMe = text
     }
 
+    // MARK: - Intents: live insights (§5.34)
+
+    /// ⌃⌥⌘I. A toggle, unlike the ask chord — see `ShortcutAction.insights`.
+    public func toggleLiveInsights() {
+        setLiveInsights(!studio.assistant.liveInsights)
+    }
+
+    /// Turning the mode on turns on what it needs (§8.7): the panel, if it
+    /// is not up, and listening, if it is not running. Turning it off leaves
+    /// both alone — the transcript is still wanted for the notes, and a panel
+    /// the user may be reading an answer on is not this switch's to close.
+    ///
+    /// Refused, with the reason in the warning row, when there is nowhere to
+    /// send a request. A mode that sends on its own must not be switchable
+    /// into a state where every attempt fails quietly.
+    public func setLiveInsights(_ on: Bool) {
+        guard on else {
+            guard studio.assistant.liveInsights else { return }
+            studio.assistant.liveInsights = false
+            sessionLog.record(.device, "Live insights off")
+            return
+        }
+        guard studio.assistant.provider != .none else {
+            warning = WarningMessage(
+                text: "Choose an AI provider in the Assistant pane first.")
+            return
+        }
+        guard makeProvider() != nil else {
+            warning = WarningMessage(
+                text: LLMError.missingKey.errorDescription ?? "That provider isn't set up yet.")
+            return
+        }
+        if !studio.assistant.liveInsights {
+            studio.assistant.liveInsights = true
+            // The provider's name and nothing else — §5.21. Never a card.
+            sessionLog.record(.device,
+                              "Live insights on (\(studio.assistant.provider.displayName))")
+        }
+        if !studio.assistant.isEnabled { setAssistantEnabled(true) }
+        if !meeting.phase.isRunning { startMeeting() }
+    }
+
+    public func setInsightPace(_ pace: InsightPace) {
+        studio.assistant.insightPace = pace
+    }
+
+    public func setInsightKind(_ kind: InsightKind, enabled: Bool) {
+        if enabled {
+            studio.assistant.insightKinds.insert(kind)
+        } else {
+            studio.assistant.insightKinds.remove(kind)
+        }
+    }
+
+    public func dismissInsight(_ id: String) { insights.dismiss(id) }
+    public func pinInsight(_ id: String) { insights.togglePin(id) }
+    public func clearInsights() { insights.clearAll() }
+
+    /// "More" on a card goes through the typed path, so the rolling
+    /// transcript travels with it: the card is about the call, and the
+    /// follow-up is elliptical by construction.
+    public func askAboutInsight(_ id: String) {
+        guard let card = insights.card(id: id) else { return }
+        askAssistant("More about \"\(card.title)\". You suggested: \(card.body)")
+    }
+
     /// Stores the key in the Keychain and caches it in memory.
     ///
     /// Cached because every `SecItem` call blocks the calling thread, and a
@@ -3138,15 +3300,18 @@ public final class AppState: ObservableObject {
         case .anthropic:
             guard !cachedAnthropicKey.isEmpty else { return nil }
             return AnthropicProvider(model: studio.assistant.anthropicModel,
-                                     apiKey: cachedAnthropicKey)
+                                     apiKey: cachedAnthropicKey,
+                                     transport: llmTransport)
         case .ollama:
             guard !studio.assistant.ollamaModel.isEmpty else { return nil }
-            return OllamaProvider(model: studio.assistant.ollamaModel)
+            return OllamaProvider(model: studio.assistant.ollamaModel,
+                                  transport: llmTransport)
         case .openAICompatible:
             guard studio.assistant.providerIsConfigured else { return nil }
             return OpenAICompatibleProvider(
                 baseURL: studio.assistant.compatibleBaseURL,
-                model: studio.assistant.compatibleModel)
+                model: studio.assistant.compatibleModel,
+                transport: llmTransport)
         }
     }
 
@@ -3155,7 +3320,7 @@ public final class AppState: ObservableObject {
     /// Writes notes from the transcript. The one place §5.32 reaches the
     /// network, and only because the user pressed a button that says so.
     public func writeMeetingNotes() {
-        guard let record = meeting.record, !record.words.isEmpty else {
+        guard let record = meeting.recordForNotes(), !record.words.isEmpty else {
             warning = WarningMessage(text: "There's no transcript to write notes from yet.")
             return
         }
@@ -3164,15 +3329,18 @@ public final class AppState: ObservableObject {
                 text: "Choose an AI provider in the Assistant pane first.")
             return
         }
-        meeting.setNotesPhase(.writing)
+        meeting.setNotesPhase(.writing, progress: "Preparing the transcript…")
         let started = Date()
         noteWriter.write(
             record: record,
-            transcript: meeting.labelledTranscript,
             template: NoteTemplate.named(studio.meeting.templateName),
             provider: provider,
             language: studio.meeting.language,
-            onProgress: { _ in },
+            onProgress: { [weak self] progress in
+                Task { @MainActor [weak self] in
+                    self?.meeting.setNotesProgress(progress)
+                }
+            },
             completion: { [weak self] result in
                 guard let self else { return }
                 switch result {

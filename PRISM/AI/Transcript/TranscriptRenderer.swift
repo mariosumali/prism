@@ -89,11 +89,18 @@ public enum TranscriptRenderer {
         // else looks at them. A recogniser emits them at chunk boundaries,
         // and keeping one would either open a run that renders as a bare
         // label or stretch a gap that should not exist.
-        let ordered = chronological(words.filter { !collapsed($0.trimmed).isEmpty })
+        // Recognisers almost never emit a whitespace-only word. Preserve the
+        // original array storage on that common path; `filter` otherwise
+        // allocated a second full transcript before the sort even began.
+        let visible = words.contains { !hasVisibleContent($0.text) }
+            ? words.filter { hasVisibleContent($0.text) }
+            : words
+        let ordered = chronological(visible)
         guard !ordered.isEmpty else { return [] }
 
-        var runs: [[TranscriptWord]] = []
-        var current: [TranscriptWord] = []
+        var rendered: [TranscriptLine] = []
+        rendered.reserveCapacity(min(ordered.count, 32))
+        var runStart = ordered.startIndex
         /// The furthest point in time the current run has reached. The gap
         /// is measured against this rather than literally against the last
         /// word's end, so one word that overlaps its predecessor — which
@@ -101,33 +108,48 @@ public enum TranscriptRenderer {
         /// manufacture a gap and split a sentence in half.
         var reach: Int64 = 0
 
-        for word in ordered {
-            if let last = current.last,
-               word.channel != last.channel || word.startMs - reach > maxGapMs {
-                runs.append(current)
-                current = []
+        var index = ordered.startIndex
+        while index < ordered.endIndex {
+            let word = ordered[index]
+            if index > runStart {
+                let last = ordered[index - 1]
+                if word.channel != last.channel || word.startMs - reach > maxGapMs {
+                    rendered.append(line(from: ordered[runStart..<index],
+                                         youLabel: youLabel,
+                                         farEndLabel: farEndLabel))
+                    runStart = index
+                    reach = word.endMs
+                    index += 1
+                    continue
+                }
             }
-            reach = current.isEmpty ? word.endMs : max(reach, word.endMs)
-            current.append(word)
+            reach = index == runStart ? word.endMs : max(reach, word.endMs)
+            index += 1
         }
-        if !current.isEmpty { runs.append(current) }
-
-        let rendered = runs.map { run -> TranscriptLine in
-            // The id is the first word's, not a fresh UUID: SwiftUI diffs
-            // this list on every delta, and an identity that changes every
-            // render animates the whole transcript on each new word.
-            TranscriptLine(id: run[0].id,
-                           label: label(for: run[0].channel,
-                                        youLabel: youLabel,
-                                        farEndLabel: farEndLabel),
-                           text: joinedText(run),
-                           startMs: run[0].startMs,
-                           endMs: run.reduce(run[0].endMs) { max($0, $1.endMs) },
-                           channel: run[0].channel,
-                           isSettled: run.allSatisfy { $0.state == .final })
-        }
+        rendered.append(line(from: ordered[runStart..<ordered.endIndex],
+                             youLabel: youLabel,
+                             farEndLabel: farEndLabel))
 
         return mergeRunOnSentences(bridgeShortInterjections(rendered))
+    }
+
+    private static func line<Run: Collection>(from run: Run,
+                                               youLabel: String,
+                                               farEndLabel: String) -> TranscriptLine
+        where Run.Element == TranscriptWord {
+        // The id is the first word's, not a fresh UUID: SwiftUI diffs this
+        // list on every delta. Ranges let the renderer avoid allocating one
+        // temporary word array per spoken turn.
+        let first = run.first!
+        return TranscriptLine(id: first.id,
+                              label: label(for: first.channel,
+                                           youLabel: youLabel,
+                                           farEndLabel: farEndLabel),
+                              text: joinedText(run),
+                              startMs: first.startMs,
+                              endMs: run.reduce(first.endMs) { max($0, $1.endMs) },
+                              channel: first.channel,
+                              isSettled: run.allSatisfy { $0.state == .final })
     }
 
     /// One labelled string, for a prompt or the clipboard. Each line is
@@ -151,7 +173,7 @@ public enum TranscriptRenderer {
                             youLabel: String, farEndLabel: String) -> String {
         guard turns > 0 else { return "" }
         let all = lines(words, youLabel: youLabel, farEndLabel: farEndLabel)
-        return render(Array(all.suffix(turns)), includeTimestamps: false)
+        return render(all.suffix(turns), includeTimestamps: false)
     }
 
     // MARK: - Ordering
@@ -165,7 +187,25 @@ public enum TranscriptRenderer {
     /// costs one allocation per render and buys an output that does not
     /// move when nothing changed.
     static func chronological(_ words: [TranscriptWord]) -> [TranscriptWord] {
-        words.enumerated()
+        // MeetingSession maintains this order as words arrive. Most renders
+        // can therefore return the same CoW storage after a linear check,
+        // instead of decorating, sorting, mapping and allocating the entire
+        // meeting again on every transcript update.
+        if words.count < 2 { return words }
+        var alreadyOrdered = true
+        for index in 1..<words.count {
+            let previous = words[index - 1]
+            let current = words[index]
+            if current.startMs < previous.startMs
+                || (current.startMs == previous.startMs
+                    && current.channel.sortRank < previous.channel.sortRank) {
+                alreadyOrdered = false
+                break
+            }
+        }
+        if alreadyOrdered { return words }
+
+        return words.enumerated()
             .sorted { left, right in
                 if left.element.startMs != right.element.startMs {
                     return left.element.startMs < right.element.startMs
@@ -176,6 +216,41 @@ public enum TranscriptRenderer {
                 return left.offset < right.offset
             }
             .map(\.element)
+    }
+
+    /// Stable linear merge for the live session. Existing words win an exact
+    /// timestamp/channel tie because they arrived first; new words are first
+    /// stably ordered among themselves by `chronological`.
+    static func mergingChronological(_ existing: [TranscriptWord],
+                                     with newWords: [TranscriptWord]) -> [TranscriptWord] {
+        guard !newWords.isEmpty else { return existing }
+        guard !existing.isEmpty else { return chronological(newWords) }
+        let incoming = chronological(newWords)
+        var merged: [TranscriptWord] = []
+        merged.reserveCapacity(existing.count + incoming.count)
+        var oldIndex = 0
+        var newIndex = 0
+        while oldIndex < existing.count && newIndex < incoming.count {
+            let old = existing[oldIndex]
+            let new = incoming[newIndex]
+            let newComesFirst = new.startMs < old.startMs
+                || (new.startMs == old.startMs
+                    && new.channel.sortRank < old.channel.sortRank)
+            if newComesFirst {
+                merged.append(new)
+                newIndex += 1
+            } else {
+                merged.append(old)
+                oldIndex += 1
+            }
+        }
+        if oldIndex < existing.count {
+            merged.append(contentsOf: existing[oldIndex...])
+        }
+        if newIndex < incoming.count {
+            merged.append(contentsOf: incoming[newIndex...])
+        }
+        return merged
     }
 
     // MARK: - Labels
@@ -205,23 +280,29 @@ public enum TranscriptRenderer {
     /// token often enough that a naive space-join produces "Hello , world".
     /// So the tokens are stripped of their own whitespace on the way in and
     /// the join owns every space in the result.
-    static func joinedText(_ run: [TranscriptWord]) -> String {
+    static func joinedText<Run: Collection>(_ run: Run) -> String
+        where Run.Element == TranscriptWord {
         var text = ""
         var previousBindsRight = false
         for word in run {
-            let token = collapsed(word.trimmed)
+            let token = collapsed(word.text)
             guard !token.isEmpty else { continue }
             let binding = binding(of: token)
             if text.isEmpty {
                 text = token
             } else if previousBindsRight || binding == .left {
-                text += token
+                text.append(contentsOf: token)
             } else {
-                text += " " + token
+                text.append(" ")
+                text.append(contentsOf: token)
             }
             previousBindsRight = binding == .right
         }
         return text
+    }
+
+    private static func hasVisibleContent(_ text: String) -> Bool {
+        text.contains { !$0.isWhitespace }
     }
 
     /// Whitespace runs of any kind squeezed to one space, with none left at
@@ -229,7 +310,23 @@ public enum TranscriptRenderer {
     /// character set also catches the newline a recogniser puts between
     /// utterances, which `trimmingCharacters(in: .whitespaces)` does not.
     static func collapsed(_ text: String) -> String {
-        text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        // The overwhelmingly common token has no whitespace and can keep its
+        // original String storage. Build a replacement only for recogniser
+        // chunks that actually need trimming or whitespace compression.
+        guard text.contains(where: { $0.isWhitespace }) else { return text }
+        var result = ""
+        result.reserveCapacity(text.utf8.count)
+        var pendingSpace = false
+        for character in text {
+            if character.isWhitespace {
+                pendingSpace = !result.isEmpty
+            } else {
+                if pendingSpace { result.append(" ") }
+                result.append(character)
+                pendingSpace = false
+            }
+        }
+        return result
     }
 
     /// Which side of itself a token owns the space on.
@@ -261,17 +358,36 @@ public enum TranscriptRenderer {
     private static let openingMarks =
         CharacterSet(charactersIn: "([{\u{201C}\u{2018}\u{00AB}\u{00BF}\u{00A1}")
 
-    private static func render(_ lines: [TranscriptLine],
-                               includeTimestamps: Bool) -> String {
-        lines.map { line in
-            let body = "\(line.label): \(line.text)"
-            return includeTimestamps ? "[\(line.timestamp)] " + body : body
+    static func render<Lines: Collection>(_ lines: Lines,
+                                          includeTimestamps: Bool) -> String
+        where Lines.Element == TranscriptLine {
+        var result = ""
+        for line in lines {
+            if !result.isEmpty { result.append("\n") }
+            if includeTimestamps {
+                result.append("[")
+                result.append(contentsOf: line.timestamp)
+                result.append(contentsOf: "] ")
+            }
+            result.append(contentsOf: line.label)
+            result.append(contentsOf: ": ")
+            result.append(contentsOf: line.text)
         }
-        .joined(separator: "\n")
+        return result
     }
 
     private static func wordCount(_ text: String) -> Int {
-        text.split(whereSeparator: { $0.isWhitespace }).count
+        var count = 0
+        var insideWord = false
+        for character in text {
+            if character.isWhitespace {
+                insideWord = false
+            } else if !insideWord {
+                count += 1
+                insideWord = true
+            }
+        }
+        return count
     }
 
     // MARK: - Repairs

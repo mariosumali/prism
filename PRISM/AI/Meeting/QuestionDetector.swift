@@ -19,6 +19,13 @@
 // every false positive into a token bill and a paragraph that arrives while
 // somebody is still speaking — and nobody can un-ask it.
 //
+// Live insights (§5.34) is the one opt-in exception, and it is built on
+// exactly that lesson rather than against it: there the detector is one of
+// two triggers, behind a quiet gap, a cooldown, a ten-minute ceiling and a
+// switch of its own, and a false positive costs a request that is allowed
+// to — and usually does — return nothing. Everything below is still written
+// for the light, because the light is the default.
+//
 // Wired to a light, a false positive costs a lit key that gets ignored.
 // That asymmetry is what buys the rules below the right to be loose, and
 // they use it: an imperative that opens with an auxiliary ("do not forget
@@ -196,6 +203,11 @@ public enum QuestionDetector {
         guard trimmed.rangeOfCharacter(from: .alphanumerics) != nil else { return .none }
         let folded = normalized(trimmed)
         let words = wordCount(folded)
+        return confidence(trimmed: trimmed, folded: folded, words: words)
+    }
+
+    private static func confidence(trimmed: String, folded: String,
+                                   words: Int) -> QuestionConfidence {
 
         // A question mark is the one unambiguous signal in the language, so
         // it outranks everything and it is checked without a length floor:
@@ -233,8 +245,10 @@ public enum QuestionDetector {
     public static func isLikelyCompleteQuestion(_ text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= answerableCharacterFloor else { return false }
-        guard wordCount(trimmed) >= answerableWordFloor else { return false }
-        return confidence(trimmed) >= .medium
+        let folded = normalized(trimmed)
+        let words = wordCount(folded)
+        guard words >= answerableWordFloor else { return false }
+        return confidence(trimmed: trimmed, folded: folded, words: words) >= .medium
     }
 
     /// Pulls the most recent question-shaped sentence out of a run of
@@ -275,8 +289,8 @@ public enum QuestionDetector {
     public static func sentences(in text: String) -> [String] {
         var pieces: [String] = []
         var current = ""
-        let characters = Array(text)
-        var index = 0
+        current.reserveCapacity(min(text.utf8.count, 512))
+        var index = text.startIndex
 
         func close() {
             let piece = current.trimmingCharacters(in: .whitespaces)
@@ -286,9 +300,10 @@ public enum QuestionDetector {
             current.removeAll(keepingCapacity: true)
         }
 
-        while index < characters.count {
-            let character = characters[index]
-            index += 1
+        while index < text.endIndex {
+            let character = text[index]
+            let next = text.index(after: index)
+            index = next
             if character.isNewline {
                 close()
                 continue
@@ -297,7 +312,7 @@ public enum QuestionDetector {
             guard character == "." || character == "!" || character == "?" else { continue }
             if character == ".",
                let previous = current.dropLast().last, previous.isNumber,
-               index < characters.count, characters[index].isNumber {
+               next < text.endIndex, text[next].isNumber {
                 continue
             }
             close()

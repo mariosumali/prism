@@ -56,6 +56,7 @@ struct AssistantPane: View {
         Form {
             providerSection
             panelSection
+            liveInsightsSection
             aboutMeSection
             privacySection
         }
@@ -269,10 +270,78 @@ struct AssistantPane: View {
                 .help("Mark the composer when the other side appears to have asked a question")
                 .accessibilityLabel("Highlight detected questions")
             // The sentence that decides whether this feature is trustworthy,
-            // so it is written flatly and without hedging.
-            Text("A detected question lights up the composer. It is never sent on its own. Nothing goes to the provider until you press the key — PRISM shows you what it thinks it heard so the chord has something ready, and that is the whole of it.")
+            // so it is written flatly and without hedging — and it changes
+            // when §5.34 is on, because then it would be false.
+            Text(detectionCaption)
                 .font(.caption)
                 .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var detectionCaption: String {
+        if settings.liveInsights {
+            return "A detected question lights up the composer — and while live insights is on, it is also one of the two things that prompt a request, so an answer card may follow it. Turn live insights off below and nothing goes to the provider until you press the key."
+        }
+        return "A detected question lights up the composer. It is never sent on its own. Nothing goes to the provider until you press the key — PRISM shows you what it thinks it heard so the chord has something ready, and that is the whole of it."
+    }
+
+    // MARK: - Live insights (§5.34)
+
+    /// The one section in this pane about something that sends on its own,
+    /// which is why it says how often in numbers rather than adverbs, and
+    /// why the switch is disabled until there is somewhere to send to.
+    private var liveInsightsSection: some View {
+        Section("Live insights") {
+            Toggle("Show me things as the call goes on", isOn: liveInsightsBinding)
+                .disabled(settings.provider == .none)
+                .help("Cards appear on the panel without you asking\(state.shortcutSuffix(.insights))")
+                .accessibilityLabel("Live insights")
+            Text(liveInsightsBlurb)
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Picker("Pace", selection: insightPaceBinding) {
+                ForEach(InsightPace.allCases, id: \.self) { pace in
+                    Text(pace.displayName).tag(pace)
+                }
+            }
+            .pickerStyle(.segmented)
+            .help("How often PRISM looks at the conversation")
+            .accessibilityLabel("Live insights pace")
+            Text(settings.insightPace.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            ForEach(InsightKind.allCases, id: \.self) { kind in
+                Toggle(kind.displayName, isOn: insightKindBinding(kind))
+                    .help(kind.rule.prefix(1).uppercased() + kind.rule.dropFirst())
+                    .accessibilityLabel(kind.displayName)
+            }
+            if settings.insightKinds.isEmpty {
+                Text("Every kind is off, so nothing is asked for. That is the same as the switch being off.")
+                    .font(.caption)
+                    .foregroundStyle(Color.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            InsightCadenceText(session: state.insights, pace: settings.insightPace)
+        }
+    }
+
+    /// Standing, never conditional (§8.4): this is the sentence that tells
+    /// the user PRISM will send without a key press, and it has to be
+    /// readable before the switch is flipped, not after.
+    private var liveInsightsBlurb: String {
+        "While you are listening and the panel is up, PRISM sends the last \(settings.clampedContextTurns) lines to \(destinationName) on its own and puts up a card when there is something worth saying — the answer to what you were just asked, a term that went past, a commitment somebody made. It is told that nothing is the usual answer, and most of the time it shows nothing. Turning this on starts listening if you were not already. This is the one thing in PRISM that sends without you pressing a key, which is why it has its own switch."
+    }
+
+    private var destinationName: String {
+        switch settings.provider {
+        case .none: return "your provider"
+        case .anthropic: return "Claude"
+        case .ollama: return "Ollama on this Mac"
+        case .openAICompatible: return "the endpoint you named"
         }
     }
 
@@ -329,11 +398,17 @@ struct AssistantPane: View {
         case .none:
             return "Nothing leaves this Mac while the provider is Off. There is no request to describe."
         case .ollama:
-            return "When you ask, what goes to the model is the last \(settings.clampedContextTurns) lines of transcript, whatever is under About you, and your question. Nothing else — not your audio, not your camera, not your screen. And with Ollama it stays on this Mac."
+            let timing = settings.liveInsights
+                ? "When you ask, and automatically while Live insights is on,"
+                : "When you ask,"
+            return "\(timing) what goes to the model is the recent transcript, whatever is under About you, and the question or card request. Nothing else — not your audio, not your camera, not your screen. And with Ollama it stays on this Mac."
         case .anthropic, .openAICompatible:
             let destination = settings.provider == .anthropic
                 ? "Claude" : "the endpoint you named above"
-            return "When you ask, what goes to \(destination) is the last \(settings.clampedContextTurns) lines of transcript, whatever is under About you, and your question. Nothing else — not your audio, not your camera, not your screen. That request does leave this Mac, and nothing is sent until you ask for it."
+            let timing = settings.liveInsights
+                ? "When you ask, and automatically while Live insights is on,"
+                : "When you ask,"
+            return "\(timing) what goes to \(destination) is the recent transcript, whatever is under About you, and the question or card request. Nothing else — not your audio, not your camera, not your screen. Those requests do leave this Mac."
         }
     }
 
@@ -425,5 +500,46 @@ struct AssistantPane: View {
         Binding(
             get: { state.studio.assistant.aboutMe },
             set: { state.setAssistantAboutMe($0) })
+    }
+
+    private var liveInsightsBinding: Binding<Bool> {
+        Binding(
+            get: { state.studio.assistant.liveInsights },
+            set: { state.setLiveInsights($0) })
+    }
+
+    private var insightPaceBinding: Binding<InsightPace> {
+        Binding(
+            get: { state.studio.assistant.insightPace },
+            set: { state.setInsightPace($0) })
+    }
+
+    private func insightKindBinding(_ kind: InsightKind) -> Binding<Bool> {
+        Binding(
+            get: { state.studio.assistant.insightKinds.contains(kind) },
+            set: { state.setInsightKind(kind, enabled: $0) })
+    }
+}
+
+/// A live, factual account of automatic model traffic. The configured pace
+/// explains the ceiling; the count says what this meeting has actually used.
+private struct InsightCadenceText: View {
+    @ObservedObject var session: InsightSession
+    let pace: InsightPace
+
+    var body: some View {
+        Text(summary)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityLabel("Live insights request count")
+            .accessibilityValue(summary)
+    }
+
+    private var summary: String {
+        let count = session.requestCount
+        let used = count == 1 ? "1 request this meeting" : "\(count) requests this meeting"
+        let limit = InsightPolicy.forPace(pace).requestsPerWindow
+        return "\(used). This pace allows at most \(limit) requests in any ten minutes."
     }
 }

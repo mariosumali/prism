@@ -96,6 +96,20 @@ public struct AssistantSettings: Codable, Equatable {
     /// and the pane says plainly that it is sent.
     public var aboutMe: String = ""
 
+    /// §5.34 — cards appear on their own while the call goes on. The one
+    /// exception to push-to-ask, and a preference rather than a state: it is
+    /// restored, because it can only act while `isEnabled` is true and
+    /// `isEnabled` never is. Off by default, like everything that sends.
+    public var liveInsights: Bool = false
+
+    /// How eager §5.34 is allowed to be. The numbers live in `InsightPolicy`.
+    public var insightPace: InsightPace = .balanced
+
+    /// Which kinds of card the user wants. Stored as a set, decoded from a
+    /// list of names so that a kind this build does not know is skipped
+    /// rather than taking the whole selection with it.
+    public var insightKinds: Set<InsightKind> = InsightKind.defaultSet
+
     public init() {}
 
     public init(from decoder: Decoder) throws {
@@ -116,6 +130,27 @@ public struct AssistantSettings: Codable, Equatable {
         contextTurns = c.tolerant(.contextTurns, 14)
         highlightsQuestions = c.tolerant(.highlightsQuestions, true)
         aboutMe = c.tolerant(.aboutMe, "")
+        liveInsights = c.tolerant(.liveInsights, false)
+        insightPace = c.tolerant(.insightPace, InsightPace.balanced)
+        if let names: [String] = c.tolerant(.insightKinds, nil) {
+            insightKinds = Set(names.compactMap(InsightKind.init(rawValue:)))
+        } else {
+            insightKinds = InsightKind.defaultSet
+        }
+    }
+
+    /// The kinds a request asks for. An empty selection means the user
+    /// switched every kind off, which is the same intent as switching the
+    /// mode off — so it is treated that way by `wantsLiveInsights`, and
+    /// never silently widened back to the default.
+    public var effectiveInsightKinds: Set<InsightKind> { insightKinds }
+
+    /// §5.34's demand gate: the mode is on, the panel is active with a
+    /// provider, and there is at least one kind of card to ask for. The
+    /// meeting being listened to is the fourth switch and lives on the
+    /// session, not here.
+    public var wantsLiveInsights: Bool {
+        isActive && liveInsights && !insightKinds.isEmpty
     }
 
     public var clampedOpacity: Double { min(max(opacity, 0.35), 1) }

@@ -534,6 +534,53 @@ final class SettingsForwardCompatTests: XCTestCase {
         XCTAssertEqual(settings.aboutMe, "I ship a virtual camera.")
     }
 
+    /// §5.34: a file from before live insights decodes with the mode off,
+    /// the default pace and every kind.
+    func testPreInsightsAssistantSettingsDecodeWithTheModeOff() throws {
+        let json = #"{"provider":"ollama","ollamaModel":"llama3"}"#
+        let settings = try decode(AssistantSettings.self, json)
+
+        XCTAssertFalse(settings.liveInsights)
+        XCTAssertEqual(settings.insightPace, .balanced)
+        XCTAssertEqual(settings.insightKinds, InsightKind.defaultSet)
+        XCTAssertFalse(settings.wantsLiveInsights)
+    }
+
+    /// A kind or a pace this build does not know — a file from a later
+    /// build, or a hand-edit — is skipped, not fatal: the kinds it does
+    /// know survive, and the pace falls back.
+    func testUnknownInsightKindsAndPacesAreSkippedNotFatal() throws {
+        let json = #"{"liveInsights":true,"insightPace":"frantic","insightKinds":["term","hologram","commitment"]}"#
+        let settings = try decode(AssistantSettings.self, json)
+
+        XCTAssertTrue(settings.liveInsights)
+        XCTAssertEqual(settings.insightPace, .balanced)
+        XCTAssertEqual(settings.insightKinds, [.term, .commitment])
+    }
+
+    /// The mode is a preference and round-trips. The panel's open state
+    /// still does not, so a restored `liveInsights: true` has nothing to arm
+    /// at launch — the three switches are three switches on purpose.
+    func testLiveInsightsRoundTripsButCannotArmWithoutThePanel() throws {
+        var settings = AssistantSettings()
+        settings.isEnabled = true
+        settings.provider = .ollama
+        settings.ollamaModel = "llama3"
+        settings.liveInsights = true
+        settings.insightPace = .eager
+        settings.insightKinds = [.answer]
+        XCTAssertTrue(settings.wantsLiveInsights)
+
+        let data = try JSONEncoder().encode(settings)
+        let decoded = try JSONDecoder().decode(AssistantSettings.self, from: data)
+
+        XCTAssertTrue(decoded.liveInsights)
+        XCTAssertEqual(decoded.insightPace, .eager)
+        XCTAssertEqual(decoded.insightKinds, [.answer])
+        XCTAssertFalse(decoded.isEnabled)
+        XCTAssertFalse(decoded.wantsLiveInsights, "a restored mode must not be able to send at login")
+    }
+
     /// A partially-written meeting settings object — the shape a downgrade
     /// or a hand-edit produces — keeps what it names and defaults the rest,
     /// rather than throwing the whole struct away.

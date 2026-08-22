@@ -105,6 +105,23 @@ final class TranscriptRendererTests: XCTestCase {
                        ["one", "two", "three"])
     }
 
+    func testLiveMergeIsChronologicalStableAndDoesNotResortTheWholeMeeting() {
+        let oldFirst = word("old-first", 1_000, 1_100, .directMic)
+        let oldLast = word("old-last", 3_000, 3_100, .farEnd)
+        // Deliberately unordered. The exact-key tie must follow the word that
+        // was already present, while the earlier far-end word moves ahead.
+        let tiedNew = word("new-tie", 1_000, 1_100, .directMic)
+        let earlierNew = word("new-earlier", 500, 600, .farEnd)
+        let middleNew = word("new-middle", 2_000, 2_100, .farEnd)
+
+        let merged = TranscriptRenderer.mergingChronological(
+            [oldFirst, oldLast],
+            with: [middleNew, tiedNew, earlierNew])
+
+        XCTAssertEqual(merged.map(\.text),
+                       ["new-earlier", "old-first", "new-tie", "new-middle", "old-last"])
+    }
+
     // MARK: - Labels
 
     func testFarEndRunNeverMergesIntoAYouLine() {
@@ -224,6 +241,14 @@ final class TranscriptRendererTests: XCTestCase {
         let text = render(words)[0].text
         XCTAssertEqual(text, "ragged spacing here indeed")
         XCTAssertFalse(text.contains("  "))
+    }
+
+    func testUnicodeWhitespaceStillCollapsesOnTheAllocationFreeFastPath() {
+        let words = [
+            word("\u{2003}wide\u{2003}space\u{2003}", 0, 300, .directMic),
+            word("works", 300, 600, .directMic),
+        ]
+        XCTAssertEqual(render(words)[0].text, "wide space works")
     }
 
     // MARK: - Settling

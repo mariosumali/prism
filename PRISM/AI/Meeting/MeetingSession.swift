@@ -79,7 +79,14 @@ public final class MeetingSession: ObservableObject {
     /// sentence behind the conversation.
     @Published public private(set) var hypothesis: String = ""
     @Published public private(set) var notesPhase: NotesPhase = .none
+    /// A concrete stage for long note runs. Kept separate from NotesPhase so
+    /// existing callers can still reason about the small state machine.
+    @Published public private(set) var notesProgress: String?
     @Published public private(set) var record: MeetingRecord?
+    /// The last durable checkpoint for the record currently on screen.
+    /// Surfaces use this to distinguish "captured" from "saved" instead of
+    /// making the user infer it from a preference toggle.
+    @Published public private(set) var lastSavedAt: Date?
     /// True once the far-end stream has delivered audio that is actually
     /// audible — not merely that it started. See `SystemAudioCapture`.
     @Published public private(set) var farEndHeard = false
@@ -88,7 +95,13 @@ public final class MeetingSession: ObservableObject {
     @Published public private(set) var notice: String?
     /// Typed during the call. Worth more to the notes prompt than anything
     /// else in it, because it is the one part a human wrote on purpose.
-    @Published public var userNotes: String = ""
+    @Published public var userNotes: String = "" {
+        didSet {
+            guard userNotes != oldValue else { return }
+            record?.userNotes = userNotes
+            scheduleCheckpoint()
+        }
+    }
 
     // MARK: Injected
 
@@ -101,6 +114,7 @@ public final class MeetingSession: ObservableObject {
     private let farEnd: (any SystemAudioCapturing)?
     private let store: TranscriptStore
     private let now: () -> Date
+    private let checkpointDelay: TimeInterval
     /// Whether the microphone is currently off air — muted, or displaced by
     /// clip audio. The tap starves in both cases, and this is how the
     /// session tells "nobody is speaking" from "PRISM is not being given
@@ -118,7 +132,8 @@ public final class MeetingSession: ObservableObject {
                 farEnd: (any SystemAudioCapturing)?,
                 store: TranscriptStore? = nil,
                 micIsOffAir: @escaping () -> Bool = { false },
-                now: @escaping () -> Date = Date.init) {
+                now: @escaping () -> Date = Date.init,
+                checkpointDelay: TimeInterval = 3) {
         self.engineFactory = engineFactory
         self.armMicTap = armMicTap
         self.micTapCursor = micTapCursor
@@ -130,6 +145,7 @@ public final class MeetingSession: ObservableObject {
         self.store = store ?? TranscriptStore()
         self.micIsOffAir = micIsOffAir
         self.now = now
+        self.checkpointDelay = max(0, checkpointDelay)
         scratch = UnsafeMutablePointer<Float>.allocate(capacity: Self.scratchFrames)
         scratch.initialize(repeating: 0, count: Self.scratchFrames)
     }
@@ -144,6 +160,7 @@ public final class MeetingSession: ObservableObject {
 
     public func apply(_ settings: MeetingSettings) {
         let modelChanged = settings.model != self.settings.model
+        let savingChanged = settings.savesTranscript != self.settings.savesTranscript
         self.settings = settings
         // A model swap mid-meeting is not something to do quietly: the new
         // one has to be downloaded and loaded, which takes long enough to
@@ -151,6 +168,21 @@ public final class MeetingSession: ObservableObject {
         // listening; this is the belt to that braces.
         if modelChanged, phase.isRunning {
             notice = "The speech model changes the next time you start listening."
+        }
+        guard savingChanged, phase.isRunning else { return }
+        if settings.savesTranscript {
+            scheduleCheckpoint(immediately: true)
+        } else {
+            // A checkpoint may already exist from earlier in this meeting.
+            // Turning saving off must mean no transcript remains on disk, not
+            // merely that the final write is skipped.
+            cancelCheckpoint()
+            do {
+                try store.delete(id: meetingID)
+                lastSavedAt = nil
+            } catch {
+                notice = "PRISM couldn't remove the saved transcript — \(error.localizedDescription)"
+            }
         }
     }
 
@@ -171,6 +203,12 @@ public final class MeetingSession: ObservableObject {
     /// short enough that the user finds out during the call rather than
     /// from half a transcript afterwards.
     private var farEndDeadline: Date?
+    private var checkpointTask: Task<Void, Never>?
+    private var checkpointGeneration: UInt64 = 0
+    /// True after a record was opened from the library. Updating notes on an
+    /// already-saved meeting remains durable even when saving new meetings is
+    /// currently switched off.
+    private var isViewingSavedRecord = false
 
     private static let scratchFrames = 48_000      // 1 s at 48 kHz
     private let scratch: UnsafeMutablePointer<Float>
@@ -183,12 +221,17 @@ public final class MeetingSession: ObservableObject {
 
         meetingID = UUID().uuidString
         startedAt = now()
+        cancelCheckpoint()
         words = []
         lines = []
         hypothesis = ""
+        userNotes = ""
         notesPhase = .none
+        notesProgress = nil
+        lastSavedAt = nil
         notice = nil
         farEndHeard = false
+        isViewingSavedRecord = false
         micChannel.reset()
         farChannel.reset()
         partials = [:]
@@ -290,12 +333,12 @@ public final class MeetingSession: ObservableObject {
 
         teardownCapture()
 
-        // Emit whatever each channel was holding back. The stitcher holds
-        // the last word of every batch in case the next one continues it;
-        // at the end of a meeting there is no next one, so it has to be
-        // released or the transcript quietly loses its final word.
-        apply(micChannel.state.finish(), channel: .directMic)
-        apply(farChannel.state.finish(), channel: .farEnd)
+        // Promote the visible provisional tail before releasing the held
+        // anchor. There will never be a second decode after Stop with which
+        // LocalAgreement can confirm it; discarding words already visible to
+        // the user makes the saved transcript look arbitrarily cut off.
+        finish(channel: .directMic)
+        finish(channel: .farEnd)
         hypothesis = ""
 
         var finished = record ?? MeetingRecord(id: meetingID, title: MeetingRecord.defaultTitle(for: startedAt), startedAt: startedAt)
@@ -305,9 +348,11 @@ public final class MeetingSession: ObservableObject {
         finished.farEndLabel = settings.resolvedFarEndLabel
         record = finished
 
+        cancelCheckpoint()
         if settings.savesTranscript, !words.isEmpty {
             do {
                 try store.save(finished)
+                lastSavedAt = now()
             } catch {
                 notice = "PRISM couldn't save the transcript — \(error.localizedDescription)"
             }
@@ -316,6 +361,19 @@ public final class MeetingSession: ObservableObject {
         Task { [engine] in await engine?.unload() }
         engine = nil
         phase = .idle
+    }
+
+    /// Finalises one channel without throwing away its on-screen tail.
+    private func finish(channel: ChannelProfile) {
+        var pipeline = self[channel]
+        let provisional = TranscriptSanitizer.clean(pipeline.agreement.provisional)
+        if !provisional.isEmpty {
+            apply(pipeline.state.applyFinal(provisional), channel: channel)
+        }
+        apply(pipeline.state.finish(), channel: channel)
+        pipeline.agreement.reset()
+        partials[channel] = []
+        self[channel] = pipeline
     }
 
     private func teardownCapture() {
@@ -337,8 +395,12 @@ public final class MeetingSession: ObservableObject {
     /// it would at frame rate.
     private func startDrainTimer() {
         let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.drain() }
+            MainActor.assumeIsolated { self?.drain() }
         }
+        // Audio itself remains continuous in the tap ring. A small tolerance
+        // lets macOS coalesce wakeups while staying far inside the ring and
+        // decode-window margins.
+        timer.tolerance = 0.015
         // .common, not the default mode: a timer scheduled the ordinary way
         // stops firing while a menu is open or a window is being dragged,
         // and a transcript that pauses because somebody opened the popover
@@ -411,14 +473,19 @@ public final class MeetingSession: ObservableObject {
         }
         pipeline.cursor = returnedCursor
 
-        var resampled: [Float] = []
-        resampled.reserveCapacity(frames / 3 + 4)
-        pipeline.resampler.append(scratch, frameCount: frames, into: &resampled)
-        guard !resampled.isEmpty else { return }
+        // Reuse one array per channel. This path runs ten times a second per
+        // active channel; constructing a fresh Float array here made ordinary
+        // listening an allocator benchmark even though SpeechResampler's API
+        // was explicitly designed around caller-owned storage.
+        pipeline.resampledScratch.removeAll(keepingCapacity: true)
+        pipeline.resampledScratch.reserveCapacity(frames / 3 + 4)
+        pipeline.resampler.append(scratch, frameCount: frames,
+                                  into: &pipeline.resampledScratch)
+        guard !pipeline.resampledScratch.isEmpty else { return }
 
         // The gate. Below this the recogniser is not called at all — see
         // the file header.
-        if SpeechLevel.rms(resampled) < settings.clampedSilenceRMS {
+        if SpeechLevel.rms(pipeline.resampledScratch) < settings.clampedSilenceRMS {
             pipeline.silentRuns += 1
             // A long silence ends the utterance rather than padding the
             // buffer with room tone the model would be charged to read.
@@ -428,7 +495,7 @@ public final class MeetingSession: ObservableObject {
             return
         }
         pipeline.silentRuns = 0
-        pipeline.buffer.append(resampled)
+        pipeline.buffer.append(pipeline.resampledScratch)
     }
 
     private func checkFarEndDeadline() {
@@ -452,10 +519,15 @@ public final class MeetingSession: ObservableObject {
         // window. Selected by channel rather than by key path: these are
         // stored properties of a class, and a value-typed key path into one
         // cannot be written back through.
-        let ready = [micChannel, farChannel].filter(\.readyToDecode)
-        guard let target = ready.max(by: {
-            $0.buffer.pendingSeconds < $1.buffer.pendingSeconds
-        }) else { return }
+        let target: ChannelPipeline
+        switch (micChannel.readyToDecode, farChannel.readyToDecode) {
+        case (true, true):
+            target = micChannel.buffer.pendingSeconds >= farChannel.buffer.pendingSeconds
+                ? micChannel : farChannel
+        case (true, false): target = micChannel
+        case (false, true): target = farChannel
+        case (false, false): return
+        }
 
         let channel = target.channel
         var pipeline = self[channel]
@@ -510,6 +582,10 @@ public final class MeetingSession: ObservableObject {
 
         self[channel] = pipeline
         rebuildHypothesis()
+        // The provisional phrase is already on screen. Include it in the
+        // next recovery checkpoint even when this was the first decode and
+        // LocalAgreement has not confirmed a word yet.
+        scheduleCheckpoint()
     }
 
     // MARK: - Applying deltas
@@ -529,14 +605,13 @@ public final class MeetingSession: ObservableObject {
             words.removeAll { removed.contains($0.id) }
         }
         if !delta.newWords.isEmpty {
-            words.append(contentsOf: delta.newWords)
-            words.sort {
-                ($0.startMs, $0.channel.sortRank) < ($1.startMs, $1.channel.sortRank)
-            }
+            words = TranscriptRenderer.mergingChronological(words,
+                                                             with: delta.newWords)
             lines = TranscriptRenderer.lines(words,
                                              youLabel: TranscriptRenderer.defaultYouLabel,
                                              farEndLabel: settings.resolvedFarEndLabel)
             record?.words = words
+            scheduleCheckpoint()
         }
     }
 
@@ -552,16 +627,14 @@ public final class MeetingSession: ObservableObject {
     // MARK: - Reading out
 
     public var labelledTranscript: String {
-        TranscriptRenderer.labelled(words,
-                                    youLabel: TranscriptRenderer.defaultYouLabel,
-                                    farEndLabel: settings.resolvedFarEndLabel)
+        TranscriptRenderer.render(lines, includeTimestamps: false)
     }
 
     /// The last few lines, for the assistant's rolling context.
     public func transcriptTail(turns: Int) -> String {
-        TranscriptRenderer.tail(words, turns: turns,
-                               youLabel: TranscriptRenderer.defaultYouLabel,
-                               farEndLabel: settings.resolvedFarEndLabel)
+        guard turns > 0 else { return "" }
+        return TranscriptRenderer.render(lines.suffix(turns),
+                                         includeTimestamps: false)
     }
 
     public var elapsed: TimeInterval {
@@ -573,6 +646,17 @@ public final class MeetingSession: ObservableObject {
     public func dismissNotice() { notice = nil }
 
     // MARK: - Notes
+
+    /// A current, internally consistent snapshot for the notes request. The
+    /// record created at Start is intentionally long-lived, so reading it
+    /// directly used to omit text typed since the meeting began.
+    public func recordForNotes() -> MeetingRecord? {
+        guard var record else { return nil }
+        record.words = checkpointWords()
+        record.userNotes = userNotes
+        if record.endedAt == nil { record.endedAt = now() }
+        return record
+    }
 
     public func applyNotes(markdown: String, title: String?, items: [MeetingActionItem]) {
         guard var record else { return }
@@ -587,15 +671,125 @@ public final class MeetingSession: ObservableObject {
         // an unwritable folder took the meeting's notes with it and said
         // nothing. Same shape as the transcript save in `finish()`.
         notesPhase = .ready
+        notesProgress = nil
+        guard settings.savesTranscript || isViewingSavedRecord else { return }
         do {
-            try store.save(record)
+            var snapshot = record
+            snapshot.words = checkpointWords()
+            try store.save(snapshot)
             try store.saveNotes(markdown, for: record)
+            lastSavedAt = now()
         } catch {
             notice = "PRISM couldn't save the meeting notes — \(error.localizedDescription)"
         }
     }
 
-    public func setNotesPhase(_ phase: NotesPhase) { notesPhase = phase }
+    public func setNotesPhase(_ phase: NotesPhase, progress: String? = nil) {
+        notesPhase = phase
+        notesProgress = progress
+    }
+
+    public func setNotesProgress(_ progress: String) {
+        guard notesPhase == .writing else { return }
+        if notesProgress != progress { notesProgress = progress }
+    }
+
+    // MARK: - Saved meetings
+
+    /// Replaces the idle pane with a durable record chosen from the library.
+    /// Starting a new meeting resets this state as usual.
+    public func viewSavedMeeting(_ saved: MeetingRecord) {
+        guard !phase.isRunning else { return }
+        cancelCheckpoint()
+        // A crash-safe checkpoint deliberately has no endedAt. Once opened
+        // outside its original live session, bound its duration to the last
+        // captured word instead of letting `duration` count all the wall time
+        // since the crash.
+        var restored = saved
+        if restored.endedAt == nil,
+           let lastEnd = restored.words.map(\.endMs).max(), lastEnd > 0 {
+            restored.endedAt = restored.startedAt.addingTimeInterval(
+                Double(lastEnd) / 1_000)
+        }
+        meetingID = restored.id
+        startedAt = restored.startedAt
+        micChannel.reset()
+        farChannel.reset()
+        partials = [:]
+        record = restored
+        words = TranscriptRenderer.chronological(restored.words)
+        lines = TranscriptRenderer.lines(
+            words,
+            youLabel: TranscriptRenderer.defaultYouLabel,
+            farEndLabel: restored.farEndLabel)
+        hypothesis = ""
+        userNotes = restored.userNotes
+        notesPhase = restored.notesMarkdown?.isEmpty == false ? .ready : .none
+        notesProgress = nil
+        lastSavedAt = restored.endedAt ?? restored.startedAt
+        isViewingSavedRecord = true
+        notice = nil
+    }
+
+    // MARK: - Crash-safe checkpoints
+
+    private func scheduleCheckpoint(immediately: Bool = false) {
+        let hasTail = micChannel.state.hasCheckpointTail
+            || farChannel.state.hasCheckpointTail
+        guard canCheckpointCurrentRecord,
+              !words.isEmpty || hasTail || !userNotes.isEmpty else { return }
+        guard checkpointTask == nil else { return }
+        let delay = immediately ? 0 : checkpointDelay
+        let generation = checkpointGeneration
+        checkpointTask = Task { @MainActor [weak self] in
+            if delay > 0 {
+                try? await Task.sleep(
+                    nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+            guard !Task.isCancelled, let self,
+                  generation == self.checkpointGeneration,
+                  self.canCheckpointCurrentRecord,
+                  var snapshot = self.record else { return }
+            self.checkpointTask = nil
+            snapshot.words = self.words
+            snapshot.userNotes = self.userNotes
+            let tail = self.checkpointTailWords()
+            self.store.saveInBackground(snapshot, additionalWords: tail) { [weak self] result in
+                guard let self,
+                      generation == self.checkpointGeneration,
+                      self.canCheckpointCurrentRecord,
+                      self.meetingID == snapshot.id else { return }
+                switch result {
+                case .success:
+                    self.lastSavedAt = self.now()
+                case .failure(let error):
+                    self.notice = "PRISM couldn't checkpoint the transcript — \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func cancelCheckpoint() {
+        checkpointGeneration &+= 1
+        checkpointTask?.cancel()
+        checkpointTask = nil
+    }
+
+    /// Settled words plus the small per-channel tail already visible to the
+    /// user. The latter is marked pending and only used for durable snapshots;
+    /// recognition state remains free to revise it while the meeting runs.
+    private func checkpointWords() -> [TranscriptWord] {
+        TranscriptRenderer.mergingChronological(
+            words, with: checkpointTailWords())
+    }
+
+    private func checkpointTailWords() -> [TranscriptWord] {
+        micChannel.state.checkpointTail + farChannel.state.checkpointTail
+    }
+
+    private var canCheckpointCurrentRecord: Bool {
+        phase.isRunning ? settings.savesTranscript : isViewingSavedRecord
+    }
 }
 
 // MARK: - Per-channel pipeline
@@ -607,6 +801,9 @@ struct ChannelPipeline {
     let channel: ChannelProfile
     var cursor: UInt64 = 0
     var resampler = SpeechResampler()
+    /// Caller-owned output storage for the resampler, retained across the
+    /// 10 Hz drain instead of allocated for every audio block.
+    var resampledScratch: [Float] = []
     var buffer = RollingSpeechBuffer()
     var agreement = HypothesisBuffer()
     var state: TranscriptChannelState
@@ -651,6 +848,7 @@ struct ChannelPipeline {
     mutating func reset() {
         cursor = 0
         resampler.reset()
+        resampledScratch.removeAll(keepingCapacity: true)
         buffer.reset()
         agreement.reset()
         state.reset()
