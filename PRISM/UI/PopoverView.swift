@@ -22,7 +22,15 @@ import UniformTypeIdentifiers
 struct PopoverView: View {
     @EnvironmentObject var state: AppState
 
+    /// Supplied by the status-item controller so keyboard and VoiceOver
+    /// activation size against the item's display, not the pointer's display.
+    var availableScreenHeight: CGFloat?
+
     @State private var contentHeight: CGFloat?
+
+    init(availableScreenHeight: CGFloat? = nil) {
+        self.availableScreenHeight = availableScreenHeight
+    }
 
     var body: some View {
         ScrollView(.vertical) {
@@ -88,7 +96,14 @@ struct PopoverView: View {
     }
 
     private var maxHeight: CGFloat {
-        let available = NSScreen.main?.visibleFrame.height ?? 720
+        // `NSScreen.main` follows the key window, which can still be on a
+        // different display when the user opens this menu. Size against the
+        // menu bar they actually clicked instead.
+        let pointer = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first {
+            NSMouseInRect(pointer, $0.frame, false)
+        } ?? NSScreen.main
+        let available = availableScreenHeight ?? screen?.visibleFrame.height ?? 720
         return max(available - Metrics.sectionGap * 2, 360)
     }
 

@@ -3,7 +3,7 @@
 //
 // Maps MenuBarState to the menu bar glyph (§8.2): outline prism when idle
 // or live pass-through, filled when effects are active, pause/slash badge
-// overlays for frozen/muted, red tint on error, 40% opacity when idle.
+// overlays for frozen/muted, and red tint on error.
 // Uses the template PDF assets when present, SF Symbols otherwise.
 //
 // Licensed under the Apache License, Version 2.0.
@@ -28,7 +28,12 @@ struct MenuBarIcon: View {
 
     var body: some View {
         baseImage
-            .opacity(state == .idle ? 0.4 : 1.0)
+            // MenuBarExtra otherwise uses the asset's 22-point intrinsic
+            // size. Pinning the rendered mark keeps it sharp and leaves room
+            // for badges without letting macOS squeeze it into an oval.
+            .resizable()
+            .scaledToFit()
+            .frame(width: 19, height: 18)
             .foregroundStyle(isAlerting
                              ? AnyShapeStyle(.red)
                              : AnyShapeStyle(.primary))
@@ -55,7 +60,7 @@ struct MenuBarIcon: View {
     /// The states worth spending the red on: something is broken, or the
     /// picture on air is not what the user thinks it is. Talking into a muted
     /// microphone qualifies — it is the one state the user cannot notice.
-    private var isAlerting: Bool {
+    var isAlerting: Bool {
         state == .error || state == .panicked || state == .mutedTalking
     }
 
@@ -80,7 +85,7 @@ struct MenuBarIcon: View {
         }
     }
 
-    private var accessibilityDescription: String {
+    var accessibilityDescription: String {
         switch state {
         case .idle: return "PRISM, not in use"
         case .live: return "PRISM, live"

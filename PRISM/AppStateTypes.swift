@@ -61,7 +61,7 @@ public struct CameraClient: Identifiable, Equatable, Hashable {
 /// There is deliberately no recording state: writing a file changes nothing
 /// on air, and this ladder ranks what is on air.
 public enum MenuBarState: Equatable {
-    case idle          // not in use by any client: outline, 40% opacity
+    case idle          // not in use by any client: outline
     case live          // pass-through: outline, full opacity
     case effects       // filled
     case sharingScreen // filled + display badge: the screen is on air, not you

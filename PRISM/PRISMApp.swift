@@ -1,16 +1,13 @@
 // PRISMApp.swift
 // PRISM
 //
-// App entry. MenuBarExtra (.window style) hosts the popover; the main PRISM
-// window (an AppKit window owned by the delegate via MainWindowController,
-// so nothing shows at login-item launch) is the full control surface,
-// including the Menu Bar pane that customizes the popover itself.
+// App entry. An AppKit square status item hosts the SwiftUI popover; the main
+// PRISM window (also owned by the delegate, so nothing shows at login-item
+// launch) is the full control surface, including the Menu Bar pane that
+// customizes the popover itself.
 //
-// There is deliberately no SwiftUI `Settings` scene. It used to hold a
-// second, smaller copy of the framing, adjust, format, LUT and shortcut
-// controls, which meant two windows editing the same state with two sets of
-// wording — and the smaller copy was always the one that fell behind. The
-// main window is the single settings surface, and ⌘, opens it.
+// The empty SwiftUI `Settings` scene exists only to host commands. The main
+// AppKit window remains the single settings surface, and ⌘, opens it.
 //
 // PRISM appears in both the Dock and the menu bar. That overrides SPEC §1,
 // which specifies LSUIElement = true (menu bar only) — see PRISM/Info.plist.
@@ -19,6 +16,7 @@
 
 import AppKit
 import SwiftUI
+import UserNotifications
 
 @main
 struct PRISMApp: App {
@@ -32,18 +30,12 @@ struct PRISMApp: App {
     }
 
     var body: some Scene {
-        MenuBarExtra {
-            PopoverView()
-                .environmentObject(state)
-                .onAppear { state.popoverOpen = true }
-                .onDisappear { state.popoverOpen = false }
-        } label: {
-            MenuBarIcon(state: state.menuBarState)
-        }
-        .menuBarExtraStyle(.window)
-        // Removing the Settings scene also removes the app menu's
-        // "Settings…" item, and ⌘, is muscle memory. Put it back pointing
-        // at the window that now owns every setting.
+        // PRISM's visible windows are AppKit-owned. A Settings scene keeps the
+        // SwiftUI app lifecycle without opening an untitled window at launch;
+        // its standard command is replaced below with the real PRISM window.
+        Settings { EmptyView() }
+        // Point the standard Settings command at the window that owns every
+        // setting instead of at the empty lifecycle scene.
         .commands {
             CommandGroup(replacing: .appSettings) {
                 Button("Settings…") { state.showMainWindow() }
@@ -53,8 +45,13 @@ struct PRISMApp: App {
     }
 }
 
-final class PRISMAppDelegate: NSObject, NSApplicationDelegate {
+final class PRISMAppDelegate: NSObject, NSApplicationDelegate,
+                              UNUserNotificationCenterDelegate {
     @MainActor static var pendingState: AppState?
+    /// A square AppKit item uses 24 points instead of SwiftUI's 40-point
+    /// custom-label slot. That difference keeps PRISM visible on notched
+    /// displays with a crowded right-hand side of the menu bar.
+    @MainActor private var menuBarController: MenuBarController?
     /// Created lazily on first open and kept for the process lifetime.
     @MainActor private var mainWindowController: MainWindowController?
     /// §5.27 — created the first time the prompter is asked for and kept
@@ -65,8 +62,13 @@ final class PRISMAppDelegate: NSObject, NSApplicationDelegate {
     @MainActor private var assistantPanelController: AssistantPanelController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let notificationCenter = UNUserNotificationCenter.current()
+        notificationCenter.delegate = self
+        MeetingPromptNotification.registerActions()
+
         Task { @MainActor in
             guard let state = PRISMAppDelegate.pendingState else { return }
+            menuBarController = MenuBarController(state: state)
             // §5.32. The real speech engine is installed here, from the app
             // target only — `PRISM/AI/Engines/` is excluded from the test
             // bundle, which is what keeps the suite ad-hoc signed and free
@@ -107,6 +109,15 @@ final class PRISMAppDelegate: NSObject, NSApplicationDelegate {
                 }
                 self.assistantPanelController?.show()
             }
+            state.meetingJoinPromptHandler = { candidate in
+                MeetingPromptNotification.post(candidate)
+            }
+            state.meetingJoinEndedHandler = { signingIDs in
+                MeetingPromptNotification.remove(for: signingIDs)
+            }
+            state.clearMeetingJoinPromptsHandler = {
+                MeetingPromptNotification.removeAll()
+            }
             state.start()
         }
     }
@@ -126,5 +137,36 @@ final class PRISMAppDelegate: NSObject, NSApplicationDelegate {
             PRISMAppDelegate.pendingState?.showMainWindow()
         }
         return true
+    }
+
+    /// Notifications still appear when PRISM is frontmost (for example while
+    /// its preview is open). Merely clicking the notification opens PRISM;
+    /// only the explicit action starts Meeting mode.
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler:
+            @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .list])
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let action = response.actionIdentifier
+        let signingID = MeetingPromptNotification.signingID(from: response)
+        Task { @MainActor in
+            if action == MeetingPromptNotification.startActionIdentifier,
+               let signingID {
+                PRISMAppDelegate.pendingState?.startMeeting(
+                    fromPromptFor: signingID)
+            } else if action == UNNotificationDefaultActionIdentifier {
+                PRISMAppDelegate.pendingState?.showMainWindow()
+            }
+        }
+        completionHandler()
     }
 }
