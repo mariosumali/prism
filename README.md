@@ -23,13 +23,15 @@ Apache-2.0. macOS 13+.
 Tools/run_local.sh
 ```
 
-Builds ad-hoc signed with no entitlements and launches the agent — no Team
-ID, no provisioning profile, no Apple account. You get the dropdown, the
-main window, the live preview, the full Metal effects chain, freeze, clips,
-presets and hotkeys. What you do **not** get is `PRISM Camera` inside Zoom
-or FaceTime: installing the camera system extension requires an entitlement
-that only a provisioning profile can grant, so onboarding stays incomplete
-and a setup banner stays up. That is the expected state for this mode.
+Builds with the local capture entitlements and launches the agent — no Team
+ID, provisioning profile, or Apple account required. It uses an Apple
+Development certificate when one is available and otherwise signs ad hoc.
+You get the dropdown, the main window, the live preview, the full Metal
+effects chain, freeze, clips, presets and hotkeys. What you do **not** get is
+`PRISM Camera` inside Zoom or FaceTime: installing the camera system
+extension requires an entitlement that only a provisioning profile can
+grant, so onboarding stays incomplete and a setup banner stays up. That is
+the expected state for this mode.
 
 For the virtual devices themselves, read on.
 
@@ -250,6 +252,10 @@ before saving anything a virtual background or a keyed layer was concealing.
   and captures the far end separately, it knows which side every word came
   from without any speaker-identification model — on a one-to-one call that is
   the whole of "who said what", exactly right, for free.
+- **Meeting detection asks first** — when Zoom, FaceTime, Teams, or a browser
+  call such as Google Meet begins using PRISM Camera or PRISM Microphone,
+  PRISM posts a notification offering to start Meeting mode. Dismissing it
+  does nothing; detection never starts transcription on its own.
 - **Nothing is transcribed while you are muted**, and that is architecture
   rather than a setting. Mute and the transcription tap receives nothing at
   all — not silence, nothing — and no buffer holds what you said before.
@@ -264,6 +270,15 @@ before saving anything a virtual background or a keyed layer was concealing.
   own screen. It answers the question you were just asked. It runs when you
   press the key and at no other time: PRISM notices questions and lights up
   the composer, but never sends one by itself.
+- **Live insights** (⌃⌥⌘I) — the opt-in exception to that. While you are
+  listening and the panel is up, PRISM sends the last few lines to your
+  provider on its own — between turns, never closer than a cooldown, never
+  more than a ceiling per ten minutes — and puts up a card when there is
+  something worth saying: the answer to what you were just asked, a term
+  that went past, a commitment somebody made, a question worth asking next.
+  It is told that nothing is the usual answer, and every card quotes the
+  line that prompted it. Off by default, with its own switch, and it
+  disarms the moment the panel closes or listening stops.
 
 ### Driving it
 
@@ -329,8 +344,9 @@ Default shortcuts:
 | ⌃⌥⌘T | Teleprompter |
 | ⌃⌥⌘M | Transcribe this call |
 | ⌃⌥⌘A | Ask the assistant |
+| ⌃⌥⌘I | Live insights on or off |
 
-⌃ is in the last two because PRISM's event tap never consumes a chord: a
+⌃ is in those last rows because PRISM's event tap never consumes a chord: a
 plain ⌥⌘V would also trigger Finder's "Move Item Here" every time you put a
 chipmunk on air, and ⌥⌘T would open the frontmost app's font panel.
 
@@ -427,6 +443,11 @@ unable to generate a profile" even when everything is configured correctly.
 ./rebuild.sh --with-driver   # app AND the audio driver (needs sudo)
 ./rebuild.sh --driver-only   # just the audio driver
 ```
+
+The normal rebuild installs an optimized Release build. For a deliberately
+unoptimized installed build while diagnosing with a debugger, set
+`PRISM_BUILD_CONFIGURATION=Debug`; `Tools/run_local.sh` is the faster Debug
+loop when the system extension is not needed.
 
 The app and the driver install to two different places and neither implies
 the other, which is the usual reason a change "didn't work". `rebuild.sh`
@@ -562,10 +583,14 @@ connect to anything.
 
 **When you configure a provider, PRISM sends it what you asked it to send.**
 A transcript when you press *Write notes*. A question, the last few lines of
-transcript and your "About you" text when you press the ask chord. Nothing
-otherwise — not your audio, not your camera, not your screen. There is one
-further request in the app's life: the speech model, downloaded once from
-Hugging Face after you confirm the size.
+transcript and your "About you" text when you press the ask chord. And —
+only if you turn on live insights — those same last few lines on their own
+while the panel is up and you are listening, between turns, with a cooldown
+and a ceiling the Assistant pane states in numbers. That switch is off by
+default and is the one thing in PRISM that sends without a key press.
+Nothing otherwise — not your audio, not your camera, not your screen. There
+is one further request in the app's life: the speech model, downloaded once
+from Hugging Face after you confirm the size.
 
 **Every byte goes through one file you can read.**
 `PRISM/AI/LLM/LLMTransport.swift` is about 150 lines and is meant to be read

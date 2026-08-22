@@ -868,7 +868,7 @@ Every action in the table below is bindable; the defaults are the chords §5.2�
 
 | Property | Specification |
 |---|---|
-| Actions | `ShortcutAction` (Hotkeys.swift), all fourteen: freeze, mute, freeze and mute, instant replay, away loop, panic, eye contact, lag switch, bad connection, voice changer, save the last seconds, take a still, share a screen, prompter |
+| Actions | `ShortcutAction` (Hotkeys.swift), all seventeen: freeze, mute, freeze and mute, instant replay, away loop, panic, eye contact, lag switch, bad connection, voice changer, save the last seconds, take a still, share a screen, prompter, transcribe this call, ask the assistant, live insights |
 | Editing | Shortcuts pane (main window) and Settings → General, both built from one `ShortcutsList`; a recorder captures the real key-down |
 | Rules | A binding needs ⌥ or ⌃; function keys may stand alone; a modifier key alone is never a binding |
 | Conflicts | A chord has one owner. Assigning one that is taken takes it, leaves the previous owner unbound, and says so in the warning row |
@@ -1226,10 +1226,18 @@ What was said, written down on this Mac.
 | Storage | `~/Library/Application Support/PRISM/Meetings`; the transcript only, never audio |
 | Network | none, for the transcript. Notes are a separate, user-pressed action |
 | Persistence | `MeetingSettings` in `StudioSettings`, never in a preset |
-| Trigger | the Meeting section, the Meeting pane, and ⌃⌥⌘M |
+| Trigger | the Meeting section, the Meeting pane, ⌃⌥⌘M, or explicit acceptance of a detected-call notification |
 | Default | off; far end off; a stock build downloads nothing |
 
 **Nothing is transcribed while you are muted, and that is architecture rather than policy.** The transcription tap sits after the mute and suppression early returns in the RT callback, so a muted microphone does not deliver silence to the recogniser — it delivers nothing, and there is no buffer holding what was said before. A promise implemented as a check somewhere is a promise that survives until somebody moves the check. This one is a consequence of where three lines sit.
+
+**Meeting detection may ask and may never consent for the user.** A supported
+meeting app beginning to consume PRISM Camera is the strong signal; PRISM
+Microphone in use while a supported meeting app is frontmost is the
+camera-off fallback. Zoom, FaceTime and Teams are named directly. Browser
+calls are named by browser because PRISM does not inspect tab URLs or titles.
+The notification has `Start Meeting Mode` and `Not Now` actions, fires once
+per observed call, and starts nothing unless the first action is pressed.
 
 **The transcript is tapped before the voice changer, and the mic check is tapped after it, for opposite reasons.** §5.13 exists to play back exactly what the call receives, so its tap belongs at the end of the chain. A recogniser wants the opposite: Chipmunk, Robot and Telephone make speech unintelligible, and a transcript that changed because somebody picked a voice effect would be a transcript of the effect. It is also ahead of §5.17 cleanup, so a noise gate cannot clip a word onset. Whisper is robust to a noisy room; it is not robust to a ring modulator.
 
@@ -1255,14 +1263,14 @@ An answer only you can see, while you are still in the conversation.
 | Property | Specification |
 |---|---|
 | Mechanism | a floating `NSPanel` with `sharingType = .none`, as §5.27 |
-| Trigger | ⌃⌥⌘A, push-to-ask. Detection lights a control and never sends anything |
+| Trigger | ⌃⌥⌘A, push-to-ask. Detection lights a control and never sends anything — except under §5.34, which is off by default |
 | Provider | Claude, Ollama on this Mac, or any OpenAI-compatible endpoint; none by default |
 | Sent | the last *n* transcript lines, the About-you text, and the question. Nothing else |
 | Key storage | Keychain, never `StudioSettings`, never an exported preset |
 | Persistence | `AssistantSettings` in `StudioSettings`; the open state is never restored |
 | Default | off, with no provider |
 
-**Push-to-ask, because every project that shipped automatic answering removed it.** The detector runs continuously over the far-end transcript and its entire output is a highlight on a control. cheating-daddy deleted its five-second capture loop and left the dead parameter behind; Amurex, the only fully automatic one, needed a server-side rate cap and a two-field guard to make the noise bearable. An assistant that answers unprompted talks over the meeting. The user presses the key.
+**Push-to-ask, because every project that shipped automatic answering removed it.** The detector runs continuously over the far-end transcript and its entire output is a highlight on a control. cheating-daddy deleted its five-second capture loop and left the dead parameter behind; Amurex, the only fully automatic one, needed a server-side rate cap and a two-field guard to make the noise bearable. An assistant that answers unprompted talks over the meeting. The user presses the key. Live insights (§5.34) is the one opt-in exception, and it is a separate mode with a separate switch — built out of the controls those projects added afterwards — so that this one never grows an automatic branch.
 
 **A typed question travels with the conversation; a detected one travels alone.** This asymmetry is the highest-leverage idea in the design and it is counter-intuitive. When the user types, the question is *about* the discussion and the rolling transcript is context. When the far end asked something specific and PRISM already knows what it was, sending the transcript alongside it dilutes the answer rather than improving it, so the detected path sends the question and the About-you block and nothing else.
 
@@ -1275,6 +1283,37 @@ An answer only you can see, while you are still in the conversation.
 **The key is not a setting.** `StudioSettings` is JSON in a plist that any process running as this user can read, and it is what gets exported with a preset and attached to a support thread. The API key lives in the data-protection Keychain, is read once at launch because every `SecItem` call blocks the calling thread, and never reaches a view.
 
 **A stalled provider is a failure, not a state.** A stream that stops mid-answer without closing leaves the panel waiting forever and wedges every later question until the app is relaunched — glass has exactly this bug. A watchdog rearmed on every token turns it into a sentence the user can read.
+
+
+### 5.34 Live insights
+
+Cards that appear on the assistant's panel while the call goes on, without a key being pressed.
+
+| Property | Specification |
+|---|---|
+| Mechanism | `InsightSession`: measures the transcript, decides against `InsightPolicy`, asks once, filters what comes back |
+| Trigger | a question from the other side, or enough new settled conversation and a pause — never mid-sentence, never inside a cooldown, never past the ceiling |
+| Sent | the last *n* transcript lines, the About-you text, the kinds asked for, the titles of cards already shown, and the detected question when there is one |
+| Reply | JSON: zero to two cards, each a kind, a title, a body, and the transcript line that prompted it |
+| Armed by | the mode switch **and** the panel up with a provider **and** a meeting listening; any one off, nothing is sent |
+| Pace | `quiet` (questions only), `balanced`, `eager` — one `InsightPolicy` each: word floor, quiet gap, cooldown, requests per ten minutes |
+| Persistence | `liveInsights`, `insightPace`, `insightKinds` in `AssistantSettings`; the mode is a preference and is restored, the panel never is |
+| Surfaces | the Assistant pane, the panel's hover strip, the popover's Meeting section, and ⌃⌥⌘I |
+| Default | off |
+
+**This is the one thing in PRISM that sends without a key being pressed, and it has its own switch because of that.** §5.33's finding stands — every open-source project that shipped automatic answering took it back out — and this mode does not revise it. It is built out of the controls those projects added afterwards: a floor on how much new material is worth a request, a quiet gap so the request lands between turns rather than inside one, a cooldown, and a hard ceiling per rolling ten minutes. The numbers live in one struct per pace, and the trigger is a pure function over a snapshot so that every rule has a test that runs in milliseconds against a fake clock.
+
+**The model is told that nothing is the usual answer, and then it is not believed.** The schema permits an empty list and the prompt asks for one by default; what does come back is filtered again here, in code and cheapest first: the kinds the user wants, the quote that has to be real, the titles already shown this meeting, and the titles the user dismissed. A term defined once stays defined; a dismissed card stays dismissed. Two cards per reply at most, six on the panel at most, and an unpinned card leaves after two minutes — the panel is about the current minute of the call, not the whole of it. `fact` is off by default: it is the one kind no project in the open-source record has shipped and measured, and the one most likely to be a confident invention about the user's own company.
+
+**Every card quotes the line that prompted it, and the quote is checked.** §5.32's action-item rule, for the same reason: a model made to cite the line cannot invent the card, and the quote lets the user check it in a glance without leaving the panel. The check is not left to the prompt — a card whose quote is not mostly present in the window the model was actually sent is dropped before it is shown.
+
+**A detected question is a trigger here and a light everywhere else.** §5.33's detector is reused unchanged; what changes is what is wired to it. In this mode the newest settled far-end line that reads as a complete question goes out after a short gap and a short cooldown, without waiting for the word floor — the question arrived complete, and the clock is running on the user's reply. The same question is never asked about twice; a question the user has already started answering (a settled reply of eight words or more) is not asked about at all; and a question that has waited out a cooldown or a request in flight for more than twelve seconds is dropped rather than answered late.
+
+**Turning it on turns on what it needs.** §8.7: the chord shows the panel if it is down and starts listening if it is not running, because a chord that did nothing until two other switches were found is a chord nobody presses twice. Turning it off leaves both alone — the transcript is still wanted for the notes, and a panel the user may be reading an answer on is not this switch's to close. It is refused, with the reason in the warning row, when there is no provider: a mode that sends on its own must not be switchable into a state where every attempt fails quietly.
+
+**The panel gates the sending.** Close the panel and the mode disarms and its cards go; reopen it and the mode is back. Nothing is sent on behalf of a screen nobody is looking at.
+
+**What it says about itself is conditional.** §5.33's "never sent on its own" is true while this is off and false while it is on, so every surface that says it — the pane's detection caption, the privacy inventory, the popover's caption — says which, and the inventory names the cadence and the ceiling in numbers. The panel's live row always carries the request count, because a panel that sends on its own and says nothing about it reads as broken. A row of the session log says the mode went on or off and which provider, and one more at the end of the meeting says how many requests, cards and dismissals there were — counts only, and never a word of what a card said. Those counts are the only way the defaults will ever be tuned against real use.
 
 
 ---

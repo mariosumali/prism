@@ -1298,6 +1298,82 @@ Carries a stall watchdog rearmed on every token. A provider that stops
 mid-stream without closing otherwise leaves `isStreaming` true forever and
 wedges every later question until the app is relaunched.
 
+### InsightSession (`PRISM/AI/Meeting/InsightSession.swift`)
+
+§5.34. The one object in PRISM that sends to a model without a key press,
+and everything that earns it the right to. Measures the transcript; the
+decision is `InsightTrigger.decide`, a pure function over a snapshot.
+
+```swift
+@MainActor
+public final class InsightSession: ObservableObject {
+    @Published public private(set) var cards: [InsightCard]      // newest first
+    @Published public private(set) var isThinking: Bool
+    @Published public private(set) var lastError: String?
+    @Published public private(set) var requestCount: Int         // this meeting
+    public private(set) var cardsShown: Int
+    public private(set) var cardsDismissed: Int
+    /// "Live insights: N requests, M cards shown, K dismissed", or nil when
+    /// nothing was sent. Counts only; AppState logs it when the meeting ends.
+    public var meetingSummary: String? { get }
+    /// Mode on, panel active with a provider, meeting listening. Any one
+    /// off and nothing is sent.
+    @Published public private(set) var isArmed: Bool
+
+    public typealias Sleep = @Sendable (TimeInterval) async -> Void
+    /// Installed by AppState; the key never leaves it.
+    public var providerFactory: () -> LLMProvider?
+
+    public init(now: @escaping () -> Date = Date.init, sleep: @escaping Sleep = …)
+    public func apply(_ settings: AssistantSettings)
+    public func setListening(_ on: Bool)          // false resets everything
+    /// Fed every change to `MeetingSession.lines`. Measures; never sends directly.
+    public func observe(lines: [TranscriptLine])
+    public func dismiss(_ id: String)             // remembered for the meeting
+    public func togglePin(_ id: String)           // pinned cards never expire
+    public func clearAll()                        // remembers nothing
+    public func card(id: String) -> InsightCard?
+}
+
+public struct InsightCard: Identifiable, Equatable {
+    public var id: String
+    public var kind: InsightKind                  // answer, term, fact, followUp, commitment
+    public var title: String
+    public var body: String
+    public var trigger: String                    // the transcript line that prompted it
+    public var arrivedAt: Date
+    public var isPinned: Bool
+}
+
+public enum InsightPace: String, Codable, CaseIterable { case quiet, balanced, eager }
+
+public struct InsightPolicy: Equatable {
+    public static func forPace(_ pace: InsightPace) -> InsightPolicy
+    // answersMaterial, minNewWords, materialGapSeconds, questionGapSeconds,
+    // cooldownSeconds, questionCooldownSeconds, requestsPerWindow,
+    // windowSeconds, maxCardsPerReply, visibleLimit, expirySeconds,
+    // requestTimeoutSeconds, shownMemory
+}
+
+public enum InsightTrigger {
+    public enum Reason: Equatable { case question(String), material }
+    public struct Snapshot: Equatable { … }
+    public static func decide(_ s: Snapshot, policy: InsightPolicy) -> Reason?
+    public static func delayUntilPossible(_ s: Snapshot, policy: InsightPolicy) -> TimeInterval?
+}
+```
+
+Invariants: one request in flight; a request never goes out mid-sentence
+(the quiet gap), inside a cooldown, or past the per-window ceiling; a reply
+is filtered in code against the kinds asked for, a quote that must be mostly
+present in the window actually sent (`InsightDeduper.isGrounded`), the
+titles already shown this meeting and the titles dismissed; a meeting
+stopping, the panel closing, the provider going to `none` or the mode
+switching off disarms it and clears its cards. The detected question is the
+§5.33 detector's output, used here as a trigger and nowhere else; it is
+dropped unasked once the user has settled a reply of eight words or more,
+or once it has waited more than `questionStaleSeconds`.
+
 ### SpeechRecognizing (`PRISM/AI/Speech/SpeechRecognizing.swift`)
 
 The seam that keeps the one third-party dependency inside one directory.
@@ -2298,6 +2374,19 @@ public final class AppState: ObservableObject {
     public func setAssistantHighlightsQuestions(_ on: Bool)
     public func setAssistantAboutMe(_ text: String)
     @discardableResult public func setAnthropicKey(_ key: String) -> Bool
+    // Live insights (§5.34)
+    public let insights: InsightSession
+    /// ⌃⌥⌘I. A toggle. On also shows the panel and starts listening
+    /// (§8.7); refused with a warning when there is no provider.
+    public func toggleLiveInsights()
+    public func setLiveInsights(_ on: Bool)
+    public func setInsightPace(_ pace: InsightPace)
+    public func setInsightKind(_ kind: InsightKind, enabled: Bool)
+    public func dismissInsight(_ id: String)
+    public func pinInsight(_ id: String)
+    public func clearInsights()
+    /// Through `askAssistant`, so the transcript tail travels with it.
+    public func askAboutInsight(_ id: String)
     // Control surface (§5.19, §5.20)
     @Published public var hotkeyBindings: HotkeyBindings
     @Published public var externalControlEnabled: Bool      // default off
